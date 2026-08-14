@@ -28,7 +28,10 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendStoreKVConnectorWorkerMetadata
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendStoreKVConnectorWorkerMetadata,
+    LookupHashMode,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
     KVPoolScheduler,
     get_zmq_rpc_path_lookup,
@@ -315,13 +318,15 @@ class LookupKeyServer:
                 token_len = int.from_bytes(all_frames[0], byteorder="big")
                 kv_group_ids = self.decoder.decode([all_frames[1]])
                 hbm_hit_tokens = int.from_bytes(all_frames[2], byteorder="big")
-                hashes_str = self.decoder.decode(all_frames[3:])
+                lookup_hash_mode = LookupHashMode(self.decoder.decode([all_frames[3]]))
+                hashes_str = self.decoder.decode(all_frames[4:])
                 result = self.pool_worker.lookup_scheduler(
                     token_len,
                     hashes_str,
                     kv_group_ids,
                     use_layerwise=False,
                     hbm_hit_tokens=hbm_hit_tokens,
+                    lookup_hash_mode=lookup_hash_mode,
                 )
                 logger.debug(
                     "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",

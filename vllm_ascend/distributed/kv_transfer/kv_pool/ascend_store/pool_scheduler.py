@@ -38,6 +38,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendStoreKVConnectorWorkerMetadata,
     KeyMetadata,
     LoadSpec,
+    LookupHashMode,
     PoolKey,
     ReqMeta,
     RequestTracker,
@@ -152,6 +153,17 @@ class KVPoolScheduler:
         # {event_id, completed_woke_count}
         self.sending_events: dict[int, int] = {}
         self._expected_worker_count = vllm_config.parallel_config.world_size
+
+        lookup_hash_mode = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config.get("lookup_hash_mode", "full")
+        )
+        try:
+            self.lookup_hash_mode = LookupHashMode(lookup_hash_mode)
+        except ValueError as e:
+            raise ValueError(
+                "lookup_hash_mode must be one of: full, suffix; "
+                f"got {lookup_hash_mode!r}"
+            ) from e
 
         use_mla = getattr(vllm_config.model_config, "use_mla", False)
         tp_mismatch_info = infer_tp_mismatch_info(
@@ -567,11 +579,22 @@ class KVPoolScheduler:
                     return 0, False
                 if self.client is None:
                     self.client = LookupKeyClient(self.vllm_config)
+
+                lookup_block_hashes = request.block_hashes
+
+                if self.lookup_hash_mode is LookupHashMode.SUFFIX:
+                    assert num_computed_tokens % self.hash_block_size == 0, (
+                        "num_computed_tokens must be aligned to hash_block_size"
+                    )
+                    hbm_cached_hashes = num_computed_tokens // self.hash_block_size
+                    lookup_block_hashes = request.block_hashes[hbm_cached_hashes:]
+
                 num_external_hit_tokens = self.client.lookup(
                     token_len,
-                    request.block_hashes,
+                    lookup_block_hashes,
                     self.kv_cache_group_ids,
                     hbm_hit_tokens=num_computed_tokens,
+                    lookup_hash_mode=self.lookup_hash_mode,
                 )
 
         if num_external_hit_tokens == 0:
@@ -1171,15 +1194,18 @@ class LookupKeyClient:
         block_hashes: list[BlockHash],
         kv_cache_group_ids: list[int] | None = None,
         hbm_hit_tokens: int = 0,
+        lookup_hash_mode: LookupHashMode = LookupHashMode.FULL,
     ) -> int:
         kv_cache_group_ids = kv_cache_group_ids or [0]
         hash_strs = [h.hex() for h in block_hashes]
         hash_frames = self.encoder.encode(hash_strs)
         kv_group_frames = self.encoder.encode(kv_cache_group_ids)
+        lookup_mode_frames = self.encoder.encode(lookup_hash_mode.value)
         all_frames = [
             token_len.to_bytes(4, byteorder="big"),
             *kv_group_frames,
             hbm_hit_tokens.to_bytes(4, byteorder="big"),
+            *lookup_mode_frames,
             *hash_frames,
         ]
         self.socket.send_multipart(all_frames, copy=False)

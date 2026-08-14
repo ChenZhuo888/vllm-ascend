@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from importlib import import_module
-from typing import Any, cast
+from typing import Any, cast, overload
 
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -22,6 +23,58 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 
 _CACHE_MISSING = object()
 _MANAGER_CLASS_CACHE_ATTR = "_manager_class_cache"
+
+
+class _HBMCachedBlockHash(bytes):
+    """Marker hash for a prefix block that is already cached in HBM."""
+
+
+_HBM_CACHED_BLOCK_HASH = _HBMCachedBlockHash()
+
+
+class HBMCachedBlockHashList(Sequence[BlockHash | str]):
+    """Logical block-hash list with an HBM-cached prefix.
+
+    ``block_hashes`` contains only the suffix hashes that still need external
+    lookup. The HBM prefix is represented lazily by a dedicated marker hash,
+    so callers can keep using absolute block-hash indices without sending the
+    real hashes for the HBM-cached prefix.
+    """
+
+    def __init__(
+        self,
+        block_hashes: Sequence[BlockHash],
+        num_hbm_cached_hashes: int,
+    ) -> None:
+        assert num_hbm_cached_hashes >= 0
+        self._block_hashes = block_hashes
+        self._num_hbm_cached_hashes = num_hbm_cached_hashes
+
+    def __len__(self) -> int:
+        return self._num_hbm_cached_hashes + len(self._block_hashes)
+
+    @overload
+    def __getitem__(self, index: int) -> BlockHash: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[BlockHash]: ...
+
+    def __getitem__(self, index: int | slice) -> BlockHash | list[BlockHash]:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        if index < self._num_hbm_cached_hashes:
+            return cast(BlockHash, _HBM_CACHED_BLOCK_HASH)
+        return self._block_hashes[index - self._num_hbm_cached_hashes]
+
+    def __iter__(self) -> Iterator[BlockHash]:
+        for index in range(len(self)):
+            yield self[index]
 
 
 class ExternalCachedBlockPool:
@@ -44,6 +97,8 @@ class ExternalCachedBlockPool:
         block_hash: BlockHash,
         group_ids: list[int],
     ) -> list[KVCacheBlock] | None:
+        if isinstance(block_hash, _HBMCachedBlockHash):
+            return [self._present_block] * len(group_ids)
         if self._exists is None:
             return [self._present_block] * len(group_ids)
         h = block_hash_to_bytes(block_hash)
@@ -143,7 +198,7 @@ class AscendStoreCoordinator:
 
     def find_longest_cache_hit(
         self,
-        block_hashes: list[BlockHash],
+        block_hashes: list[BlockHash] | HBMCachedBlockHashList,
         max_length: int,
         cached_block_pool: ExternalCachedBlockPool,
         *,
@@ -223,12 +278,16 @@ class AscendStoreCoordinator:
                 assert len(mask) == num_chunks
         return tuple(None if mask is None or all(mask) else mask for _, mask in masks)
 
-    def block_hashes_for_spec(self, block_hashes: list[BlockHash], spec: KVCacheSpec) -> BlockHashList:
-        return block_hashes
+    def block_hashes_for_spec(
+        self,
+        block_hashes: list[BlockHash] | HBMCachedBlockHashList,
+        spec: KVCacheSpec,
+    ) -> BlockHashList:
+        return cast(BlockHashList, block_hashes)
 
     def _find_hit_blocks(
         self,
-        block_hashes: list[BlockHash],
+        block_hashes: list[BlockHash] | HBMCachedBlockHashList,
         max_length: int,
         cached_block_pool: ExternalCachedBlockPool,
         *,

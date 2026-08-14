@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, cast
 
 import numpy as np
@@ -251,6 +252,13 @@ def infer_group_cache_families(
             families.append("mixed")
     return families
 
+
+
+class LookupHashMode(str, Enum):
+    """Block-hash representation used by scheduler-side KV lookup."""
+
+    FULL = "full"
+    SUFFIX = "suffix"
 
 class ChunkedTokenDatabase:
     def __init__(

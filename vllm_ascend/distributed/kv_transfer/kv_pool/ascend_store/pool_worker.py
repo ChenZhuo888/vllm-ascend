@@ -36,6 +36,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
     AscendStoreCoordinator,
     ExternalCachedBlockPool,
+    HBMCachedBlockHashList,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVCacheStoreKeyLayerRecvingThread,
@@ -63,6 +64,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     KeyMetadata,
     LayerBlockRange,
     LayerLoadTask,
+    LookupHashMode,
     LayerMultiBlockReqMeta,
     LayerTransferTask,
     ReqMeta,
@@ -2117,6 +2119,7 @@ class KVPoolWorker:
         block_hashes: list[BlockHash],
         group_id: int,
         use_layerwise: bool,
+        token_offset: int = 0,
     ) -> tuple[list[str], list[int], list[int]]:
         keys: list[str] = []
         starts: list[int] = []
@@ -2126,15 +2129,15 @@ class KVPoolWorker:
                 token_len, block_hashes, kv_cache_group_id=group_id
             ):
                 keys.extend(item.to_string() for item in pool_key.split_layers(self.num_layers))
-                starts.append(start)
-                ends.append(end)
+                starts.append(start + token_offset)
+                ends.append(end + token_offset)
         else:
             for start, end, key_string, _ in self.token_database.process_token_key_strings(
                 token_len, block_hashes, kv_cache_group_id=group_id
             ):
                 keys.append(key_string)
-                starts.append(start)
-                ends.append(end)
+                starts.append(start + token_offset)
+                ends.append(end + token_offset)
         return keys, starts, ends
 
     def lookup(
@@ -2250,11 +2253,25 @@ class KVPoolWorker:
         use_layerwise: bool,
         include_all_ranks: bool,
         hbm_hit_tokens: int = 0,
+        lookup_hash_mode: LookupHashMode = LookupHashMode.FULL,
     ) -> int | None:
         if self.cache_coordinator is None or use_layerwise:
             return None
         if sorted(kv_cache_group_ids) != list(range(self.num_kv_cache_groups)):
             return None
+
+        assert 0 <= hbm_hit_tokens <= token_len
+        if lookup_hash_mode is LookupHashMode.SUFFIX:
+            assert hbm_hit_tokens % self.hash_block_size == 0, (
+                "hbm_hit_tokens must be aligned to hash_block_size "
+                "when using suffix hash lookup"
+            )
+            lookup_block_hashes = HBMCachedBlockHashList(
+                block_hashes,
+                hbm_hit_tokens // self.hash_block_size,
+            )
+        else:
+            lookup_block_hashes = block_hashes
 
         exists: set[tuple[int, bytes]] = set()
         aligned_len = (
@@ -2271,7 +2288,11 @@ class KVPoolWorker:
             base_block_size = self.token_database.get_block_size(group_id)
             cache_family = self.token_database.group_cache_families.get("kv", {}).get(group_id, "default")
             effective_block_size = get_cache_family_granularity(base_block_size, cache_family)
-            if hbm_hit_tokens:
+
+            # Legacy FULL mode represents the HBM prefix by inserting its real
+            # hashes into the external-existence view. SUFFIX mode represents
+            # the same prefix lazily through HBMCachedBlockHashList instead.
+            if lookup_hash_mode is LookupHashMode.FULL and hbm_hit_tokens:
                 grouped_hashes = get_block_hashes(
                     block_hashes, effective_block_size, self.token_database.hash_block_size
                 )
@@ -2279,6 +2300,7 @@ class KVPoolWorker:
                     (group_id, block_hash_to_bytes(chunk_hash))
                     for chunk_hash in grouped_hashes[: hbm_hit_tokens // effective_block_size]
                 )
+
             lookup_start = hbm_hit_tokens // effective_block_size * effective_block_size
             lookup_mask = lookup_masks[group_id] if lookup_masks is not None and group_id < len(lookup_masks) else None
 
@@ -2292,7 +2314,7 @@ class KVPoolWorker:
 
             for _, _, key_string, chunk_hash in self.token_database.process_token_key_strings(
                 token_len,
-                block_hashes,
+                lookup_block_hashes,  # type: ignore[arg-type]
                 mask_num=lookup_start,
                 kv_cache_group_id=group_id,
                 chunk_filter=chunk_filter,
@@ -2313,7 +2335,9 @@ class KVPoolWorker:
                 offset += count
 
             logger.debug(
-                "KV pool coordinator lookup group=%d token_len=%d keys=%d exists_chunks=%d/%d sample_keys=%s",
+                "KV pool coordinator lookup mode=%s group=%d token_len=%d "
+                "keys=%d exists_chunks=%d/%d sample_keys=%s",
+                lookup_hash_mode.value,
                 group_id,
                 token_len,
                 len(keys),
@@ -2323,13 +2347,14 @@ class KVPoolWorker:
             )
 
         _, hit_length = self.cache_coordinator.find_longest_cache_hit(
-            block_hashes,
+            lookup_block_hashes,  # type: ignore[arg-type]
             token_len,
             ExternalCachedBlockPool(self.hash_block_size, exists),
             apply_eagle=False,
         )
         logger.debug(
-            "KV pool coordinator lookup final token_len=%d groups=%s hit=%d",
+            "KV pool coordinator lookup final mode=%s token_len=%d groups=%s hit=%d",
+            lookup_hash_mode.value,
             token_len,
             kv_cache_group_ids,
             hit_length,
@@ -2343,16 +2368,27 @@ class KVPoolWorker:
         kv_cache_group_ids: list[int] | None = None,
         use_layerwise: bool = False,
         hbm_hit_tokens: int = 0,
+        lookup_hash_mode: LookupHashMode = LookupHashMode.FULL,
     ) -> int:
         """
         Checks the existence of KV cache of the tokens from the cache engine.
-        :param tokens: the input tokens, with shape [seq_len]
+        :param block_hashes: The complete request hash list in FULL mode, or the
+            hashes after the HBM prefix in SUFFIX mode.
+        :param lookup_hash_mode: The block hash lookup mode.
         :return: An int indicating how many prefix tokens are cached.
         """
         try:
             hits: list[list[int]] = []
             max_hit_position = self.max_model_len
             kv_cache_group_ids = kv_cache_group_ids or [0]
+
+            assert 0 <= hbm_hit_tokens <= token_len
+            if lookup_hash_mode is LookupHashMode.SUFFIX:
+                assert hbm_hit_tokens % self.hash_block_size == 0, (
+                    "hbm_hit_tokens must be aligned to hash_block_size "
+                    "when using suffix hash lookup"
+                )
+
             coordinator_hit = self._lookup_with_coordinator(
                 token_len,
                 block_hashes,
@@ -2360,13 +2396,38 @@ class KVPoolWorker:
                 use_layerwise,
                 include_all_ranks=True,
                 hbm_hit_tokens=hbm_hit_tokens,
+                lookup_hash_mode=lookup_hash_mode,
             )
             if coordinator_hit is not None:
                 return coordinator_hit
+
+            if lookup_hash_mode is LookupHashMode.SUFFIX:
+                lookup_token_len = token_len - hbm_hit_tokens
+                token_offset = hbm_hit_tokens
+            else:
+                lookup_token_len = token_len
+                token_offset = 0
+
             for group_id in kv_cache_group_ids:
-                keys, starts, ends = self._build_lookup_keys(token_len, block_hashes, group_id, use_layerwise)
+                keys, starts, ends = self._build_lookup_keys(
+                    lookup_token_len,
+                    block_hashes,
+                    group_id,
+                    use_layerwise,
+                    token_offset=token_offset,
+                )
 
                 if not keys:
+                    if (
+                        lookup_hash_mode is LookupHashMode.SUFFIX
+                        and hbm_hit_tokens
+                    ):
+                        group_hits = [hbm_hit_tokens]
+                        max_hit_position = min(
+                            max_hit_position, hbm_hit_tokens
+                        )
+                        hits.append(group_hits)
+                        continue
                     return 0
 
                 multi_tp_keys = self._expand_lookup_keys_by_rank(keys, group_id)
@@ -2381,8 +2442,10 @@ class KVPoolWorker:
                     for i in range(num_ranks)
                 ]
                 logger.debug(
-                    "KV pool lookup request token_len=%d group=%d keys=%d multi_tp_keys=%d "
-                    "exists_count=%d/%d exists_sample=%s sample_keys=%s",
+                    "KV pool lookup request mode=%s token_len=%d group=%d "
+                    "keys=%d multi_tp_keys=%d exists_count=%d/%d "
+                    "exists_sample=%s sample_keys=%s",
+                    lookup_hash_mode.value,
                     token_len,
                     group_id,
                     len(keys),
@@ -2400,12 +2463,21 @@ class KVPoolWorker:
                     group_hits = self.find_all_continuous_hit_positions(
                         multi_tp_values, ends, num_block, max_hit_position, self.cache_transfer_granularity
                     )
+
+                if (
+                    lookup_hash_mode is LookupHashMode.SUFFIX
+                    and hbm_hit_tokens
+                ):
+                    group_hits.insert(0, hbm_hit_tokens)
+
                 if not group_hits:
                     return 0
                 max_hit_position = min(max_hit_position, group_hits[-1])
                 hits.append(group_hits)
                 logger.debug(
-                    "KV pool scheduler lookup group=%d keys=%d hit=%d token_len=%d",
+                    "KV pool scheduler lookup mode=%s group=%d keys=%d "
+                    "hit=%d token_len=%d",
+                    lookup_hash_mode.value,
                     group_id,
                     len(keys),
                     max_hit_position,
@@ -2420,7 +2492,8 @@ class KVPoolWorker:
             return 0
         final_hits = self._max_intersection_hit_position(hits)
         logger.debug(
-            "KV pool scheduler lookup final token_len=%d groups=%s hit=%d",
+            "KV pool scheduler lookup final mode=%s token_len=%d groups=%s hit=%d",
+            lookup_hash_mode.value,
             token_len,
             kv_cache_group_ids,
             final_hits,
