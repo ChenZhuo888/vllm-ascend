@@ -43,7 +43,7 @@ class HBMCachedBlockHashList(Sequence[BlockHash | str]):
 
     def __init__(
         self,
-        block_hashes: Sequence[BlockHash],
+        block_hashes: Sequence[BlockHash | str],
         num_hbm_cached_hashes: int,
     ) -> None:
         assert num_hbm_cached_hashes >= 0
