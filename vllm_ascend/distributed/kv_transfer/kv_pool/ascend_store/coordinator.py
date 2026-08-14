@@ -54,12 +54,12 @@ class HBMCachedBlockHashList(Sequence[BlockHash | str]):
         return self._num_hbm_cached_hashes + len(self._block_hashes)
 
     @overload
-    def __getitem__(self, index: int) -> BlockHash: ...
+    def __getitem__(self, index: int) -> BlockHash | str: ...
 
     @overload
-    def __getitem__(self, index: slice) -> list[BlockHash]: ...
+    def __getitem__(self, index: slice) -> list[BlockHash | str]: ...
 
-    def __getitem__(self, index: int | slice) -> BlockHash | list[BlockHash]:
+    def __getitem__(self, index: int | slice) -> BlockHash | str | list[BlockHash | str]:
         if isinstance(index, slice):
             start, stop, step = index.indices(len(self))
             return [self[i] for i in range(start, stop, step)]
@@ -69,10 +69,10 @@ class HBMCachedBlockHashList(Sequence[BlockHash | str]):
         if index < 0 or index >= len(self):
             raise IndexError(index)
         if index < self._num_hbm_cached_hashes:
-            return cast(BlockHash, _HBM_CACHED_BLOCK_HASH)
+            return BlockHash(_HBM_CACHED_BLOCK_HASH)
         return self._block_hashes[index - self._num_hbm_cached_hashes]
 
-    def __iter__(self) -> Iterator[BlockHash]:
+    def __iter__(self) -> Iterator[BlockHash | str]:
         for index in range(len(self)):
             yield self[index]
 
