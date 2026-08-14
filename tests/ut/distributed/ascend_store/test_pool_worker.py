@@ -22,10 +22,12 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import HBMCachedBlockHashList
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
     LayerTransferTask,
     LoadSpec,
+    LookupHashMode,
     ReqMeta,
     SharedBlockData,
 )
@@ -155,6 +157,125 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         self.assertFalse(worker.cache_coordinator.find_longest_cache_hit.call_args.kwargs["apply_eagle"])
         worker.token_database.process_tokens.assert_not_called()
 
+    def test_external_coordinator_suffix_lookup_skips_hbm_prefix(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.hash_block_size = 16
+        worker.num_kv_cache_groups = 1
+        worker.cache_coordinator = MagicMock()
+        worker.cache_coordinator.lcm_block_size = 16
+        worker.cache_coordinator.lookup_mask.return_value = ([True, True, True, True])
+        worker.cache_coordinator.find_longest_cache_hit.return_value = ((), 48)
+        worker.m_store = MagicMock()
+        worker.m_store.exists.return_value = [1, 0]
+        worker.token_database = MagicMock()
+        worker.token_database.hash_block_size = 16
+        worker.token_database.get_block_size.return_value = 16
+        worker.token_database.group_cache_families = {"kv": {0: "default"}}
+        h2 = b"h2"
+        h3 = b"h3"
+        worker.token_database.process_token_key_strings.return_value = [
+            (32, 48, "key-h2", h2),
+            (48, 64, "key-h3", h3),
+        ]
+        hit = worker._lookup_with_coordinator(
+            token_len=64,
+            block_hashes=[h2, h3],
+            kv_cache_group_ids=[0],
+            use_layerwise=False,
+            include_all_ranks=False,
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+        self.assertEqual(hit, 48)
+        # Only suffix keys are queried from the remote store.
+        worker.m_store.exists.assert_called_once_with(["key-h2", "key-h3"])
+        worker.token_database.process_token_key_strings.assert_called_once()
+        call = worker.token_database.process_token_key_strings.call_args
+        self.assertEqual(call.args[0], 64)
+        self.assertEqual(call.kwargs["mask_num"], 32)
+        self.assertEqual(call.kwargs["kv_cache_group_id"], 0)
+        # The coordinator still sees a logical full-length hash sequence:
+        # two HBM marker hashes followed by the two real suffix hashes.
+        logical_hashes = call.args[1]
+        self.assertIsInstance(logical_hashes, HBMCachedBlockHashList)
+        self.assertEqual(len(logical_hashes), 4)
+        self.assertEqual(logical_hashes[2], h2)
+        self.assertEqual(logical_hashes[3], h3)
+        worker.cache_coordinator.find_longest_cache_hit.assert_called_once()
+        coordinator_call = worker.cache_coordinator.find_longest_cache_hit.call_args
+        self.assertIs(coordinator_call.args[0], logical_hashes)
+        self.assertEqual(coordinator_call.args[1], 64)
+        self.assertFalse(coordinator_call.kwargs["apply_eagle"])
+
+    def test_external_coordinator_suffix_lookup_across_multiple_groups(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.hash_block_size = 16
+        worker.num_kv_cache_groups = 2
+        worker.cache_coordinator = MagicMock()
+        worker.cache_coordinator.lcm_block_size = 16
+        worker.cache_coordinator.lookup_mask.return_value = (
+            [True, True, True, True],
+            [True, True, True, True],
+        )
+        worker.cache_coordinator.find_longest_cache_hit.return_value = ((), 48)
+        worker.m_store = MagicMock()
+        worker.m_store.exists.side_effect = [[1, 1], [1, 0]]
+        worker.token_database = MagicMock()
+        worker.token_database.hash_block_size = 16
+        worker.token_database.get_block_size.side_effect = lambda group_id: 16
+        worker.token_database.group_cache_families = {"kv": {0: "default", 1: "default"}}
+        h2 = b"h2"
+        h3 = b"h3"
+        def process_token_key_strings(
+            token_len,
+            block_hashes,
+            *,
+            mask_num,
+            kv_cache_group_id,
+            chunk_filter,
+        ):
+            return [(32, 48, f"g{kv_cache_group_id}-h2", h2), (48, 64, f"g{kv_cache_group_id}-h3", h3)]
+        worker.token_database.process_token_key_strings.side_effect = (
+            process_token_key_strings
+        )
+        hit = worker._lookup_with_coordinator(
+            token_len=64,
+            block_hashes=[h2, h3],
+            kv_cache_group_ids=[0, 1],
+            use_layerwise=False,
+            include_all_ranks=False,
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+        self.assertEqual(hit, 48)
+        # Each group queries only the suffix keys.
+        self.assertEqual(worker.m_store.exists.call_args_list[0].args[0], ["g0-h2", "g0-h3"])
+        self.assertEqual(worker.m_store.exists.call_args_list[1].args[0], ["g1-h2", "g1-h3"])
+        # Both groups start remote lookup after the 32-token HBM prefix.
+        lookup_calls = worker.token_database.process_token_key_strings.call_args_list
+        for group_id, lookup_call in enumerate(lookup_calls):
+            self.assertEqual(lookup_call.args[0], 64)
+            self.assertEqual(lookup_call.kwargs["mask_num"], 32)
+            self.assertEqual(lookup_call.kwargs["kv_cache_group_id"], group_id)
+
+            logical_hashes = lookup_call.args[1]
+            self.assertIsInstance(logical_hashes, HBMCachedBlockHashList)
+            self.assertEqual(len(logical_hashes), 4)
+            self.assertEqual(logical_hashes[2], h2)
+            self.assertEqual(logical_hashes[3], h3)
+        coordinator_call = worker.cache_coordinator.find_longest_cache_hit.call_args
+        logical_hashes = coordinator_call.args[0]
+        cached_block_pool = coordinator_call.args[2]
+        # h2 is remotely cached by both groups.
+        self.assertIsNotNone(cached_block_pool.get_cached_block(h2, [0, 1]))
+        # h3 exists only for group 0, so it is not a common remote hit.
+        self.assertIsNone(cached_block_pool.get_cached_block(h3, [0, 1]))
+        # The HBM marker is locally considered cached for every group.
+        self.assertIsNotNone(cached_block_pool.get_cached_block(logical_hashes[0], [0, 1]))
+        self.assertFalse(coordinator_call.kwargs["apply_eagle"],)
+
     def test_layerwise_multi_group_layout_includes_mtp(self):
         import torch
         from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -205,6 +326,26 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         self.assertEqual(len(worker.layer_load_tasks), 5)
         self.assertEqual(len(worker.layer_save_tasks), 5)
 
+    def test_build_lookup_keys_applies_token_offset(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.token_database = MagicMock()
+        worker.token_database.process_token_key_strings.return_value = [
+            (0, 16, "key-h2", b"h2"),
+            (16, 32, "key-h3", b"h3"),
+        ]
+        keys, starts, ends = worker._build_lookup_keys(
+            token_len=32,
+            block_hashes=[b"h2", b"h3"],
+            group_id=0,
+            use_layerwise=False,
+            token_offset=32,
+        )
+        self.assertEqual(keys, ["key-h2", "key-h3"])
+        self.assertEqual(starts, [32, 48])
+        self.assertEqual(ends, [48, 64])
+
+        worker.token_database.process_token_key_strings.assert_called_once_with(32, [b"h2", b"h3"], kv_cache_group_id=0)
 
 class TestKVPoolWorkerInit(unittest.TestCase):
     """Test KVPoolWorker initialization with mocked dependencies."""
@@ -573,6 +714,18 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker = KVPoolWorker(config, use_layerwise=use_layerwise)
         return worker
 
+    def _make_suffix_fallback_worker(self):
+        worker = self._make_worker()
+        # Force lookup_scheduler to use the legacy/fallback lookup path.
+        worker.cache_coordinator = None
+        worker.hash_block_size = 16
+        worker.cache_transfer_granularity = 16
+        worker.group_uses_align_state = [False]
+        # Keep this batch focused on suffix offset/hit calculation rather
+        # than TP/PP key expansion.
+        worker._expand_lookup_keys_by_rank = MagicMock(side_effect=lambda keys, group_id: keys)
+        return worker
+
     def setUp(self):
         self._patches = {}
 
@@ -770,6 +923,108 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.m_store.exists.side_effect = Exception("fail")
         result = worker.lookup_scheduler(32, ["h0", "h1"], use_layerwise=False)
         self.assertEqual(result, 0)
+
+    def test_lookup_scheduler_suffix_fallback_all_remote_hit(self):
+        worker = self._make_suffix_fallback_worker()
+        worker._build_lookup_keys = MagicMock(return_value=(["key-h2", "key-h3"], [32, 48], [48, 64]))
+        worker.m_store.exists.return_value = [1, 1]
+        result = worker.lookup_scheduler(
+            64,
+            [b"h2", b"h3"],
+            use_layerwise=False,
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+        self.assertEqual(result, 64)
+        worker._build_lookup_keys.assert_called_once_with(32, [b"h2", b"h3"], 0, False, token_offset=32)
+        worker.m_store.exists.assert_called_once_with(["key-h2", "key-h3"])
+
+    def test_lookup_scheduler_suffix_fallback_partial_remote_hit(self):
+        worker = self._make_suffix_fallback_worker()
+        worker._build_lookup_keys = MagicMock(return_value=( ["key-h2", "key-h3"], [32, 48], [48, 64]))
+        worker.m_store.exists.return_value = [1, 0]
+        result = worker.lookup_scheduler(
+            64,
+            [b"h2", b"h3"],
+            use_layerwise=False,
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+        self.assertEqual(result, 48)
+
+    def test_lookup_scheduler_suffix_fallback_first_remote_miss(self):
+        worker = self._make_suffix_fallback_worker()
+        worker._build_lookup_keys = MagicMock(return_value=( ["key-h2", "key-h3"], [32, 48], [48, 64]))
+        worker.m_store.exists.return_value = [0, 1]
+        result = worker.lookup_scheduler(
+            64,
+            [b"h2", b"h3"],
+            use_layerwise=False,
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+        self.assertEqual(result, 32)
+
+    def test_lookup_scheduler_suffix_fallback_no_remote_keys_keeps_hbm_hit(self):
+        worker = self._make_suffix_fallback_worker()
+        worker._build_lookup_keys = MagicMock(return_value=([], [], []))
+        result = worker.lookup_scheduler(
+            64,
+            [],
+            use_layerwise=False,
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+        self.assertEqual(result, 32)
+        worker._build_lookup_keys.assert_called_once_with(32, [], 0, False, token_offset=32)
+        worker.m_store.exists.assert_not_called()
+
+    def test_lookup_scheduler_suffix_fallback_multi_group_intersection(self):
+        worker = self._make_suffix_fallback_worker()
+        worker.group_uses_align_state = [False, False]
+        worker._build_lookup_keys = MagicMock(
+            side_effect=[
+                (["g0-h2", "g0-h3"], [32, 48], [48, 64]),
+                (["g1-h2", "g1-h3"], [32, 48], [48, 64]),
+            ]
+        )
+        worker.m_store.exists.side_effect = [[1, 1], [1, 0]]
+        result = worker.lookup_scheduler(
+            64,
+            [b"h2", b"h3"],
+            kv_cache_group_ids=[0, 1],
+            use_layerwise=False,
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+        self.assertEqual(result, 48)
+        self.assertEqual(
+            worker._build_lookup_keys.call_args_list,
+            [
+                unittest.mock.call(32, [b"h2", b"h3"], 0, False, token_offset=32),
+                unittest.mock.call(32, [b"h2", b"h3"], 1, False, token_offset=32),
+            ],
+        )
+
+    def test_lookup_scheduler_suffix_fallback_multi_group_keeps_common_hbm_boundary(self):
+        worker = self._make_suffix_fallback_worker()
+        worker.group_uses_align_state = [False, False]
+        worker._build_lookup_keys = MagicMock(
+            side_effect=[
+                (["g0-h2", "g0-h3"], [32, 48], [48, 64]),
+                (["g1-h2", "g1-h3"], [32, 48], [48, 64]),
+            ]
+        )
+        worker.m_store.exists.side_effect = [[1, 0], [0, 1]]
+        result = worker.lookup_scheduler(
+            64,
+            [b"h2", b"h3"],
+            kv_cache_group_ids=[0, 1],
+            use_layerwise=False,
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+        self.assertEqual(result, 32)
 
     def test_lookup_layerwise(self):
         worker = self._make_worker()

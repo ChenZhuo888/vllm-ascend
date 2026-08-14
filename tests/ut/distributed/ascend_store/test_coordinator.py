@@ -27,6 +27,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import ge
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
     AscendStoreCoordinator,
     ExternalCachedBlockPool,
+    HBMCachedBlockHashList,
 )
 # isort: on
 
@@ -92,6 +93,32 @@ class _FakeCompressedManager:
             for blocks, block in zip(computed, cached):
                 blocks.append(block)
         return computed, len(computed[0]) * logical_block_size
+
+
+class TestHBMCachedBlockHashList(unittest.TestCase):
+    def test_hbm_prefix_and_suffix_form_logical_hash_list(self):
+        h2 = b"h2"
+        h3 = b"h3"
+        hashes = HBMCachedBlockHashList([h2, h3], num_hbm_cached_hashes=2)
+        self.assertEqual(len(hashes), 4)
+        # The first two logical positions represent HBM-cached blocks.
+        self.assertIs(hashes[0], hashes[1])
+        # The suffix keeps its original absolute positions.
+        self.assertEqual(hashes[2], h2)
+        self.assertEqual(hashes[3], h3)
+        # Sequence semantics used by cache managers.
+        self.assertEqual(hashes[-1], h3)
+        sliced = hashes[1:3]
+        self.assertEqual(len(sliced), 2)
+        self.assertIs(sliced[0], hashes[0])
+        self.assertEqual(sliced[1], h2)
+
+    def test_index_out_of_range(self):
+        hashes = HBMCachedBlockHashList([b"h2", b"h3"], num_hbm_cached_hashes=2)
+        with self.assertRaises(IndexError):
+            _ = hashes[4]
+        with self.assertRaises(IndexError):
+            _ = hashes[-5]
 
 
 class TestAscendStoreCoordinator(unittest.TestCase):
@@ -240,6 +267,94 @@ class TestAscendStoreCoordinator(unittest.TestCase):
             return_value=(([False, False, False, True],), 2048),
         ):
             self.assertEqual(coord.load_mask(_hashes(16), 2048), ([True] * 4,))
+
+    def test_hbm_prefix_and_remote_hit_are_combined(self):
+        h2, h3 = _hashes(4)[2:]
+        block_hashes = HBMCachedBlockHashList([h2, h3], num_hbm_cached_hashes=2)
+        coord = AscendStoreCoordinator(
+            [KVCacheGroupSpec(["layer.0"], _full_spec(16))],
+            scheduler_block_size=16,
+            hash_block_size=16,
+            group_block_sizes=[16],
+            group_cache_families=["c1"],
+        )
+        _, hit_length = coord.find_longest_cache_hit(
+            block_hashes,
+            64,
+            ExternalCachedBlockPool(16, {(0, bytes(h2))})
+        )
+        self.assertEqual(hit_length, 48)
+
+    def test_hbm_prefix_remains_hit_when_first_remote_block_misses(self):
+        h2, h3 = _hashes(4)[2:]
+        block_hashes = HBMCachedBlockHashList([h2, h3], num_hbm_cached_hashes=2)
+        coord = AscendStoreCoordinator(
+            [KVCacheGroupSpec(["layer.0"], _full_spec(16))],
+            scheduler_block_size=16,
+            hash_block_size=16,
+            group_block_sizes=[16],
+            group_cache_families=["c1"],
+        )
+        _, hit_length = coord.find_longest_cache_hit(
+            block_hashes, 64, ExternalCachedBlockPool(16, set())
+        )
+        self.assertEqual(hit_length, 32)
+
+    def test_hbm_prefix_and_remote_hit_across_multiple_groups(self):
+        h2, h3 = _hashes(4)[2:]
+        block_hashes = HBMCachedBlockHashList([h2, h3], num_hbm_cached_hashes=2)
+        coord = AscendStoreCoordinator(
+            [
+                KVCacheGroupSpec(["layer.0"], _full_spec(16)),
+                KVCacheGroupSpec(["layer.1"], _full_spec(16)),
+            ],
+            scheduler_block_size=16,
+            hash_block_size=16,
+            group_block_sizes=[16, 16],
+            group_cache_families=["c1", "c1"],
+        )
+        _, hit_length = coord.find_longest_cache_hit(
+            block_hashes,
+            64,
+            ExternalCachedBlockPool(
+                16,
+                {
+                    # h2 exists in both groups.
+                    (0, bytes(h2)),
+                    (1, bytes(h2)),
+
+                    # h3 exists only in group 0.
+                    (0, bytes(h3)),
+                },
+            ),
+        )
+        self.assertEqual(hit_length, 48)
+
+    def test_multiple_groups_keep_hbm_prefix_when_remote_hit_is_not_common(self):
+        h2, h3 = _hashes(4)[2:]
+        block_hashes = HBMCachedBlockHashList(
+            [h2, h3],
+            num_hbm_cached_hashes=2,
+        )
+        coord = AscendStoreCoordinator(
+            [
+                KVCacheGroupSpec(["layer.0"], _full_spec(16)),
+                KVCacheGroupSpec(["layer.1"], _full_spec(16)),
+            ],
+            scheduler_block_size=16,
+            hash_block_size=16,
+            group_block_sizes=[16, 16],
+            group_cache_families=["c1", "c1"],
+        )
+        _, hit_length = coord.find_longest_cache_hit(
+            block_hashes,
+            64,
+            ExternalCachedBlockPool(
+                16,
+                {(0, bytes(h2))},
+            ),
+        )
+        self.assertEqual(hit_length, 32)
 
 
 if __name__ == "__main__":

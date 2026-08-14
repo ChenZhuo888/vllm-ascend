@@ -25,8 +25,11 @@ from vllm.distributed.kv_events import KVCacheEvent
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import (
     AscendStoreConnector,
     AscendStoreKVEvents,
+    LookupKeyServer,
 )
-
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    LookupHashMode,
+)
 # isort: on
 
 
@@ -80,6 +83,52 @@ class TestAscendStoreKVEvents(unittest.TestCase):
         s = repr(ev)
         self.assertIn("AscendStoreKVEvents", s)
 
+class TestLookupKeyServer(unittest.TestCase):
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store."
+        "ascend_store_connector.threading.Thread"
+    )
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store."
+        "ascend_store_connector.make_zmq_socket"
+    )
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store."
+        "ascend_store_connector.MsgpackDecoder"
+    )
+    def test_suffix_request_is_decoded_and_forwarded(self, mock_decoder_cls, mock_make_socket, mock_thread_cls):
+        config = MagicMock()
+        config.parallel_config.data_parallel_rank = 0
+        config.kv_transfer_config.kv_connector_extra_config = {}
+        pool_worker = MagicMock()
+        pool_worker.lookup_scheduler.return_value = 48
+        mock_socket = MagicMock()
+        mock_make_socket.return_value = mock_socket
+        decoder = mock_decoder_cls.return_value
+        decoder.decode.side_effect = [[0, 1], "suffix", ["aabb", "ccdd"]]
+        server = LookupKeyServer(pool_worker, config)
+        frames = [
+            (64).to_bytes(4, "big"),
+            b"groups",
+            (32).to_bytes(4, "big"),
+            b"mode",
+            b"hashes",
+        ]
+        def recv_once(copy=False):
+            server.running = False
+            return frames
+        mock_socket.recv_multipart.side_effect = recv_once
+        process_request = mock_thread_cls.call_args.kwargs["target"]
+        process_request()
+        pool_worker.lookup_scheduler.assert_called_once_with(
+            64,
+            ["aabb", "ccdd"],
+            [0, 1],
+            use_layerwise=False,
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+        mock_socket.send.assert_called_once_with((48).to_bytes(4, "big"))
 
 class TestAscendStoreConnector(unittest.TestCase):
     def _make_vllm_config(self, kv_role="kv_producer", extra_config=None):

@@ -23,6 +23,7 @@ import pytest
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LoadSpec,
+    LookupHashMode,
     RequestTracker,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
@@ -134,6 +135,7 @@ class TestKVPoolScheduler(unittest.TestCase):
             request.block_hashes,
             [0],
             hbm_hit_tokens=16,
+            lookup_hash_mode=LookupHashMode.FULL,
         )
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
@@ -153,6 +155,129 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(need, 63)
         self.assertEqual(scheduler.load_specs["r1"].kvpool_cached_tokens, 63)
         self.assertEqual(scheduler.load_specs["r1"].kvpool_store_skip_tokens, 64)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_get_num_new_matched_tokens_suffix_omits_hbm_hashes(self, mock_client_cls):
+        config = self._make_config(block_size=16, extra_config={"lookup_hash_mode": "suffix"})
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        mock_client_cls.return_value.lookup.return_value = 48
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h0", b"h1", b"h2", b"h3"]
+        need, is_async = scheduler.get_num_new_matched_tokens(request, 32)
+        self.assertEqual(need, 16)
+        self.assertFalse(is_async)
+        self.assertIn("r1", scheduler.load_specs)
+        mock_client_cls.return_value.lookup.assert_called_once_with(
+            64,
+            [b"h2", b"h3"],
+            [0],
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_get_num_new_matched_tokens_suffix_zero_hbm_keeps_all_hashes(self, mock_client_cls):
+        config = self._make_config(block_size=16, extra_config={"lookup_hash_mode": "suffix"})
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        mock_client_cls.return_value.lookup.return_value = 32
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h0", b"h1", b"h2", b"h3"]
+        need, is_async = scheduler.get_num_new_matched_tokens(request, 0)
+        self.assertEqual(need, 32)
+        self.assertFalse(is_async)
+        mock_client_cls.return_value.lookup.assert_called_once_with(
+            64,
+            request.block_hashes,
+            [0],
+            hbm_hit_tokens=0,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_get_num_new_matched_tokens_suffix_requires_hash_block_alignment(self, mock_client_cls):
+        config = self._make_config(block_size=16, extra_config={"lookup_hash_mode": "suffix"})
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h0", b"h1", b"h2", b"h3"]
+        with self.assertRaisesRegex(
+            AssertionError,
+            "num_computed_tokens must be aligned to hash_block_size",
+        ):
+            scheduler.get_num_new_matched_tokens(request, 24)
+        mock_client_cls.return_value.lookup.assert_not_called()
+
+    def test_lookup_hash_mode_defaults_to_full(self):
+        scheduler = KVPoolScheduler(self._make_config(block_size=16), use_layerwise=False,)
+        self.assertIs(scheduler.lookup_hash_mode, LookupHashMode.FULL)
+
+    def test_lookup_hash_mode_suffix_config(self):
+        scheduler = KVPoolScheduler(
+            self._make_config(
+                block_size=16,
+                extra_config={"lookup_hash_mode": "suffix"},
+            ),
+            use_layerwise=False,
+        )
+        self.assertIs(scheduler.lookup_hash_mode, LookupHashMode.SUFFIX)
+
+    def test_lookup_hash_mode_invalid_config(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "lookup_hash_mode must be one of: full, suffix",
+        ):
+            KVPoolScheduler(
+                self._make_config(
+                    block_size=16,
+                    extra_config={"lookup_hash_mode": "invalid"},
+                ),
+                use_layerwise=False,
+            )
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.make_zmq_socket")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.zmq")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.MsgpackEncoder")
+    def test_lookup_suffix_wire_protocol(self, mock_encoder_cls, mock_zmq, mock_make_socket):
+        config = MagicMock()
+        config.parallel_config.data_parallel_rank = 0
+        config.kv_transfer_config.kv_connector_extra_config = {}
+        mock_socket = MagicMock()
+        mock_make_socket.return_value = mock_socket
+        mock_socket.recv.return_value = (48).to_bytes(4, "big")
+        mock_encoder_cls.return_value.encode.side_effect = [[b"hashes"], [b"groups"], [b"mode"]]
+        client = LookupKeyClient(config)
+        result = client.lookup(
+            64,
+            [b"\xaa\xbb", b"\xcc\xdd"],
+            [0, 1],
+            hbm_hit_tokens=32,
+            lookup_hash_mode=LookupHashMode.SUFFIX,
+        )
+        self.assertEqual(result, 48)
+        encoder_calls = mock_encoder_cls.return_value.encode.call_args_list
+        self.assertEqual(encoder_calls[0].args[0], ["aabb", "ccdd"])
+        self.assertEqual(encoder_calls[1].args[0], [0, 1])
+        self.assertEqual(encoder_calls[2].args[0], "suffix")
+        mock_socket.send_multipart.assert_called_once()
+        frames = mock_socket.send_multipart.call_args.args[0]
+        self.assertEqual(
+            frames,
+            [
+                (64).to_bytes(4, "big"),
+                b"groups",
+                (32).to_bytes(4, "big"),
+                b"mode",
+                b"hashes",
+            ],
+        )
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_layerwise_mtp_hit_uses_safe_load_extent(self, mock_client_cls):
@@ -579,7 +704,7 @@ class TestLookupKeyClient(unittest.TestCase):
         mock_make_socket.return_value = mock_socket
         mock_socket.recv.return_value = (32).to_bytes(4, "big")
 
-        mock_encoder_cls.return_value.encode.side_effect = [[b"hashes"], [b"groups"]]
+        mock_encoder_cls.return_value.encode.side_effect = [[b"hashes"], [b"groups"], [b"mode"]]
         client = LookupKeyClient(config)
         result = client.lookup(64, [b"\xaa\xbb"], hbm_hit_tokens=16)
         self.assertEqual(result, 32)
@@ -591,6 +716,7 @@ class TestLookupKeyClient(unittest.TestCase):
                 (64).to_bytes(4, "big"),
                 b"groups",
                 (16).to_bytes(4, "big"),
+                b"mode",
                 b"hashes",
             ],
         )
