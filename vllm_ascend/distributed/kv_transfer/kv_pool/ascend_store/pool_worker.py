@@ -1678,7 +1678,7 @@ class KVPoolWorker:
             if not self.layer_load_tasks[layer_id] and reuse_source is None:
                 return False
             attention_start_gate = None
-            if self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
+            if self.layer_load_tasks[layer_id] and layer_id != self.current_layer and reuse_source is not None:
                 attention_start_gate = get_attention_compute_start_gate()
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]

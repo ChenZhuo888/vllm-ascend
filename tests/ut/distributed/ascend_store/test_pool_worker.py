@@ -205,6 +205,41 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         self.assertEqual(len(worker.layer_load_tasks), 5)
         self.assertEqual(len(worker.layer_save_tasks), 5)
 
+    def test_submit_ready_layer_loads_gates_only_reused_prefetch_layers(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+
+        worker.kv_recv_thread = MagicMock()
+        worker.current_layer = 0
+        worker.num_layers = 6
+        worker.num_prefetch_layers = 6
+        worker.next_layer_to_submit = 0
+
+        worker.prefetch_layer_map = {5: 1}
+        worker.layer_load_tasks = [[MagicMock()] for _ in range(worker.num_layers)]
+
+        gate = MagicMock(name="attention_start_gate")
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store."
+            "pool_worker.get_attention_compute_start_gate",
+            return_value=gate,
+        ) as mock_get_gate:
+            worker._submit_ready_layer_loads()
+        submitted_tasks = [
+            call.args[0]
+            for call in worker.kv_recv_thread.add_request.call_args_list
+        ]
+
+        self.assertEqual(
+            [task.layer_id for task in submitted_tasks],
+            [0, 1, 2, 3, 4, 5],
+        )
+        for layer_id in range(5):
+            self.assertIsNone(submitted_tasks[layer_id].attention_start_gate)
+        self.assertEqual(submitted_tasks[5].wait_for_save_layer, 1)
+        self.assertIs(submitted_tasks[5].attention_start_gate, gate)
+        mock_get_gate.assert_called_once_with()
+
 
 class TestKVPoolWorkerInit(unittest.TestCase):
     """Test KVPoolWorker initialization with mocked dependencies."""
