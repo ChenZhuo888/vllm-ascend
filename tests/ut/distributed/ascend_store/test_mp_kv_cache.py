@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import os
 import threading
 import time
 
@@ -10,6 +11,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp_kv_cache import
     AscendStoreKVCacheClientClosedError,
     AscendStoreKVCacheRemoteError,
     AscendStoreKVCacheServer,
+    AscendStoreKVCacheServerUnavailableError,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp_protocol import (
     RequestType,
@@ -99,6 +101,19 @@ def _run_hanging_server(conn):
         socket.close(linger=0)
         context.term()
         conn.close()
+
+
+def _run_crashing_server(conn):
+    context = zmq.Context()
+    socket = context.socket(zmq.ROUTER)
+    port = socket.bind_to_random_port("tcp://127.0.0.1")
+
+    conn.send(f"tcp://127.0.0.1:{port}")
+
+    socket.recv_multipart()
+    conn.send("request_received")
+
+    os._exit(1)
 
 
 def test_client_server_lifecycle():
@@ -286,3 +301,130 @@ def test_client_close_fails_pending_request():
         if server_process.is_alive():
             server_process.terminate()
             server_process.join()
+
+
+def test_server_crash_fails_pending_request():
+    ctx = mp.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe()
+
+    server_process = ctx.Process(target=_run_crashing_server, args=(child_conn,))
+    server_process.start()
+    child_conn.close()
+
+    client = None
+
+    try:
+        assert parent_conn.poll(5), "Server did not start in time"
+        client = AscendStoreKVCacheClient(parent_conn.recv())
+
+        future = client.submit_request(RequestType.ECHO, [b"never-return"])
+
+        assert parent_conn.poll(5), "Server did not receive request in time"
+        assert parent_conn.recv() == "request_received"
+
+        server_process.join(timeout=5)
+        assert not server_process.is_alive()
+        assert server_process.exitcode != 0
+
+        with pytest.raises(AscendStoreKVCacheServerUnavailableError, match="disconnected"):
+            future.result(timeout=5)
+
+        assert future.done()
+
+        with pytest.raises(AscendStoreKVCacheServerUnavailableError, match="unavailable"):
+            client.submit_request(RequestType.PING)
+    finally:
+        if client is not None:
+            client.close()
+
+        parent_conn.close()
+
+        if server_process.is_alive():
+            server_process.terminate()
+            server_process.join()
+
+
+def _run_crashing_server(conn):
+    context = zmq.Context()
+    socket = context.socket(zmq.ROUTER)
+    port = socket.bind_to_random_port("tcp://127.0.0.1")
+
+    conn.send(f"tcp://127.0.0.1:{port}")
+
+    socket.recv_multipart()
+    conn.send("request_received")
+
+    os._exit(1)
+
+
+def _run_server_at_endpoint(endpoint):
+    server = AscendStoreKVCacheServer(endpoint)
+
+    try:
+        server.run()
+    finally:
+        server.close()
+
+
+def test_client_recovers_after_server_restart():
+    ctx = mp.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe()
+
+    first_server_process = ctx.Process(target=_run_crashing_server, args=(child_conn,))
+    first_server_process.start()
+    child_conn.close()
+
+    second_server_process = None
+    client = None
+
+    try:
+        assert parent_conn.poll(5), "Server did not start in time"
+        endpoint = parent_conn.recv()
+        client = AscendStoreKVCacheClient(endpoint)
+
+        future = client.submit_request(RequestType.ECHO, [b"never-return"])
+
+        assert parent_conn.poll(5), "Server did not receive request in time"
+        assert parent_conn.recv() == "request_received"
+
+        first_server_process.join(timeout=5)
+        assert not first_server_process.is_alive()
+        assert first_server_process.exitcode != 0
+
+        with pytest.raises(AscendStoreKVCacheServerUnavailableError, match="disconnected"):
+            future.result(timeout=5)
+
+        assert future.done()
+        assert not client.is_healthy
+
+        with pytest.raises(AscendStoreKVCacheServerUnavailableError, match="unavailable"):
+            client.submit_request(RequestType.PING)
+
+        second_server_process = ctx.Process(target=_run_server_at_endpoint, args=(endpoint,))
+        second_server_process.start()
+
+        deadline = time.monotonic() + 5
+        while not client.is_healthy and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert client.is_healthy
+        assert client.ping() == "OK"
+        assert client.echo(b"after-restart") == b"after-restart"
+        assert client.shutdown() == "OK"
+
+        second_server_process.join(timeout=5)
+        assert not second_server_process.is_alive()
+        assert second_server_process.exitcode == 0
+    finally:
+        if client is not None:
+            client.close()
+
+        parent_conn.close()
+
+        if first_server_process.is_alive():
+            first_server_process.terminate()
+            first_server_process.join()
+
+        if second_server_process is not None and second_server_process.is_alive():
+            second_server_process.terminate()
+            second_server_process.join()

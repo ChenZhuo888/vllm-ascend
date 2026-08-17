@@ -6,6 +6,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import zmq
+from zmq.utils.monitor import recv_monitor_message
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp_protocol import (
     RequestType,
@@ -22,6 +23,10 @@ class AscendStoreKVCacheRemoteError(RuntimeError):
 
 
 class AscendStoreKVCacheClientClosedError(RuntimeError):
+    pass
+
+
+class AscendStoreKVCacheServerUnavailableError(ConnectionError):
     pass
 
 
@@ -169,28 +174,36 @@ class AscendStoreKVCacheClient:
         self._outbound_queue: queue.Queue[OutboundRequest] = queue.Queue()
         self._pending_futures: dict[bytes, tuple[bytes, Future[list[bytes]]]] = {}
 
-        self._close_requested = threading.Event()
-        self._closed = threading.Event()
-        self._close_lock = threading.Lock()
-        self._resources_closed = False
+        self._client_close_requested = threading.Event()
+        self._server_healthy = threading.Event()
+        self._server_healthy.set()
+        self._lifecycle_lock = threading.Lock()
+        self._resources_released = False
 
-        self._ready = threading.Event()
+        self._io_ready = threading.Event()
         self._io_error: Exception | None = None
 
         self._notify_reader, self._notify_writer = socket.socketpair()
         self._io_thread = threading.Thread(target=self._io_loop, daemon=True, name="ascend-store-kv-client")
         self._io_thread.start()
 
-        self._ready.wait()
+        self._io_ready.wait()
         if self._io_error is not None:
             raise RuntimeError("Failed to start KV cache client I/O thread") from self._io_error
+
+    @property
+    def is_healthy(self) -> bool:
+        return self._server_healthy.is_set()
 
     def submit_request(
         self, request_type: RequestType, payloads: list[bytes] | None = None
     ) -> Future[list[bytes]]:
-        with self._close_lock:
-            if self._close_requested.is_set() or self._resources_closed:
+        with self._lifecycle_lock:
+            if self._client_close_requested.is_set() or self._resources_released:
                 raise AscendStoreKVCacheClientClosedError("KV cache client is closed")
+
+            if not self._server_healthy.is_set():
+                raise AscendStoreKVCacheServerUnavailableError("KV cache server is unavailable")
 
             request_id = str(next(self._request_ids)).encode()
             request_type_bytes = encode_request_type(request_type)
@@ -239,17 +252,52 @@ class AscendStoreKVCacheClient:
 
         future.set_result(responses)
 
+    def _drain_inbound(self, zmq_socket: zmq.Socket) -> None:
+        while zmq_socket.poll(timeout=0, flags=zmq.POLLIN):
+            self._process_inbound(zmq_socket)
+
+    def _handle_server_disconnect(self, zmq_socket: zmq.Socket) -> None:
+        with self._lifecycle_lock:
+            if self._client_close_requested.is_set() or not self._server_healthy.is_set():
+                return
+
+            self._server_healthy.clear()
+
+        self._drain_inbound(zmq_socket)
+        self._fail_pending(
+            AscendStoreKVCacheServerUnavailableError(f"KV cache server disconnected: {self.server_url}")
+        )
+
+    def _handle_server_connected(self) -> None:
+        with self._lifecycle_lock:
+            if self._client_close_requested.is_set() or self._resources_released:
+                return
+
+            self._server_healthy.set()
+
+    def _process_monitor_event(self, zmq_socket: zmq.Socket, monitor_socket: zmq.Socket) -> None:
+        monitor_event = recv_monitor_message(monitor_socket)
+        event = monitor_event["event"]
+
+        if event == zmq.EVENT_DISCONNECTED:
+            self._handle_server_disconnect(zmq_socket)
+        elif event == zmq.EVENT_CONNECTED:
+            self._handle_server_connected()
+
     def _io_loop(self) -> None:
         zmq_socket = None
+        monitor_socket = None
 
         try:
             zmq_socket = self.context.socket(zmq.DEALER)
+            monitor_socket = zmq_socket.get_monitor_socket(events=zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED)
             zmq_socket.connect(self.server_url)
 
             poller = zmq.Poller()
             poller.register(zmq_socket, zmq.POLLIN)
+            poller.register(monitor_socket, zmq.POLLIN)
             poller.register(self._notify_reader.fileno(), zmq.POLLIN)
-            self._ready.set()
+            self._io_ready.set()
 
             while True:
                 events = dict(poller.poll())
@@ -257,7 +305,7 @@ class AscendStoreKVCacheClient:
                 if self._notify_reader.fileno() in events:
                     self._notify_reader.recv(4096)
 
-                    if self._close_requested.is_set():
+                    if self._client_close_requested.is_set():
                         self._fail_pending(AscendStoreKVCacheClientClosedError("KV cache client was closed"))
                         break
 
@@ -265,16 +313,25 @@ class AscendStoreKVCacheClient:
 
                 if zmq_socket in events:
                     self._process_inbound(zmq_socket)
+
+                if monitor_socket in events:
+                    self._process_monitor_event(zmq_socket, monitor_socket)
         except Exception as exc:
             self._io_error = exc
+
+            with self._lifecycle_lock:
+                self._server_healthy.clear()
+
             self._fail_pending(exc)
-            self._ready.set()
+            self._io_ready.set()
         finally:
+            if monitor_socket is not None:
+                monitor_socket.close(linger=0)
+
             if zmq_socket is not None:
                 zmq_socket.close(linger=0)
 
             self._notify_reader.close()
-            self._closed.set()
 
     def _fail_pending(self, exc: Exception) -> None:
         while True:
@@ -314,22 +371,25 @@ class AscendStoreKVCacheClient:
         return self._request(RequestType.SHUTDOWN, timeout_ms=timeout_ms)[0].decode()
 
     def close(self) -> None:
-        with self._close_lock:
-            if self._resources_closed:
+        with self._lifecycle_lock:
+            if self._resources_released:
                 return
 
-            if not self._close_requested.is_set():
-                self._close_requested.set()
+            if not self._client_close_requested.is_set():
+                self._client_close_requested.set()
 
                 if self._io_thread.is_alive():
-                    self._notify_writer.send(b"\x01")
+                    try:
+                        self._notify_writer.send(b"\x01")
+                    except OSError:
+                        pass
 
         self._io_thread.join()
 
-        with self._close_lock:
-            if self._resources_closed:
+        with self._lifecycle_lock:
+            if self._resources_released:
                 return
 
             self._notify_writer.close()
             self.context.term()
-            self._resources_closed = True
+            self._resources_released = True
