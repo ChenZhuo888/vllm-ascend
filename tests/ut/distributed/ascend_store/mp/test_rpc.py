@@ -22,11 +22,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.protocol im
 UPPERCASE_METHOD = "TEST_UPPERCASE"
 INVALID_RESPONSE_METHOD = "TEST_INVALID_RESPONSE"
 
+_WORKER_COUNT = 4
+_REQUESTS_PER_WORKER = 16
+
 
 def _start_server(target):
-    ctx = mp.get_context("spawn")
-    parent_conn, child_conn = ctx.Pipe()
-    process = ctx.Process(target=target, args=(child_conn,))
+    context = mp.get_context("spawn")
+    parent_conn, child_conn = context.Pipe()
+    process = context.Process(target=target, args=(child_conn,))
     process.start()
     child_conn.close()
 
@@ -51,7 +54,7 @@ def _cleanup(client: MPClient | None, conn, process) -> None:
 
     if process.is_alive():
         process.terminate()
-        process.join()
+    process.join()
 
 
 def _send_ok_response(
@@ -62,9 +65,8 @@ def _send_ok_response(
     identity, *request_frames = request
     request_id, method, payloads = decode_request(request_frames)
     response_payloads = payloads if responses is None else responses
-    router.send_multipart(
-        [identity, *encode_response(request_id, method, ResponseStatus.OK, response_payloads)]
-    )
+    response = [identity, *encode_response(request_id, method, ResponseStatus.OK, response_payloads)]
+    router.send_multipart(response)
 
 
 def _run_server(conn) -> None:
@@ -78,6 +80,27 @@ def _run_server(conn) -> None:
         server.close()
 
 
+def _run_client_worker(endpoint: str, worker_id: int, start_event, conn) -> None:
+    try:
+        with MPClient(endpoint) as client:
+            client.wait_until_connected()
+            conn.send(("ready", worker_id))
+
+            if not start_event.wait(5):
+                raise TimeoutError("Timed out waiting for other workers")
+
+            responses = []
+            for request_id in range(_REQUESTS_PER_WORKER):
+                payload = f"worker-{worker_id}-request-{request_id}".encode()
+                responses.append(client.echo(payload))
+
+            conn.send(("result", worker_id, responses))
+    except Exception as exc:
+        conn.send(("error", worker_id, f"{type(exc).__name__}: {exc}"))
+    finally:
+        conn.close()
+
+
 def _uppercase_handler(payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
     if len(payloads) != 1:
         raise ValueError(f"{UPPERCASE_METHOD} expects 1 payload, got {len(payloads)}")
@@ -89,13 +112,11 @@ def _invalid_response_handler(_payloads: tuple[bytes, ...]):
 
 
 def _run_server_with_injected_handlers(conn) -> None:
-    server = MPServer(
-        "tcp://127.0.0.1:*",
-        handlers={
-            UPPERCASE_METHOD: _uppercase_handler,
-            INVALID_RESPONSE_METHOD: _invalid_response_handler,
-        },
-    )
+    handlers = {
+        UPPERCASE_METHOD: _uppercase_handler,
+        INVALID_RESPONSE_METHOD: _invalid_response_handler,
+    }
+    server = MPServer("tcp://127.0.0.1:*", handlers=handlers)
 
     try:
         conn.send(server.endpoint)
@@ -176,12 +197,7 @@ def test_protocol_round_trip():
     request_frames = encode_request(b"request-1", SystemMethod.ECHO, (b"payload",))
     assert decode_request(request_frames) == (b"request-1", "ECHO", (b"payload",))
 
-    response_frames = encode_response(
-        b"request-1",
-        SystemMethod.ECHO,
-        ResponseStatus.OK,
-        (b"response",),
-    )
+    response_frames = encode_response(b"request-1", SystemMethod.ECHO, ResponseStatus.OK, (b"response",))
     assert decode_response(response_frames) == (
         b"request-1",
         "ECHO",
@@ -211,6 +227,62 @@ def test_client_server_round_trip():
         assert client.ping() == "OK"
     finally:
         _cleanup(client, parent_conn, process)
+
+
+def test_multiple_worker_processes_receive_their_own_responses():
+    server_process, server_conn, endpoint = _start_server(_run_server)
+    context = mp.get_context("spawn")
+    start_event = context.Event()
+    worker_processes = []
+    worker_conns = []
+
+    try:
+        for worker_id in range(_WORKER_COUNT):
+            parent_conn, child_conn = context.Pipe()
+            process = context.Process(
+                target=_run_client_worker,
+                args=(endpoint, worker_id, start_event, child_conn),
+            )
+            process.start()
+            child_conn.close()
+            worker_processes.append(process)
+            worker_conns.append(parent_conn)
+
+        for worker_id, conn in enumerate(worker_conns):
+            assert conn.poll(5), f"Worker {worker_id} did not connect in time"
+            assert conn.recv() == ("ready", worker_id)
+
+        start_event.set()
+
+        for worker_id, conn in enumerate(worker_conns):
+            assert conn.poll(10), f"Worker {worker_id} did not finish in time"
+            message = conn.recv()
+            assert message[0] == "result", message
+
+            _, returned_worker_id, responses = message
+            expected = [
+                f"worker-{worker_id}-request-{request_id}".encode()
+                for request_id in range(_REQUESTS_PER_WORKER)
+            ]
+            assert returned_worker_id == worker_id
+            assert responses == expected
+
+        for process in worker_processes:
+            process.join(timeout=5)
+            assert not process.is_alive()
+            assert process.exitcode == 0
+    finally:
+        start_event.set()
+
+        for conn in worker_conns:
+            conn.close()
+
+        for process in worker_processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+
+        _cleanup(None, server_conn, server_process)
 
 
 def test_server_uses_injected_handlers():
