@@ -3,7 +3,7 @@ import multiprocessing as mp
 import pytest
 import zmq
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPClient,
     MPClientClosedError,
     MPRemoteError,
@@ -11,7 +11,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import (
     MPServer,
     SystemMethod,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.protocol import (
     ResponseStatus,
     decode_request,
     decode_response,
