@@ -3,7 +3,6 @@ import enum
 
 class RequestType(enum.Enum):
     PING = "PING"
-    SHUTDOWN = "SHUTDOWN"
     ECHO = "ECHO"
 
 
