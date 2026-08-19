@@ -37,33 +37,44 @@ def _validate_rank(rank: int, field_name: str) -> None:
 @dataclass(frozen=True)
 class SchedulerIdentity:
     engine_id: str
+    data_parallel_rank: int = 0
 
     def __post_init__(self) -> None:
         _validate_engine_id(self.engine_id)
+        _validate_rank(self.data_parallel_rank, "data_parallel_rank")
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "SchedulerIdentity":
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is None:
             raise ValueError("kv_transfer_config must be set")
-        return cls(engine_id=kv_transfer_config.engine_id)
+        return cls(
+            engine_id=kv_transfer_config.engine_id,
+            data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
+        )
 
 
 @dataclass(frozen=True)
 class WorkerIdentity:
     engine_id: str
     rank: int
+    data_parallel_rank: int = 0
 
     def __post_init__(self) -> None:
         _validate_engine_id(self.engine_id)
         _validate_rank(self.rank, "rank")
+        _validate_rank(self.data_parallel_rank, "data_parallel_rank")
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "WorkerIdentity":
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is None:
             raise ValueError("kv_transfer_config must be set")
-        return cls(engine_id=kv_transfer_config.engine_id, rank=vllm_config.parallel_config.rank)
+        return cls(
+            engine_id=kv_transfer_config.engine_id,
+            rank=vllm_config.parallel_config.rank,
+            data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
+        )
 
 
 @dataclass(frozen=True)

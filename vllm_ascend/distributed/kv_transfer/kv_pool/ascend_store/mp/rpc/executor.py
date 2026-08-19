@@ -67,8 +67,9 @@ class _AffinityTask(Generic[_ResultT]):
 class AffinityExecutor:
     """Execute tasks with the same key serially on the same worker thread.
 
-    Different keys may map to the same worker and are then safely serialized.
-    The total number of running and pending tasks is bounded.
+    Affinity keys should identify a bounded set of long-lived resources. New
+    keys are assigned to workers in round-robin order and retain that mapping
+    until shutdown. The total number of running and pending tasks is bounded.
     """
 
     def __init__(self, max_workers: int, max_pending_tasks: int, thread_name_prefix: str):
@@ -76,6 +77,8 @@ class AffinityExecutor:
         self._queues: list[queue.Queue[object]] = [queue.Queue() for _ in range(max_workers)]
         self._capacity = threading.BoundedSemaphore(max_workers + max_pending_tasks)
         self._state_lock = threading.Lock()
+        self._key_to_worker: dict[Hashable, int] = {}
+        self._next_worker = 0
         self._closed = False
         self._threads = [
             threading.Thread(
@@ -95,18 +98,32 @@ class AffinityExecutor:
             *args: Any,
             **kwargs: Any,
     ) -> Future[_ResultT]:
-        worker_index = hash(affinity_key) % len(self._queues)
-
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("Affinity executor is closed")
             if not self._capacity.acquire(blocking=False):
                 raise MPServerBusyError("Affinity executor is at capacity")
 
+            try:
+                worker_index = self._get_worker_index(affinity_key)
+            except BaseException:
+                self._capacity.release()
+                raise
+
             future: Future[_ResultT] = Future()
             future.add_done_callback(self._release_capacity)
             self._queues[worker_index].put_nowait(_AffinityTask(future, partial(fn, *args, **kwargs)))
             return future
+
+    def _get_worker_index(self, affinity_key: Hashable) -> int:
+        worker_index = self._key_to_worker.get(affinity_key)
+        if worker_index is not None:
+            return worker_index
+
+        worker_index = self._next_worker
+        self._next_worker = (self._next_worker + 1) % len(self._queues)
+        self._key_to_worker[affinity_key] = worker_index
+        return worker_index
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
         with self._state_lock:

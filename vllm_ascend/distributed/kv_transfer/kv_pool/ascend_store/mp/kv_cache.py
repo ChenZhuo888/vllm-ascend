@@ -21,11 +21,14 @@ from .registration import (
     encode_registration,
 )
 from .rpc import (
+    ExecutionMode,
+    HandlerSpec,
     MPClient,
     MPProtocolError,
     MPRemoteError,
     MPRequestTimeoutError,
     MPServer,
+    MPServerBusyError,
     MPServerUnavailableError,
 )
 
@@ -35,7 +38,7 @@ _HEARTBEAT_INTERVAL_MS = 1000
 _HEARTBEAT_TIMEOUT_MS = 1000
 _INTEGER_BYTES = 8
 _BYTE_ORDER = "big"
-_LOOKUP_HEADER_PAYLOADS = 5
+_LOOKUP_HEADER_PAYLOADS = 6
 _REGISTRATION_RESPONSE = b"OK"
 _ASYNC_RESPONSE = b"\x01"
 _SYNC_RESPONSE = b"\x00"
@@ -64,12 +67,12 @@ class SchedulerNode(Protocol):
 
 class WorkerNode(Protocol):
     def lookup_scheduler(
-        self,
-        token_len: int,
-        block_hashes: list[str],
-        kv_cache_group_ids: list[int] | None = None,
-        use_layerwise: bool = False,
-        hbm_hit_tokens: int = 0,
+            self,
+            token_len: int,
+            block_hashes: list[str],
+            kv_cache_group_ids: list[int] | None = None,
+            use_layerwise: bool = False,
+            hbm_hit_tokens: int = 0,
     ) -> int: ...
 
 
@@ -161,11 +164,12 @@ def _decode_block_hash(payload: bytes) -> BlockHash:
 
 
 def _encode_lookup_request(
-    identity: SchedulerIdentity, request: Request, num_computed_tokens: int
+        identity: SchedulerIdentity, request: Request, num_computed_tokens: int
 ) -> tuple[bytes, ...]:
     prompt_token_count = len(request.prompt_token_ids)
     payloads = [
         _encode_text(identity.engine_id, "engine_id"),
+        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
         _encode_text(request.request_id, "request_id"),
         _encode_non_negative_int(prompt_token_count, "prompt_token_count"),
         _encode_non_negative_int(request.num_tokens, "num_tokens"),
@@ -175,17 +179,28 @@ def _encode_lookup_request(
     return tuple(payloads)
 
 
-def _decode_lookup_request(
-    payloads: tuple[bytes, ...],
-) -> tuple[SchedulerIdentity, _LookupRequestView, int]:
+def _decode_lookup_identity(payloads: tuple[bytes, ...]) -> SchedulerIdentity:
     if len(payloads) < _LOOKUP_HEADER_PAYLOADS:
         raise MPProtocolError(f"LOOKUP expects at least {_LOOKUP_HEADER_PAYLOADS} payloads, got {len(payloads)}")
 
-    identity = SchedulerIdentity(engine_id=_decode_text(payloads[0], "engine_id"))
-    request_id = _decode_text(payloads[1], "request_id")
-    prompt_token_count = _decode_non_negative_int(payloads[2], "prompt_token_count")
-    num_tokens = _decode_non_negative_int(payloads[3], "num_tokens")
-    num_computed_tokens = _decode_non_negative_int(payloads[4], "num_computed_tokens")
+    return SchedulerIdentity(
+        engine_id=_decode_text(payloads[0], "engine_id"),
+        data_parallel_rank=_decode_non_negative_int(payloads[1], "data_parallel_rank"),
+    )
+
+
+def _lookup_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
+    return _decode_lookup_identity(payloads)
+
+
+def _decode_lookup_request(
+        payloads: tuple[bytes, ...],
+) -> tuple[SchedulerIdentity, _LookupRequestView, int]:
+    identity = _decode_lookup_identity(payloads)
+    request_id = _decode_text(payloads[2], "request_id")
+    prompt_token_count = _decode_non_negative_int(payloads[3], "prompt_token_count")
+    num_tokens = _decode_non_negative_int(payloads[4], "num_tokens")
+    num_computed_tokens = _decode_non_negative_int(payloads[5], "num_computed_tokens")
     block_hashes = [_decode_block_hash(payload) for payload in payloads[_LOOKUP_HEADER_PAYLOADS:]]
 
     request = _LookupRequestView(
@@ -230,7 +245,7 @@ class KVCacheClient:
             return self._registered and self._rpc_client.is_server_responsive
 
     def register_scheduler(
-        self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig | None, page_size_bytes: int
+            self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig | None, page_size_bytes: int
     ) -> bool:
         registration = SchedulerRegistration.create(
             vllm_config,
@@ -252,7 +267,7 @@ class KVCacheClient:
         )
 
     def _configure_registration(
-        self, method: KVCacheMethod, identity: SchedulerIdentity | WorkerIdentity, payload: bytes
+            self, method: KVCacheMethod, identity: SchedulerIdentity | WorkerIdentity, payload: bytes
     ) -> bool:
         with self._registration_lock:
             if self._registration is not None and self._registration.method != method:
@@ -285,7 +300,7 @@ class KVCacheClient:
             responses = self._rpc_client.request(
                 registration.method, (registration.payload,), timeout_ms=_REGISTRATION_TIMEOUT_MS
             )
-        except (MPRequestTimeoutError, MPServerUnavailableError):
+        except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError):
             self._mark_unregistered()
             return False
 
@@ -311,7 +326,7 @@ class KVCacheClient:
         return registration.identity
 
     def lookup(
-        self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS
+            self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS
     ) -> tuple[int, bool]:
         identity = self._get_scheduler_identity()
         payloads = _encode_lookup_request(identity, request, num_computed_tokens)
@@ -321,6 +336,8 @@ class KVCacheClient:
 
         try:
             responses = self._rpc_client.request(KVCacheMethod.LOOKUP, payloads, timeout_ms=timeout_ms)
+        except MPServerBusyError:
+            return 0, False
         except (MPRequestTimeoutError, MPServerUnavailableError):
             self._mark_unregistered()
             return 0, False
@@ -344,11 +361,11 @@ class KVCacheServer:
     """Own Scheduler and Worker services and expose their operations through RPC."""
 
     def __init__(
-        self,
-        bind_url: str,
-        max_workers: int = 4,
-        scheduler_factory: SchedulerFactory | None = None,
-        worker_factory: WorkerFactory | None = None,
+            self,
+            bind_url: str,
+            max_workers: int = 4,
+            scheduler_factory: SchedulerFactory | None = None,
+            worker_factory: WorkerFactory | None = None,
     ):
         self._registry_lock = threading.RLock()
         self._schedulers: dict[SchedulerIdentity, _RegisteredScheduler] = {}
@@ -361,7 +378,7 @@ class KVCacheServer:
             handlers={
                 KVCacheMethod.REGISTER_SCHEDULER: self._handle_register_scheduler,
                 KVCacheMethod.REGISTER_WORKER: self._handle_register_worker,
-                KVCacheMethod.LOOKUP: self._handle_lookup,
+                KVCacheMethod.LOOKUP: HandlerSpec(self._handle_lookup, ExecutionMode.AFFINITY, _lookup_affinity_key),
             },
         )
 
@@ -451,7 +468,9 @@ class KVCacheServer:
 
             service = self._worker_factory(registration)
             self._workers[registration.identity] = _RegisteredWorker(fingerprint, service)
-            scheduler_identity = SchedulerIdentity(registration.identity.engine_id)
+            scheduler_identity = SchedulerIdentity(
+                registration.identity.engine_id, registration.identity.data_parallel_rank
+            )
             self._bind_engine_store(scheduler_identity)
 
         return (_REGISTRATION_RESPONSE,)
@@ -466,7 +485,10 @@ class KVCacheServer:
             return
 
         for identity, worker in self._workers.items():
-            if identity.engine_id != scheduler_identity.engine_id:
+            if (
+                    identity.engine_id != scheduler_identity.engine_id
+                    or identity.data_parallel_rank != scheduler_identity.data_parallel_rank
+            ):
                 continue
 
             bind_store = getattr(worker.service, "bind_store", None)
@@ -474,15 +496,19 @@ class KVCacheServer:
                 bind_store(store)
 
     def _lookup_worker(
-        self,
-        scheduler_identity: SchedulerIdentity,
-        token_len: int,
-        block_hashes: Sequence[BlockHash],
-        kv_cache_group_ids: list[int] | None,
-        use_layerwise: bool,
-        hbm_hit_tokens: int,
+            self,
+            scheduler_identity: SchedulerIdentity,
+            token_len: int,
+            block_hashes: Sequence[BlockHash],
+            kv_cache_group_ids: list[int] | None,
+            use_layerwise: bool,
+            hbm_hit_tokens: int,
     ) -> int:
-        worker_identity = WorkerIdentity(scheduler_identity.engine_id, rank=0)
+        worker_identity = WorkerIdentity(
+            scheduler_identity.engine_id,
+            rank=0,
+            data_parallel_rank=scheduler_identity.data_parallel_rank,
+        )
         with self._registry_lock:
             worker = self._workers.get(worker_identity)
 
