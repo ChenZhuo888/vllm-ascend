@@ -16,6 +16,7 @@ class SystemMethod(str, enum.Enum):
 class ResponseStatus(str, enum.Enum):
     OK = "OK"
     ERROR = "ERROR"
+    BUSY = "BUSY"
 
 
 def normalize_method(method: str) -> str:
@@ -65,9 +66,7 @@ def encode_request(request_id: bytes, method: str, payloads: Iterable[bytes] = (
 
 def decode_request(frames: Sequence[bytes]) -> tuple[bytes, str, tuple[bytes, ...]]:
     if len(frames) < 2:
-        raise MPProtocolError(
-            f"Expected [request_id, method, *payloads], got {len(frames)} frames"
-        )
+        raise MPProtocolError(f"Expected [request_id, method, *payloads], got {len(frames)} frames")
 
     request_id, method_frame, *payloads = frames
     _validate_frame(request_id, "request ID")
@@ -88,9 +87,7 @@ def decode_response(
         frames: Sequence[bytes],
 ) -> tuple[bytes, str, ResponseStatus, tuple[bytes, ...]]:
     if len(frames) < 3:
-        raise MPProtocolError(
-            f"Expected [request_id, method, status, *payloads], got {len(frames)} frames"
-        )
+        raise MPProtocolError(f"Expected [request_id, method, status, *payloads], got {len(frames)} frames")
 
     request_id, method_frame, status_frame, *payloads = frames
     _validate_frame(request_id, "request ID")

@@ -5,12 +5,22 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.error impor
     MPProtocolError,
     MPRemoteError,
     MPRequestTimeoutError,
+    MPServerBusyError,
     MPServerUnavailableError,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.executor import (
+    AffinityExecutor,
+    BoundedThreadPoolExecutor,
+    ExecutionMode,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.protocol import SystemMethod
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.server import MPServer, RequestHandler
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.server import HandlerSpec, MPServer, RequestHandler
 
 __all__ = [
+    "AffinityExecutor",
+    "BoundedThreadPoolExecutor",
+    "ExecutionMode",
+    "HandlerSpec",
     "MPClient",
     "MPClientClosedError",
     "MPError",
@@ -18,6 +28,7 @@ __all__ = [
     "MPRemoteError",
     "MPRequestTimeoutError",
     "MPServer",
+    "MPServerBusyError",
     "MPServerUnavailableError",
     "RequestHandler",
     "SystemMethod",

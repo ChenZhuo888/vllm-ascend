@@ -20,3 +20,7 @@ class MPServerUnavailableError(MPError, ConnectionError):
 
 class MPRequestTimeoutError(MPError, TimeoutError):
     pass
+
+
+class MPServerBusyError(MPError):
+    pass

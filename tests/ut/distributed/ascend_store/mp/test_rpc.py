@@ -1,14 +1,20 @@
 import multiprocessing as mp
+import threading
 
 import pytest
 import zmq
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
+    AffinityExecutor,
+    BoundedThreadPoolExecutor,
+    ExecutionMode,
+    HandlerSpec,
     MPClient,
     MPClientClosedError,
     MPRemoteError,
     MPRequestTimeoutError,
     MPServer,
+    MPServerBusyError,
     SystemMethod,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.protocol import (
@@ -21,6 +27,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.protocol im
 
 UPPERCASE_METHOD = "TEST_UPPERCASE"
 INVALID_RESPONSE_METHOD = "TEST_INVALID_RESPONSE"
+AFFINITY_METHOD = "TEST_AFFINITY"
+BLOCKING_METHOD = "TEST_BLOCKING"
 
 _WORKER_COUNT = 4
 _REQUESTS_PER_WORKER = 16
@@ -111,12 +119,23 @@ def _invalid_response_handler(_payloads: tuple[bytes, ...]):
     return None
 
 
+def _affinity_handler(payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+    if len(payloads) != 1:
+        raise ValueError(f"{AFFINITY_METHOD} expects 1 payload, got {len(payloads)}")
+    return (str(threading.get_ident()).encode(),)
+
+
+def _integer_affinity_key(_identity: bytes, payloads: tuple[bytes, ...]) -> int:
+    return int(payloads[0])
+
+
 def _run_server_with_injected_handlers(conn) -> None:
     handlers = {
         UPPERCASE_METHOD: _uppercase_handler,
         INVALID_RESPONSE_METHOD: _invalid_response_handler,
+        AFFINITY_METHOD: HandlerSpec(_affinity_handler, ExecutionMode.AFFINITY, _integer_affinity_key),
     }
-    server = MPServer("tcp://127.0.0.1:*", handlers=handlers)
+    server = MPServer("tcp://127.0.0.1:*", handlers=handlers, affinity_workers=2)
 
     try:
         conn.send(server.endpoint)
@@ -124,6 +143,28 @@ def _run_server_with_injected_handlers(conn) -> None:
         server.run()
     finally:
         server.close()
+
+
+def _run_bounded_server(conn) -> None:
+    def blocking_handler(payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        conn.send("handler_started")
+        if conn.recv() != "release_handler":
+            raise ValueError("Unexpected bounded server command")
+        return payloads
+
+    server = MPServer(
+        "tcp://127.0.0.1:*",
+        max_workers=1,
+        handlers={BLOCKING_METHOD: blocking_handler},
+        max_pending_requests=0,
+    )
+
+    try:
+        conn.send(server.endpoint)
+        server.run()
+    finally:
+        server.close()
+        conn.close()
 
 
 def _run_reordering_server(conn) -> None:
@@ -261,8 +302,7 @@ def test_multiple_worker_processes_receive_their_own_responses():
 
             _, returned_worker_id, responses = message
             expected = [
-                f"worker-{worker_id}-request-{request_id}".encode()
-                for request_id in range(_REQUESTS_PER_WORKER)
+                f"worker-{worker_id}-request-{request_id}".encode() for request_id in range(_REQUESTS_PER_WORKER)
             ]
             assert returned_worker_id == worker_id
             assert responses == expected
@@ -298,9 +338,38 @@ def test_server_uses_injected_handlers():
         with pytest.raises(MPRemoteError, match="Payloads must be an iterable of bytes"):
             client.request(INVALID_RESPONSE_METHOD)
 
+        first_worker = client.request(AFFINITY_METHOD, [b"0"])
+        assert client.request(AFFINITY_METHOD, [b"0"]) == first_worker
+        assert client.request(AFFINITY_METHOD, [b"1"]) != first_worker
+
         assert process.is_alive()
         assert client.ping() == "OK"
     finally:
+        _cleanup(client, parent_conn, process)
+
+
+def test_server_returns_busy_when_executor_is_at_capacity():
+    process, parent_conn, endpoint = _start_server(_run_bounded_server)
+    client = None
+    handler_released = False
+
+    try:
+        client = MPClient(endpoint)
+        client.wait_until_connected()
+        first_future = client.submit_request(BLOCKING_METHOD, [b"first"])
+
+        assert parent_conn.poll(5), "Handler did not start in time"
+        assert parent_conn.recv() == "handler_started"
+
+        with pytest.raises(MPServerBusyError, match="Parallel executor is at capacity"):
+            client.request(BLOCKING_METHOD, [b"second"])
+
+        parent_conn.send("release_handler")
+        handler_released = True
+        assert first_future.result(timeout=5) == [b"first"]
+    finally:
+        if process.is_alive() and not handler_released:
+            parent_conn.send("release_handler")
         _cleanup(client, parent_conn, process)
 
 
@@ -393,3 +462,73 @@ def test_dispatched_request_cannot_be_cancelled():
         assert process.exitcode == 0
     finally:
         _cleanup(client, parent_conn, process)
+
+
+def test_bounded_thread_pool_rejects_excess_work():
+    started = threading.Event()
+    release = threading.Event()
+    executor = BoundedThreadPoolExecutor(1, 0, "test-bounded-pool")
+
+    def wait_for_release() -> None:
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("Timed out waiting to release the executor")
+
+    try:
+        first_future = executor.submit(wait_for_release)
+        assert started.wait(5)
+
+        with pytest.raises(MPServerBusyError, match="Parallel executor is at capacity"):
+            executor.submit(wait_for_release)
+
+        release.set()
+        first_future.result(timeout=5)
+    finally:
+        release.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_affinity_executor_serializes_same_key_on_same_thread():
+    started = threading.Event()
+    release = threading.Event()
+    execution_order = []
+    worker_threads = []
+    executor = AffinityExecutor(2, 2, "test-affinity")
+
+    def record_execution(index: int) -> int:
+        if index == 0:
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("Timed out waiting to release the affinity executor")
+        execution_order.append(index)
+        worker_threads.append(threading.get_ident())
+        return index
+
+    try:
+        futures = [executor.submit("engine-0", record_execution, 0)]
+        assert started.wait(5)
+        futures.extend(executor.submit("engine-0", record_execution, index) for index in (1, 2))
+
+        release.set()
+        assert [future.result(timeout=5) for future in futures] == [0, 1, 2]
+        assert execution_order == [0, 1, 2]
+        assert len(set(worker_threads)) == 1
+    finally:
+        release.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_affinity_executor_runs_different_keys_in_parallel():
+    barrier = threading.Barrier(2)
+    executor = AffinityExecutor(2, 0, "test-affinity")
+
+    def wait_for_peer() -> int:
+        barrier.wait(timeout=5)
+        return threading.get_ident()
+
+    try:
+        first_future = executor.submit(0, wait_for_peer)
+        second_future = executor.submit(1, wait_for_peer)
+        assert first_future.result(timeout=5) != second_future.result(timeout=5)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)

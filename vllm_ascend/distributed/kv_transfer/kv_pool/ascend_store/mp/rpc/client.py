@@ -9,6 +9,7 @@ Thread ownership rules:
   blocking methods on this client.
 """
 
+import contextlib
 import itertools
 import logging
 import math
@@ -28,6 +29,7 @@ from .error import (
     MPProtocolError,
     MPRemoteError,
     MPRequestTimeoutError,
+    MPServerBusyError,
     MPServerUnavailableError,
 )
 from .protocol import (
@@ -152,10 +154,8 @@ class MPClient:
         return time.monotonic() + timeout_ms / 1000
 
     def _notify_io_thread(self) -> None:
-        try:
+        with contextlib.suppress(BlockingIOError):
             self._notify_writer.send(b"\x01")
-        except BlockingIOError:
-            pass
 
     def submit_request(
             self,
@@ -244,15 +244,14 @@ class MPClient:
 
         if response_method != pending.method:
             pending.future.set_exception(
-                MPProtocolError(
-                    f"Response method mismatch: expected {pending.method!r}, got {response_method!r}"
-                )
+                MPProtocolError(f"Response method mismatch: expected {pending.method!r}, got {response_method!r}")
             )
             return
 
-        if status is ResponseStatus.ERROR:
+        if status is not ResponseStatus.OK:
             message = responses[0].decode(errors="replace") if responses else "Unknown server error"
-            pending.future.set_exception(MPRemoteError(message))
+            error = MPServerBusyError(message) if status is ResponseStatus.BUSY else MPRemoteError(message)
+            pending.future.set_exception(error)
             return
 
         pending.future.set_result(list(responses))
@@ -483,10 +482,8 @@ class MPClient:
                 self._server_responsive.clear()
 
                 if self._io_thread.is_alive():
-                    try:
+                    with contextlib.suppress(OSError):
                         self._notify_io_thread()
-                    except OSError:
-                        pass
 
         self._io_thread.join()
 
