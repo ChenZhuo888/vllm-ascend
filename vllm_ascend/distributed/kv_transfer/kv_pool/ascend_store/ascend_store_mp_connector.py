@@ -15,7 +15,6 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import KVPoolScheduler
 
 _KV_CACHE_SERVER_URL_KEY = "kv_cache_server_url"
 
@@ -37,33 +36,49 @@ def _get_kv_cache_server_url(vllm_config: VllmConfig) -> str:
 
 
 class AscendStoreMPConnector(KVConnectorBase_V1):
-    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
-        super().__init__(vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config)
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: KVCacheConfig | None = None,
+    ):
+        super().__init__(
+            vllm_config=vllm_config,
+            role=role,
+            kv_cache_config=kv_cache_config,
+        )
         self._kv_cache_client = KVCacheClient(_get_kv_cache_server_url(vllm_config))
-        self._pool_scheduler: KVPoolScheduler | None = None
 
-        if role == KVConnectorRole.SCHEDULER:
-            if kv_cache_config is None:
-                raise ValueError("kv_cache_config must be set for the scheduler connector")
+        try:
+            if role == KVConnectorRole.SCHEDULER:
+                if kv_cache_config is None:
+                    raise ValueError("kv_cache_config must be set for the scheduler connector")
 
-            page_size_bytes = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-            self._pool_scheduler = KVPoolScheduler(
-                vllm_config, use_layerwise=False, kv_cache_config=kv_cache_config, page_size_bytes=page_size_bytes
-            )
-            self._pool_scheduler.client = self._kv_cache_client  # type: ignore[assignment]
+                page_size_bytes = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+                self._kv_cache_client.register_scheduler(
+                    vllm_config,
+                    kv_cache_config,
+                    page_size_bytes,
+                )
+            else:
+                self._kv_cache_client.register_worker(
+                    vllm_config,
+                    kv_cache_config,
+                )
+        except Exception:
+            self._kv_cache_client.close()
+            raise
 
     def get_num_new_matched_tokens(
-            self, request: Request, num_computed_tokens: int
+        self,
+        request: Request,
+        num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         if self.role != KVConnectorRole.SCHEDULER:
             raise RuntimeError("get_num_new_matched_tokens is only available on the scheduler connector")
-        if self._pool_scheduler is None:
-            raise RuntimeError("KV pool scheduler is not initialized")
-        return self._pool_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+        return self._kv_cache_client.lookup(request, num_computed_tokens)
 
-    def update_state_after_alloc(
-            self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
-    ) -> None:
+    def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int) -> None:
         return None
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
@@ -76,11 +91,11 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         return None
 
     def save_kv_layer(
-            self,
-            layer_name: str,
-            kv_layer: torch.Tensor,
-            attn_metadata: AttentionMetadata,
-            **kwargs: Any,
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs: Any,
     ) -> None:
         return None
 

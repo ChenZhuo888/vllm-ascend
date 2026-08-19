@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import time
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 # isort: off
@@ -8,7 +9,15 @@ import zmq.asyncio  # noqa: F401
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheServer
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.lookup_worker import LookupKVPoolWorker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache import WorkerLookupHandler
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.lookup_worker import (
+    LookupKVPoolWorker,
+    MPKVPoolScheduler,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
+    SchedulerRegistration,
+    WorkerRegistration,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import KVPoolScheduler
 
 # isort: on
@@ -26,7 +35,7 @@ class _FakeStore:
         return self._exists_result[: len(keys)]
 
 
-def _make_vllm_config(tp_size: int = 1) -> MagicMock:
+def _make_vllm_config(tp_size: int = 1, rank: int = 0) -> MagicMock:
     config = MagicMock()
 
     hf_config = MagicMock(spec=[])
@@ -38,7 +47,7 @@ def _make_vllm_config(tp_size: int = 1) -> MagicMock:
     config.model_config.get_num_layers.return_value = 2
     config.model_config.get_total_num_kv_heads.return_value = tp_size
 
-    config.parallel_config.rank = 0
+    config.parallel_config.rank = rank
     config.parallel_config.world_size = tp_size
     config.parallel_config.data_parallel_rank = 0
     config.parallel_config.data_parallel_size = 1
@@ -48,6 +57,7 @@ def _make_vllm_config(tp_size: int = 1) -> MagicMock:
     config.parallel_config.decode_context_parallel_size = 1
 
     config.kv_transfer_config.kv_role = "kv_producer"
+    config.kv_transfer_config.engine_id = "engine-0"
     config.kv_transfer_config.kv_connector_extra_config = {"backend": "mooncake"}
     config.kv_transfer_config.get_from_extra_config.return_value = True
 
@@ -58,10 +68,31 @@ def _make_vllm_config(tp_size: int = 1) -> MagicMock:
     return config
 
 
-def _run_lookup_server(bind_url: str, conn, exists_result: list[int], tp_size: int) -> None:
-    worker = LookupKVPoolWorker(_make_vllm_config(tp_size), store=_FakeStore(exists_result))
-    server = KVCacheServer(bind_url, max_workers=2, lookup_handler=worker.lookup_scheduler)
+def _create_scheduler(
+    registration: SchedulerRegistration,
+    lookup_handler: WorkerLookupHandler,
+) -> MPKVPoolScheduler:
+    with patch(f"{POOL_SCHEDULER_MODULE}.importlib") as importlib_mock:
+        importlib_mock.import_module.return_value = MagicMock()
+        return MPKVPoolScheduler(registration, lookup_handler)
 
+
+def _create_worker(registration: WorkerRegistration, exists_result: list[int]) -> LookupKVPoolWorker:
+    return LookupKVPoolWorker(
+        registration.vllm_config,
+        store=_FakeStore(exists_result),
+        kv_cache_config=registration.kv_cache_config,
+        rank=registration.identity.rank,
+    )
+
+
+def _run_lookup_server(bind_url: str, conn, exists_result: list[int]) -> None:
+    server = KVCacheServer(
+        bind_url,
+        max_workers=4,
+        scheduler_factory=_create_scheduler,
+        worker_factory=partial(_create_worker, exists_result=exists_result),
+    )
     try:
         conn.send(server.endpoint)
         conn.close()
@@ -70,13 +101,10 @@ def _run_lookup_server(bind_url: str, conn, exists_result: list[int], tp_size: i
         server.close()
 
 
-def _start_lookup_server(exists_result: list[int], tp_size: int) -> tuple[mp.Process, str]:
+def _start_lookup_server(exists_result: list[int]) -> tuple[mp.Process, str]:
     context = mp.get_context("fork")
     parent_conn, child_conn = context.Pipe()
-    process = context.Process(
-        target=_run_lookup_server,
-        args=(_DEFAULT_URL, child_conn, exists_result, tp_size),
-    )
+    process = context.Process(target=_run_lookup_server, args=(_DEFAULT_URL, child_conn, exists_result))
     process.start()
     child_conn.close()
 
@@ -108,21 +136,25 @@ def _wait_until_connected(client: KVCacheClient, timeout: float = 5) -> None:
         time.sleep(0.01)
 
 
-def test_scheduler_lookup_round_trip_uses_original_worker_logic() -> None:
-    process, endpoint = _start_lookup_server([1, 1, 1, 0], tp_size=2)
-    client = None
+def test_scheduler_lookup_round_trip_uses_original_logic() -> None:
+    process, endpoint = _start_lookup_server([1, 1, 1, 0])
+    clients: list[KVCacheClient] = []
 
     try:
-        client = KVCacheClient(endpoint)
-        _wait_until_connected(client)
+        for rank in range(2):
+            worker_client = KVCacheClient(endpoint)
+            clients.append(worker_client)
+            _wait_until_connected(worker_client)
+            assert worker_client.register_worker(_make_vllm_config(tp_size=2, rank=rank), kv_cache_config=None)
 
-        config = _make_vllm_config(tp_size=2)
-        with patch(f"{POOL_SCHEDULER_MODULE}.importlib") as importlib_mock:
-            importlib_mock.import_module.return_value = MagicMock()
-            scheduler = KVPoolScheduler(config, use_layerwise=False)
-
-        scheduler.retention_interval = None
-        scheduler.client = client  # type: ignore[assignment]
+        scheduler_client = KVCacheClient(endpoint)
+        clients.append(scheduler_client)
+        _wait_until_connected(scheduler_client)
+        assert scheduler_client.register_scheduler(
+            _make_vllm_config(tp_size=2),
+            kv_cache_config=None,
+            page_size_bytes=0,
+        )
 
         request = MagicMock()
         request.request_id = "request-0"
@@ -130,9 +162,12 @@ def test_scheduler_lookup_round_trip_uses_original_worker_logic() -> None:
         request.block_hashes = _BLOCK_HASHES
         request.num_tokens = 32
 
-        assert scheduler.get_num_new_matched_tokens(request, num_computed_tokens=0) == (16, False)
-        assert scheduler.load_specs["request-0"].kvpool_cached_tokens == 16
+        assert scheduler_client.lookup(request, num_computed_tokens=0) == (16, False)
     finally:
-        if client is not None:
+        for client in clients:
             client.close()
         _stop_lookup_server(process)
+
+
+def test_mp_classes_reuse_original_business_methods() -> None:
+    assert MPKVPoolScheduler.get_num_new_matched_tokens is KVPoolScheduler.get_num_new_matched_tokens

@@ -1,26 +1,94 @@
-"""Lookup-only KVPoolWorker for AscendStore multiprocessing mode."""
+"""Lookup-side PoolScheduler and PoolWorker adaptations for MP mode."""
 
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 from vllm.config import VllmConfig
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from ..pool_scheduler import KVPoolScheduler
 from ..pool_worker import KVPoolWorker
+from .registration import SchedulerIdentity, SchedulerRegistration
 
 
 class LookupStore(Protocol):
-    def exists(self, keys: list[str]) -> list[int]:
-        ...
+    def exists(self, keys: list[str]) -> list[int]: ...
+
+
+WorkerLookupHandler = Callable[
+    [SchedulerIdentity, int, Sequence[BlockHash], list[int] | None, bool, int],
+    int,
+]
+
+
+class _MissingLookupStore:
+    @staticmethod
+    def exists(keys: list[str]) -> list[int]:
+        return [0] * len(keys)
+
+
+class _WorkerLookupAdapter:
+    def __init__(
+        self,
+        identity: SchedulerIdentity,
+        lookup_handler: WorkerLookupHandler,
+    ):
+        self._identity = identity
+        self._lookup_handler = lookup_handler
+
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        kv_cache_group_ids: list[int] | None = None,
+        hbm_hit_tokens: int = 0,
+    ) -> int:
+        return self._lookup_handler(
+            self._identity,
+            token_len,
+            block_hashes,
+            kv_cache_group_ids,
+            False,
+            hbm_hit_tokens,
+        )
+
+
+class MPKVPoolScheduler(KVPoolScheduler):
+    """Run the original KVPoolScheduler inside KVCacheServer."""
+
+    def __init__(
+        self,
+        registration: SchedulerRegistration,
+        lookup_handler: WorkerLookupHandler,
+    ):
+        super().__init__(
+            registration.vllm_config,
+            use_layerwise=False,
+            kv_cache_config=registration.kv_cache_config,
+            page_size_bytes=registration.page_size_bytes,
+        )
+        self.client = _WorkerLookupAdapter(  # type: ignore[assignment]
+            registration.identity,
+            lookup_handler,
+        )
 
 
 class LookupKVPoolWorker(KVPoolWorker):
     """Initialize only the CPU-side state required by lookup_scheduler."""
 
-    def __init__(self, vllm_config: VllmConfig, store: LookupStore, kv_cache_config: KVCacheConfig | None = None):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        store: LookupStore | None = None,
+        kv_cache_config: KVCacheConfig | None = None,
+        rank: int | None = None,
+    ):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         kv_transfer_config = vllm_config.kv_transfer_config
         extra_config = kv_transfer_config.kv_connector_extra_config or {}
+        worker_rank = parallel_config.rank if rank is None else rank
 
         self.kv_cache_config = kv_cache_config
         hf_text_config = getattr(model_config, "hf_text_config", None)
@@ -39,10 +107,10 @@ class LookupKVPoolWorker(KVPoolWorker):
         self.use_mla = isinstance(use_mla, bool) and use_mla
         self.use_sparse = hasattr(model_config.hf_text_config, "index_topk")
 
-        self.tp_rank = 0
         self.tp_size = parallel_config.tensor_parallel_size
-        self.pp_rank = 0
+        self.tp_rank = worker_rank % self.tp_size
         self.pp_size = parallel_config.pipeline_parallel_size
+        self.pp_rank = (worker_rank // self.tp_size) % self.pp_size
         self.pcp_rank = 0
         self.pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
         self.dcp_rank = 0
@@ -50,7 +118,10 @@ class LookupKVPoolWorker(KVPoolWorker):
         self.model_name = model_config.model.split("/")[-1]
 
         self._init_kv_transfer_config(
-            vllm_config, extra_config, use_layerwise=False, kv_cache_config=kv_cache_config
+            vllm_config,
+            extra_config,
+            use_layerwise=False,
+            kv_cache_config=kv_cache_config,
         )
         self._init_key_head_config(model_config, parallel_config)
         self._init_metadata(model_config, vllm_config, extra_config)
@@ -58,4 +129,12 @@ class LookupKVPoolWorker(KVPoolWorker):
         self.token_database.group_cache_families["kv"] = {
             group_id: family for group_id, family in enumerate(self.kv_cache_group_families)
         }
+        self._has_lookup_store = store is not None
+        self.m_store: LookupStore = store or _MissingLookupStore()
+
+    def bind_store(self, store: LookupStore) -> None:
+        if self._has_lookup_store:
+            return
+
         self.m_store = store
+        self._has_lookup_store = True

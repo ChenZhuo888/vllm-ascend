@@ -16,9 +16,12 @@ CONNECTOR_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.asc
 SERVER_URL = "ipc:///tmp/ascend_store_mp_test"
 
 
-def _make_vllm_config(server_url: object = SERVER_URL) -> MagicMock:
+def _make_vllm_config(server_url: object = SERVER_URL, rank: int = 0) -> MagicMock:
     config = MagicMock()
+    config.parallel_config.data_parallel_rank = 0
+    config.parallel_config.rank = rank
     config.kv_transfer_config.kv_connector = "AscendStoreMPConnector"
+    config.kv_transfer_config.engine_id = "engine-0"
     config.kv_transfer_config.kv_connector_extra_config = {}
     if server_url is not None:
         config.kv_transfer_config.kv_connector_extra_config["kv_cache_server_url"] = server_url
@@ -32,87 +35,80 @@ def _make_kv_cache_config() -> MagicMock:
 
 
 @pytest.mark.parametrize("role", [KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER])
-def test_connector_creates_client_for_each_role(role) -> None:
+def test_connector_registers_its_role(role: KVConnectorRole) -> None:
     config = _make_vllm_config()
     kv_cache_config = _make_kv_cache_config()
 
-    with (
-        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
-        patch(f"{CONNECTOR_MODULE}.KVPoolScheduler") as scheduler_class,
-    ):
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
         connector = AscendStoreMPConnector(config, role, kv_cache_config)
-        client_class.assert_called_once_with(SERVER_URL)
 
+        client_class.assert_called_once_with(SERVER_URL)
         if role == KVConnectorRole.SCHEDULER:
-            scheduler_class.assert_called_once_with(
-                config, use_layerwise=False, kv_cache_config=kv_cache_config, page_size_bytes=1024
-            )
-            assert scheduler_class.return_value.client is client_class.return_value
+            client_class.return_value.register_scheduler.assert_called_once_with(config, kv_cache_config, 1024)
+            client_class.return_value.register_worker.assert_not_called()
         else:
-            scheduler_class.assert_not_called()
+            client_class.return_value.register_worker.assert_called_once_with(config, kv_cache_config)
+            client_class.return_value.register_scheduler.assert_not_called()
 
         connector.shutdown()
         client_class.return_value.close.assert_called_once_with()
 
 
-def test_scheduler_lookup_delegates_to_pool_scheduler() -> None:
+def test_scheduler_lookup_delegates_to_kv_cache_client() -> None:
     config = _make_vllm_config()
     kv_cache_config = _make_kv_cache_config()
     request = MagicMock()
 
-    with (
-        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
-        patch(f"{CONNECTOR_MODULE}.KVPoolScheduler") as scheduler_class,
-    ):
-        scheduler = scheduler_class.return_value
-        scheduler.get_num_new_matched_tokens.return_value = (16, False)
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.lookup.return_value = (16, False)
         connector = AscendStoreMPConnector(config, KVConnectorRole.SCHEDULER, kv_cache_config)
 
-        with patch.object(AscendStoreMPConnector, "role", KVConnectorRole.SCHEDULER, create=True):
-            result = connector.get_num_new_matched_tokens(request, 32)
+        result = connector.get_num_new_matched_tokens(request, 32)
 
         assert result == (16, False)
-        assert scheduler.client is client_class.return_value
-        scheduler.get_num_new_matched_tokens.assert_called_once_with(request, 32)
+        client_class.return_value.lookup.assert_called_once_with(request, 32)
 
 
 def test_worker_cannot_call_scheduler_lookup() -> None:
     config = _make_vllm_config()
 
-    with (
-        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
-        patch(f"{CONNECTOR_MODULE}.KVPoolScheduler") as scheduler_class,
-    ):
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
         connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
 
-        with patch.object(AscendStoreMPConnector, "role", KVConnectorRole.WORKER, create=True):
-            with pytest.raises(RuntimeError, match="only available on the scheduler connector"):
-                connector.get_num_new_matched_tokens(MagicMock(), 32)
+        with pytest.raises(RuntimeError, match="only available on the scheduler connector"):
+            connector.get_num_new_matched_tokens(MagicMock(), 32)
 
         client_class.return_value.lookup.assert_not_called()
-        scheduler_class.assert_not_called()
 
 
 def test_build_connector_meta_returns_empty_metadata() -> None:
     config = _make_vllm_config()
 
-    with patch(f"{CONNECTOR_MODULE}.KVCacheClient"), patch(f"{CONNECTOR_MODULE}.KVPoolScheduler"):
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient"):
         connector = AscendStoreMPConnector(config, KVConnectorRole.SCHEDULER, _make_kv_cache_config())
         metadata = connector.build_connector_meta(MagicMock())
 
     assert isinstance(metadata, AscendStoreMPConnectorMetadata)
 
 
+def test_connector_closes_client_when_registration_fails() -> None:
+    config = _make_vllm_config()
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.register_scheduler.side_effect = RuntimeError("registration failed")
+
+        with pytest.raises(RuntimeError, match="registration failed"):
+            AscendStoreMPConnector(config, KVConnectorRole.SCHEDULER, _make_kv_cache_config())
+
+        client_class.return_value.close.assert_called_once_with()
+
+
 @pytest.mark.parametrize("server_url", [None, "", 123])
 def test_connector_rejects_invalid_server_url(server_url: object) -> None:
     config = _make_vllm_config(server_url)
 
-    with (
-        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
-        patch(f"{CONNECTOR_MODULE}.KVPoolScheduler") as scheduler_class,
-    ):
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
         with pytest.raises(ValueError, match="kv_cache_server_url"):
             AscendStoreMPConnector(config, KVConnectorRole.SCHEDULER, _make_kv_cache_config())
 
         client_class.assert_not_called()
-        scheduler_class.assert_not_called()
