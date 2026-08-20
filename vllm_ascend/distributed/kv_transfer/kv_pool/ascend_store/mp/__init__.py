@@ -1,6 +1,6 @@
 """Multiprocessing support for AscendStore."""
 
-from .kv_cache import KVCacheClient, KVCacheMethod, KVCacheServer
+from .kv_cache import KVCacheClient, KVCacheMethod, KVCacheServer, ServiceSessionExpiredError
 from .registration import SchedulerIdentity, SchedulerRegistration, WorkerIdentity, WorkerRegistration
 
 __all__ = [
@@ -9,6 +9,7 @@ __all__ = [
     "KVCacheServer",
     "SchedulerIdentity",
     "SchedulerRegistration",
+    "ServiceSessionExpiredError",
     "WorkerIdentity",
     "WorkerRegistration",
 ]

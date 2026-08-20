@@ -1,6 +1,6 @@
 """Lookup-side PoolScheduler and PoolWorker adaptations for MP mode."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Protocol
 
 from vllm.config import VllmConfig
@@ -9,17 +9,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from ..pool_scheduler import KVPoolScheduler
 from ..pool_worker import KVPoolWorker
-from .registration import SchedulerIdentity, SchedulerRegistration
+from .registration import SchedulerIdentity, SchedulerRegistration, WorkerLookupHandler
 
 
 class LookupStore(Protocol):
     def exists(self, keys: list[str]) -> list[int]: ...
-
-
-WorkerLookupHandler = Callable[
-    [SchedulerIdentity, int, Sequence[BlockHash], list[int] | None, bool, int],
-    int,
-]
 
 
 class _MissingLookupStore:
@@ -29,20 +23,16 @@ class _MissingLookupStore:
 
 
 class _WorkerLookupAdapter:
-    def __init__(
-        self,
-        identity: SchedulerIdentity,
-        lookup_handler: WorkerLookupHandler,
-    ):
+    def __init__(self, identity: SchedulerIdentity, lookup_handler: WorkerLookupHandler):
         self._identity = identity
         self._lookup_handler = lookup_handler
 
     def lookup(
-        self,
-        token_len: int,
-        block_hashes: Sequence[BlockHash],
-        kv_cache_group_ids: list[int] | None = None,
-        hbm_hit_tokens: int = 0,
+            self,
+            token_len: int,
+            block_hashes: Sequence[BlockHash],
+            kv_cache_group_ids: list[int] | None = None,
+            hbm_hit_tokens: int = 0,
     ) -> int:
         return self._lookup_handler(
             self._identity,
@@ -57,11 +47,7 @@ class _WorkerLookupAdapter:
 class MPKVPoolScheduler(KVPoolScheduler):
     """Run the original KVPoolScheduler inside KVCacheServer."""
 
-    def __init__(
-        self,
-        registration: SchedulerRegistration,
-        lookup_handler: WorkerLookupHandler,
-    ):
+    def __init__(self, registration: SchedulerRegistration, lookup_handler: WorkerLookupHandler):
         super().__init__(
             registration.vllm_config,
             use_layerwise=False,
@@ -73,16 +59,21 @@ class MPKVPoolScheduler(KVPoolScheduler):
             lookup_handler,
         )
 
+    def close(self) -> None:
+        close = getattr(self.store_scheduler, "close", None)
+        if callable(close):
+            close()
+
 
 class LookupKVPoolWorker(KVPoolWorker):
     """Initialize only the CPU-side state required by lookup_scheduler."""
 
     def __init__(
-        self,
-        vllm_config: VllmConfig,
-        store: LookupStore | None = None,
-        kv_cache_config: KVCacheConfig | None = None,
-        rank: int | None = None,
+            self,
+            vllm_config: VllmConfig,
+            store: LookupStore | None = None,
+            kv_cache_config: KVCacheConfig | None = None,
+            rank: int | None = None,
     ):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -129,12 +120,10 @@ class LookupKVPoolWorker(KVPoolWorker):
         self.token_database.group_cache_families["kv"] = {
             group_id: family for group_id, family in enumerate(self.kv_cache_group_families)
         }
-        self._has_lookup_store = store is not None
+        self._store_is_external = store is not None
         self.m_store: LookupStore = store or _MissingLookupStore()
 
     def bind_store(self, store: LookupStore) -> None:
-        if self._has_lookup_store:
+        if self._store_is_external:
             return
-
         self.m_store = store
-        self._has_lookup_store = True
