@@ -250,46 +250,16 @@ class KVCacheServiceRegistry:
                         f"Scheduler {identity!r} is already registering session {flight.session_id!r}"
                     )
                 self._validate_fingerprint("Scheduler", identity, flight.fingerprint, fingerprint)
-                future = flight.future
-                should_create = False
+                wait_future = flight.future
             else:
-                future = Future()
-                self._registering_schedulers[identity] = _RegistrationFlight(session_id, fingerprint, future)
-                should_create = True
+                flight = _RegistrationFlight(session_id, fingerprint, Future())
+                self._registering_schedulers[identity] = flight
+                wait_future = None
 
-        if not should_create:
-            return future.result()
+        if wait_future is not None:
+            return wait_future.result()
 
-        service = None
-        try:
-            if old_service is not None:
-                self._close_service(old_service)
-
-            service = self._scheduler_factory(registration, self._worker_lookup_handler)
-            with self._lock:
-                flight = self._registering_schedulers.get(identity)
-                assert flight is not None and flight.future is future
-
-                self._schedulers[identity] = _ServiceEntry(session_id, fingerprint, service)
-                try:
-                    self._bind_engine_store_locked(identity)
-                except BaseException:
-                    del self._schedulers[identity]
-                    raise
-                del self._registering_schedulers[identity]
-        except BaseException as exc:
-            with self._lock:
-                flight = self._registering_schedulers.get(identity)
-                if flight is not None and flight.future is future:
-                    del self._registering_schedulers[identity]
-            if service is not None:
-                self._close_service_safely(service)
-            if not future.done():
-                future.set_exception(exc)
-            raise
-
-        future.set_result(service)
-        return service
+        return self._create_and_publish_scheduler(registration, fingerprint, flight, old_service)
 
     def register_worker(self, registration: WorkerRegistration, payload: bytes) -> "KVPoolWorker":
         self._validate_worker_registration(registration)
@@ -318,47 +288,133 @@ class KVCacheServiceRegistry:
                         f"Worker {identity!r} is already registering session {flight.session_id!r}"
                     )
                 self._validate_fingerprint("Worker", identity, flight.fingerprint, fingerprint)
-                future = flight.future
-                should_create = False
+                wait_future = flight.future
             else:
-                future = Future()
-                self._registering_workers[identity] = _RegistrationFlight(session_id, fingerprint, future)
-                should_create = True
+                flight = _RegistrationFlight(session_id, fingerprint, Future())
+                self._registering_workers[identity] = flight
+                wait_future = None
 
-        if not should_create:
-            return future.result()
+        if wait_future is not None:
+            return wait_future.result()
 
+        return self._create_and_publish_worker(registration, fingerprint, flight, old_service)
+
+    def _create_and_publish_scheduler(
+            self,
+            registration: SchedulerRegistration,
+            fingerprint: bytes,
+            flight: _RegistrationFlight["KVPoolScheduler"],
+            old_service: "KVPoolScheduler | None",
+    ) -> "KVPoolScheduler":
+        service = None
+        try:
+            if old_service is not None:
+                self._close_service(old_service)
+
+            service = self._scheduler_factory(registration, self._worker_lookup_handler)
+            with self._lock:
+                self._publish_scheduler_locked(registration, fingerprint, flight, service)
+        except BaseException as exc:
+            self._fail_scheduler_registration(registration.identity, flight, service, exc)
+            raise
+
+        flight.future.set_result(service)
+        return service
+
+    def _create_and_publish_worker(
+            self,
+            registration: WorkerRegistration,
+            fingerprint: bytes,
+            flight: _RegistrationFlight["KVPoolWorker"],
+            old_service: "KVPoolWorker | None",
+    ) -> "KVPoolWorker":
         service = None
         try:
             if old_service is not None:
                 self._close_service(old_service)
 
             service = self._worker_factory(registration)
-            scheduler_identity = SchedulerIdentity(identity.engine_id, identity.data_parallel_rank)
             with self._lock:
-                flight = self._registering_workers.get(identity)
-                assert flight is not None and flight.future is future
-
-                self._workers[identity] = _ServiceEntry(session_id, fingerprint, service)
-                try:
-                    self._bind_engine_store_locked(scheduler_identity)
-                except BaseException:
-                    del self._workers[identity]
-                    raise
-                del self._registering_workers[identity]
+                self._publish_worker_locked(registration, fingerprint, flight, service)
         except BaseException as exc:
-            with self._lock:
-                flight = self._registering_workers.get(identity)
-                if flight is not None and flight.future is future:
-                    del self._registering_workers[identity]
-            if service is not None:
-                self._close_service_safely(service)
-            if not future.done():
-                future.set_exception(exc)
+            self._fail_worker_registration(registration.identity, flight, service, exc)
             raise
 
-        future.set_result(service)
+        flight.future.set_result(service)
         return service
+
+    def _publish_scheduler_locked(
+            self,
+            registration: SchedulerRegistration,
+            fingerprint: bytes,
+            flight: _RegistrationFlight["KVPoolScheduler"],
+            service: "KVPoolScheduler",
+    ) -> None:
+        identity = registration.identity
+        current_flight = self._registering_schedulers.get(identity)
+        assert current_flight is flight
+
+        self._schedulers[identity] = _ServiceEntry(registration.session_id, fingerprint, service)
+        try:
+            self._bind_engine_store_locked(identity)
+        except BaseException:
+            del self._schedulers[identity]
+            raise
+        del self._registering_schedulers[identity]
+
+    def _publish_worker_locked(
+            self,
+            registration: WorkerRegistration,
+            fingerprint: bytes,
+            flight: _RegistrationFlight["KVPoolWorker"],
+            service: "KVPoolWorker",
+    ) -> None:
+        identity = registration.identity
+        current_flight = self._registering_workers.get(identity)
+        assert current_flight is flight
+
+        self._workers[identity] = _ServiceEntry(registration.session_id, fingerprint, service)
+        scheduler_identity = SchedulerIdentity(identity.engine_id, identity.data_parallel_rank)
+        try:
+            self._bind_engine_store_locked(scheduler_identity)
+        except BaseException:
+            del self._workers[identity]
+            raise
+        del self._registering_workers[identity]
+
+    def _fail_scheduler_registration(
+            self,
+            identity: SchedulerIdentity,
+            flight: _RegistrationFlight["KVPoolScheduler"],
+            service: "KVPoolScheduler | None",
+            exc: BaseException,
+    ) -> None:
+        with self._lock:
+            current_flight = self._registering_schedulers.get(identity)
+            if current_flight is flight:
+                del self._registering_schedulers[identity]
+
+        if service is not None:
+            self._close_service_safely(service)
+        if not flight.future.done():
+            flight.future.set_exception(exc)
+
+    def _fail_worker_registration(
+            self,
+            identity: WorkerIdentity,
+            flight: _RegistrationFlight["KVPoolWorker"],
+            service: "KVPoolWorker | None",
+            exc: BaseException,
+    ) -> None:
+        with self._lock:
+            current_flight = self._registering_workers.get(identity)
+            if current_flight is flight:
+                del self._registering_workers[identity]
+
+        if service is not None:
+            self._close_service_safely(service)
+        if not flight.future.done():
+            flight.future.set_exception(exc)
 
     def unregister_scheduler(self, identity: SchedulerIdentity, session_id: str) -> bool:
         _validate_session_id(session_id)
