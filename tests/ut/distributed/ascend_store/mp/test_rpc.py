@@ -532,3 +532,27 @@ def test_affinity_executor_runs_different_keys_in_parallel():
         assert first_future.result(timeout=5) != second_future.result(timeout=5)
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_heartbeat_callback_runs_after_successful_ping() -> None:
+    client = object.__new__(MPClient)
+    client._heartbeat_stop = threading.Event()
+    client._server_responsive = threading.Event()
+    client._server_responsive.set()
+    client._heartbeat_interval_ms = 1
+    client._heartbeat_timeout_ms = 100
+    client._recovery_callback = None
+
+    callback_called = threading.Event()
+
+    def heartbeat_callback() -> None:
+        callback_called.set()
+        client._heartbeat_stop.set()
+
+    client._heartbeat_callback = heartbeat_callback
+    client.ping = lambda timeout_ms: "OK"
+
+    client._heartbeat_loop()
+
+    assert callback_called.is_set()
+    assert client._server_responsive.is_set()

@@ -3,6 +3,7 @@
 import enum
 import logging
 import threading
+import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -47,6 +48,8 @@ _DEFAULT_TIMEOUT_MS = 5000
 _REGISTRATION_TIMEOUT_MS = 500
 _HEARTBEAT_INTERVAL_MS = 1000
 _HEARTBEAT_TIMEOUT_MS = 1000
+_SERVICE_STALE_TIMEOUT_S = 60.0
+_SERVICE_REAP_INTERVAL_S = 5.0
 _INTEGER_BYTES = 8
 _BYTE_ORDER = "big"
 _LOOKUP_HEADER_PAYLOADS = 6
@@ -71,6 +74,8 @@ class KVCacheMethod(str, enum.Enum):
     REGISTER_WORKER = "REGISTER_WORKER"
     UNREGISTER_SCHEDULER = "UNREGISTER_SCHEDULER"
     UNREGISTER_WORKER = "UNREGISTER_WORKER"
+    HEARTBEAT_SCHEDULER = "HEARTBEAT_SCHEDULER"
+    HEARTBEAT_WORKER = "HEARTBEAT_WORKER"
     LOOKUP = "LOOKUP"
 
 
@@ -297,6 +302,7 @@ class KVCacheClient:
             interval_ms=_HEARTBEAT_INTERVAL_MS,
             timeout_ms=_HEARTBEAT_TIMEOUT_MS,
             recovery_callback=self._recover_registration,
+            heartbeat_callback=self._heartbeat_service,
         )
         return registered
 
@@ -306,6 +312,47 @@ class KVCacheClient:
         except ServiceSessionExpiredError:
             # The server is responsive; only this client incarnation is no longer valid.
             return True
+
+    def _heartbeat_service(self) -> None:
+        with self._registration_lock:
+            if self._closed or self._superseded or self._registration is None:
+                return
+            registration = self._registration[0]
+            registered = self._registered
+
+        if not registered:
+            try:
+                self._try_register()
+            except ServiceSessionExpiredError:
+                pass
+            return
+
+        if isinstance(registration, SchedulerRegistration):
+            method = KVCacheMethod.HEARTBEAT_SCHEDULER
+            payloads = _encode_scheduler_session(registration.identity, registration.session_id)
+        else:
+            method = KVCacheMethod.HEARTBEAT_WORKER
+            payloads = _encode_worker_session(registration.identity, registration.session_id)
+
+        try:
+            responses = self._rpc_client.request(method, payloads, timeout_ms=_HEARTBEAT_TIMEOUT_MS)
+        except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError):
+            return
+        except MPRemoteError as exc:
+            if str(exc).startswith(_SERVICE_NOT_REGISTERED_PREFIX):
+                self._mark_unregistered()
+                try:
+                    self._try_register()
+                except ServiceSessionExpiredError:
+                    pass
+                return
+            if str(exc).startswith(_STALE_SESSION_PREFIX):
+                self._mark_superseded()
+                return
+            raise
+
+        if responses != [_REGISTRATION_RESPONSE]:
+            raise MPProtocolError(f"{method.value} expects an OK response, got {responses!r}")
 
     def _try_register(self) -> bool:
         with self._registration_lock:
@@ -465,9 +512,15 @@ class KVCacheServer:
                 KVCacheMethod.REGISTER_WORKER: self._handle_register_worker,
                 KVCacheMethod.UNREGISTER_SCHEDULER: self._handle_unregister_scheduler,
                 KVCacheMethod.UNREGISTER_WORKER: self._handle_unregister_worker,
+                KVCacheMethod.HEARTBEAT_SCHEDULER: HandlerSpec(
+                    self._handle_scheduler_heartbeat, ExecutionMode.INLINE
+                ),
+                KVCacheMethod.HEARTBEAT_WORKER: HandlerSpec(self._handle_worker_heartbeat, ExecutionMode.INLINE),
                 KVCacheMethod.LOOKUP: HandlerSpec(self._handle_lookup, ExecutionMode.AFFINITY, _lookup_affinity_key),
             },
         )
+        self._reaper_stop = threading.Event()
+        self._reaper_thread: threading.Thread | None = None
 
     def __enter__(self) -> "KVCacheServer":
         return self
@@ -523,6 +576,18 @@ class KVCacheServer:
         self._registry.unregister_worker(identity, session_id)
         return (_UNREGISTRATION_RESPONSE,)
 
+    def _handle_scheduler_heartbeat(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id = _decode_scheduler_session(payloads)
+        if not self._registry.touch_scheduler(identity, session_id):
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        return (_REGISTRATION_RESPONSE,)
+
+    def _handle_worker_heartbeat(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id = _decode_worker_session(payloads)
+        if not self._registry.touch_worker(identity, session_id):
+            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        return (_REGISTRATION_RESPONSE,)
+
     def _lookup_worker(
             self,
             scheduler_identity: SchedulerIdentity,
@@ -554,9 +619,39 @@ class KVCacheServer:
             _ASYNC_RESPONSE if is_async else _SYNC_RESPONSE,
         )
 
+    def _reaper_loop(self) -> None:
+        while not self._reaper_stop.wait(_SERVICE_REAP_INTERVAL_S):
+            try:
+                stale_before = time.monotonic() - _SERVICE_STALE_TIMEOUT_S
+                self._registry.reap_stale(stale_before)
+            except Exception:
+                logger.exception("KV cache service reaper failed")
+
+    def _start_reaper(self) -> None:
+        if self._reaper_thread is not None and self._reaper_thread.is_alive():
+            return
+        self._reaper_stop.clear()
+        self._reaper_thread = threading.Thread(target=self._reaper_loop, daemon=True, name="ascend-store-kv-reaper")
+        self._reaper_thread.start()
+
+    def _stop_reaper(self) -> None:
+        reaper_thread = self._reaper_thread
+        if reaper_thread is None:
+            return
+        self._reaper_stop.set()
+        if reaper_thread is not threading.current_thread():
+            reaper_thread.join()
+        if self._reaper_thread is reaper_thread:
+            self._reaper_thread = None
+
     def run(self) -> None:
-        self._rpc_server.run()
+        self._start_reaper()
+        try:
+            self._rpc_server.run()
+        finally:
+            self._stop_reaper()
 
     def close(self) -> None:
+        self._stop_reaper()
         self._rpc_server.close()
         self._registry.close()

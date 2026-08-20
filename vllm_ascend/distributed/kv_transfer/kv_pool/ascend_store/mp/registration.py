@@ -8,6 +8,7 @@ restricted to trusted processes.
 import hashlib
 import logging
 import threading
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from .rpc import MPProtocolError
+from .rpc import MPProtocolError, MPServerBusyError
 
 if TYPE_CHECKING:
     from ..pool_scheduler import KVPoolScheduler
@@ -158,11 +159,18 @@ class StaleSessionError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass
 class _ServiceEntry(Generic[ServiceT]):
     session_id: str
     fingerprint: bytes
     service: ServiceT
+    last_seen: float
+
+
+@dataclass(frozen=True)
+class _RecoverableSession:
+    session_id: str
+    fingerprint: bytes
 
 
 @dataclass(frozen=True)
@@ -207,6 +215,11 @@ class KVCacheServiceRegistry:
         self._workers: dict[WorkerIdentity, _ServiceEntry["KVPoolWorker"]] = {}
         self._registering_schedulers: dict[SchedulerIdentity, _RegistrationFlight["KVPoolScheduler"]] = {}
         self._registering_workers: dict[WorkerIdentity, _RegistrationFlight["KVPoolWorker"]] = {}
+        self._reaping_schedulers: dict[SchedulerIdentity, _ServiceEntry["KVPoolScheduler"]] = {}
+        self._reaping_workers: dict[WorkerIdentity, _ServiceEntry["KVPoolWorker"]] = {}
+        # Reaping frees resources without fencing the same session from reconnecting.
+        self._recoverable_scheduler_sessions: dict[SchedulerIdentity, _RecoverableSession] = {}
+        self._recoverable_worker_sessions: dict[WorkerIdentity, _RecoverableSession] = {}
         self._retired_scheduler_sessions: dict[SchedulerIdentity, set[str]] = {}
         self._retired_worker_sessions: dict[WorkerIdentity, set[str]] = {}
         self._scheduler_factory = scheduler_factory
@@ -232,11 +245,14 @@ class KVCacheServiceRegistry:
 
         with self._lock:
             self._raise_if_retired("Scheduler", identity, session_id, self._retired_scheduler_sessions)
+            if identity in self._reaping_schedulers:
+                raise MPServerBusyError(f"Scheduler {identity!r} is being reaped")
 
             entry = self._schedulers.get(identity)
             if entry is not None:
                 if entry.session_id == session_id:
                     self._validate_fingerprint("Scheduler", identity, entry.fingerprint, fingerprint)
+                    entry.last_seen = time.monotonic()
                     return entry.service
 
                 self._retire_session_locked(self._retired_scheduler_sessions, identity, entry.session_id)
@@ -252,6 +268,7 @@ class KVCacheServiceRegistry:
                 self._validate_fingerprint("Scheduler", identity, flight.fingerprint, fingerprint)
                 wait_future = flight.future
             else:
+                self._prepare_recoverable_scheduler_locked(identity, session_id, fingerprint)
                 flight = _RegistrationFlight(session_id, fingerprint, Future())
                 self._registering_schedulers[identity] = flight
                 wait_future = None
@@ -270,11 +287,14 @@ class KVCacheServiceRegistry:
 
         with self._lock:
             self._raise_if_retired("Worker", identity, session_id, self._retired_worker_sessions)
+            if identity in self._reaping_workers:
+                raise MPServerBusyError(f"Worker {identity!r} is being reaped")
 
             entry = self._workers.get(identity)
             if entry is not None:
                 if entry.session_id == session_id:
                     self._validate_fingerprint("Worker", identity, entry.fingerprint, fingerprint)
+                    entry.last_seen = time.monotonic()
                     return entry.service
 
                 self._retire_session_locked(self._retired_worker_sessions, identity, entry.session_id)
@@ -290,6 +310,7 @@ class KVCacheServiceRegistry:
                 self._validate_fingerprint("Worker", identity, flight.fingerprint, fingerprint)
                 wait_future = flight.future
             else:
+                self._prepare_recoverable_worker_locked(identity, session_id, fingerprint)
                 flight = _RegistrationFlight(session_id, fingerprint, Future())
                 self._registering_workers[identity] = flight
                 wait_future = None
@@ -298,6 +319,32 @@ class KVCacheServiceRegistry:
             return wait_future.result()
 
         return self._create_and_publish_worker(registration, fingerprint, flight, old_service)
+
+    def _prepare_recoverable_scheduler_locked(
+            self, identity: SchedulerIdentity, session_id: str, fingerprint: bytes
+    ) -> None:
+        recoverable = self._recoverable_scheduler_sessions.get(identity)
+        if recoverable is None:
+            return
+        if recoverable.session_id == session_id:
+            self._validate_fingerprint("Scheduler", identity, recoverable.fingerprint, fingerprint)
+            return
+
+        self._retire_session_locked(self._retired_scheduler_sessions, identity, recoverable.session_id)
+        del self._recoverable_scheduler_sessions[identity]
+
+    def _prepare_recoverable_worker_locked(
+            self, identity: WorkerIdentity, session_id: str, fingerprint: bytes
+    ) -> None:
+        recoverable = self._recoverable_worker_sessions.get(identity)
+        if recoverable is None:
+            return
+        if recoverable.session_id == session_id:
+            self._validate_fingerprint("Worker", identity, recoverable.fingerprint, fingerprint)
+            return
+
+        self._retire_session_locked(self._retired_worker_sessions, identity, recoverable.session_id)
+        del self._recoverable_worker_sessions[identity]
 
     def _create_and_publish_scheduler(
             self,
@@ -354,12 +401,15 @@ class KVCacheServiceRegistry:
         current_flight = self._registering_schedulers.get(identity)
         assert current_flight is flight
 
-        self._schedulers[identity] = _ServiceEntry(registration.session_id, fingerprint, service)
+        self._schedulers[identity] = _ServiceEntry(registration.session_id, fingerprint, service, time.monotonic())
         try:
             self._bind_engine_store_locked(identity)
         except BaseException:
             del self._schedulers[identity]
             raise
+        recoverable = self._recoverable_scheduler_sessions.get(identity)
+        if recoverable is not None and recoverable.session_id == registration.session_id:
+            del self._recoverable_scheduler_sessions[identity]
         del self._registering_schedulers[identity]
 
     def _publish_worker_locked(
@@ -373,13 +423,16 @@ class KVCacheServiceRegistry:
         current_flight = self._registering_workers.get(identity)
         assert current_flight is flight
 
-        self._workers[identity] = _ServiceEntry(registration.session_id, fingerprint, service)
+        self._workers[identity] = _ServiceEntry(registration.session_id, fingerprint, service, time.monotonic())
         scheduler_identity = SchedulerIdentity(identity.engine_id, identity.data_parallel_rank)
         try:
             self._bind_engine_store_locked(scheduler_identity)
         except BaseException:
             del self._workers[identity]
             raise
+        recoverable = self._recoverable_worker_sessions.get(identity)
+        if recoverable is not None and recoverable.session_id == registration.session_id:
+            del self._recoverable_worker_sessions[identity]
         del self._registering_workers[identity]
 
     def _fail_scheduler_registration(
@@ -418,15 +471,27 @@ class KVCacheServiceRegistry:
 
     def unregister_scheduler(self, identity: SchedulerIdentity, session_id: str) -> bool:
         _validate_session_id(session_id)
+        service = None
         with self._lock:
             self._raise_if_retired("Scheduler", identity, session_id, self._retired_scheduler_sessions)
+
+            reaping = self._reaping_schedulers.get(identity)
+            if reaping is not None:
+                self._validate_session("Scheduler", identity, session_id, reaping.session_id)
+                self._retire_session_locked(self._retired_scheduler_sessions, identity, session_id)
+                return True
+
+            recoverable = self._recoverable_scheduler_sessions.get(identity)
+            if recoverable is not None:
+                self._validate_session("Scheduler", identity, session_id, recoverable.session_id)
+                del self._recoverable_scheduler_sessions[identity]
+                self._retire_session_locked(self._retired_scheduler_sessions, identity, session_id)
+                return True
+
             entry = self._schedulers.get(identity)
             if entry is None:
                 return False
-            if entry.session_id != session_id:
-                raise StaleSessionError(
-                    f"Scheduler {identity!r} session {session_id!r} is stale; current session is {entry.session_id!r}"
-                )
+            self._validate_session("Scheduler", identity, session_id, entry.session_id)
 
             del self._schedulers[identity]
             self._retire_session_locked(self._retired_scheduler_sessions, identity, session_id)
@@ -437,15 +502,27 @@ class KVCacheServiceRegistry:
 
     def unregister_worker(self, identity: WorkerIdentity, session_id: str) -> bool:
         _validate_session_id(session_id)
+        service = None
         with self._lock:
             self._raise_if_retired("Worker", identity, session_id, self._retired_worker_sessions)
+
+            reaping = self._reaping_workers.get(identity)
+            if reaping is not None:
+                self._validate_session("Worker", identity, session_id, reaping.session_id)
+                self._retire_session_locked(self._retired_worker_sessions, identity, session_id)
+                return True
+
+            recoverable = self._recoverable_worker_sessions.get(identity)
+            if recoverable is not None:
+                self._validate_session("Worker", identity, session_id, recoverable.session_id)
+                del self._recoverable_worker_sessions[identity]
+                self._retire_session_locked(self._retired_worker_sessions, identity, session_id)
+                return True
+
             entry = self._workers.get(identity)
             if entry is None:
                 return False
-            if entry.session_id != session_id:
-                raise StaleSessionError(
-                    f"Worker {identity!r} session {session_id!r} is stale; current session is {entry.session_id!r}"
-                )
+            self._validate_session("Worker", identity, session_id, entry.session_id)
 
             del self._workers[identity]
             self._retire_session_locked(self._retired_worker_sessions, identity, session_id)
@@ -453,6 +530,28 @@ class KVCacheServiceRegistry:
 
         self._close_service(service)
         return True
+
+    def touch_scheduler(self, identity: SchedulerIdentity, session_id: str) -> bool:
+        _validate_session_id(session_id)
+        with self._lock:
+            self._raise_if_retired("Scheduler", identity, session_id, self._retired_scheduler_sessions)
+            entry = self._schedulers.get(identity)
+            if entry is None:
+                return False
+            self._validate_session("Scheduler", identity, session_id, entry.session_id)
+            entry.last_seen = time.monotonic()
+            return True
+
+    def touch_worker(self, identity: WorkerIdentity, session_id: str) -> bool:
+        _validate_session_id(session_id)
+        with self._lock:
+            self._raise_if_retired("Worker", identity, session_id, self._retired_worker_sessions)
+            entry = self._workers.get(identity)
+            if entry is None:
+                return False
+            self._validate_session("Worker", identity, session_id, entry.session_id)
+            entry.last_seen = time.monotonic()
+            return True
 
     def get_scheduler(self, identity: SchedulerIdentity, session_id: str | None = None) -> "KVPoolScheduler | None":
         with self._lock:
@@ -462,10 +561,9 @@ class KVCacheServiceRegistry:
             entry = self._schedulers.get(identity)
             if entry is None:
                 return None
-            if session_id is not None and entry.session_id != session_id:
-                raise StaleSessionError(
-                    f"Scheduler {identity!r} session {session_id!r} is stale; current session is {entry.session_id!r}"
-                )
+            if session_id is not None:
+                self._validate_session("Scheduler", identity, session_id, entry.session_id)
+                entry.last_seen = time.monotonic()
             return entry.service
 
     def get_worker(self, identity: WorkerIdentity, session_id: str | None = None) -> "KVPoolWorker | None":
@@ -476,20 +574,68 @@ class KVCacheServiceRegistry:
             entry = self._workers.get(identity)
             if entry is None:
                 return None
-            if session_id is not None and entry.session_id != session_id:
-                raise StaleSessionError(
-                    f"Worker {identity!r} session {session_id!r} is stale; current session is {entry.session_id!r}"
-                )
+            if session_id is not None:
+                self._validate_session("Worker", identity, session_id, entry.session_id)
+                entry.last_seen = time.monotonic()
             return entry.service
+
+    def reap_stale(self, stale_before: float) -> tuple[int, int]:
+        with self._lock:
+            stale_schedulers = [
+                (identity, entry) for identity, entry in self._schedulers.items() if entry.last_seen < stale_before
+            ]
+            stale_workers = [
+                (identity, entry) for identity, entry in self._workers.items() if entry.last_seen < stale_before
+            ]
+            for identity, entry in stale_schedulers:
+                del self._schedulers[identity]
+                self._reaping_schedulers[identity] = entry
+            for identity, entry in stale_workers:
+                del self._workers[identity]
+                self._reaping_workers[identity] = entry
+
+        for identity, entry in stale_schedulers:
+            self._close_service_safely(entry.service)
+            self._finish_scheduler_reap(identity, entry)
+        for identity, entry in stale_workers:
+            self._close_service_safely(entry.service)
+            self._finish_worker_reap(identity, entry)
+        return len(stale_schedulers), len(stale_workers)
+
+    def _finish_scheduler_reap(
+            self, identity: SchedulerIdentity, entry: _ServiceEntry["KVPoolScheduler"]
+    ) -> None:
+        with self._lock:
+            if self._reaping_schedulers.get(identity) is not entry:
+                return
+            del self._reaping_schedulers[identity]
+            if entry.session_id not in self._retired_scheduler_sessions.get(identity, ()):
+                self._recoverable_scheduler_sessions[identity] = _RecoverableSession(
+                    entry.session_id, entry.fingerprint
+                )
+
+    def _finish_worker_reap(self, identity: WorkerIdentity, entry: _ServiceEntry["KVPoolWorker"]) -> None:
+        with self._lock:
+            if self._reaping_workers.get(identity) is not entry:
+                return
+            del self._reaping_workers[identity]
+            if entry.session_id not in self._retired_worker_sessions.get(identity, ()):
+                self._recoverable_worker_sessions[identity] = _RecoverableSession(entry.session_id, entry.fingerprint)
 
     def close(self) -> None:
         with self._lock:
             services = [entry.service for entry in self._workers.values()]
             services.extend(entry.service for entry in self._schedulers.values())
+            services.extend(entry.service for entry in self._reaping_workers.values())
+            services.extend(entry.service for entry in self._reaping_schedulers.values())
             self._workers.clear()
             self._schedulers.clear()
             self._registering_workers.clear()
             self._registering_schedulers.clear()
+            self._reaping_workers.clear()
+            self._reaping_schedulers.clear()
+            self._recoverable_worker_sessions.clear()
+            self._recoverable_scheduler_sessions.clear()
             self._retired_worker_sessions.clear()
             self._retired_scheduler_sessions.clear()
 
@@ -532,6 +678,13 @@ class KVCacheServiceRegistry:
         if registration.identity != expected_identity:
             raise ValueError(
                 f"Worker identity does not match VllmConfig: {registration.identity!r} != {expected_identity!r}"
+            )
+
+    @staticmethod
+    def _validate_session(role: str, identity, incoming: str, current: str) -> None:
+        if incoming != current:
+            raise StaleSessionError(
+                f"{role} {identity!r} session {incoming!r} is stale; current session is {current!r}"
             )
 
     @staticmethod

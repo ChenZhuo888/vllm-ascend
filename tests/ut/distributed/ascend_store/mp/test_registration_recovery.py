@@ -11,6 +11,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPRemoteError,
     MPRequestTimeoutError,
+    MPServerBusyError,
 )
 
 KV_CACHE_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache"
@@ -144,3 +145,97 @@ def test_close_stops_heartbeat_then_unregisters_the_same_session() -> None:
         )
         assert stop_index < unregister_index
         rpc_client.close.assert_called_once_with()
+
+
+def test_service_heartbeat_uses_the_registered_session() -> None:
+    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+        rpc_client = rpc_client_class.return_value
+        rpc_client.is_transport_connected = True
+        rpc_client.is_server_responsive = True
+        rpc_client.ping.return_value = "OK"
+        rpc_client.request.side_effect = [[b"OK"], [b"OK"]]
+
+        client = KVCacheClient("tcp://127.0.0.1:12345")
+        try:
+            assert client.register_scheduler(_make_vllm_config(), None, 0)
+            registration = cloudpickle.loads(rpc_client.request.call_args_list[0].args[1][0])
+
+            heartbeat_callback = rpc_client.start_heartbeat.call_args.kwargs["heartbeat_callback"]
+            heartbeat_callback()
+
+            heartbeat_call = rpc_client.request.call_args_list[1]
+            assert heartbeat_call.args[0] == KVCacheMethod.HEARTBEAT_SCHEDULER
+            assert heartbeat_call.args[1][-1].decode() == registration.session_id
+        finally:
+            client.close()
+
+
+def test_service_not_registered_heartbeat_reregisters_the_same_session() -> None:
+    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+        rpc_client = rpc_client_class.return_value
+        rpc_client.is_transport_connected = True
+        rpc_client.is_server_responsive = True
+        rpc_client.ping.return_value = "OK"
+        rpc_client.request.side_effect = [
+            [b"OK"],
+            MPRemoteError("ServiceNotRegisteredError: service was reaped"),
+            [b"OK"],
+        ]
+
+        client = KVCacheClient("tcp://127.0.0.1:12345")
+        try:
+            assert client.register_scheduler(_make_vllm_config(), None, 0)
+            heartbeat_callback = rpc_client.start_heartbeat.call_args.kwargs["heartbeat_callback"]
+            heartbeat_callback()
+
+            register_calls = [
+                request_call
+                for request_call in rpc_client.request.call_args_list
+                if request_call.args[0] == KVCacheMethod.REGISTER_SCHEDULER
+            ]
+            assert len(register_calls) == 2
+            first_registration = cloudpickle.loads(register_calls[0].args[1][0])
+            second_registration = cloudpickle.loads(register_calls[1].args[1][0])
+            assert first_registration.session_id == second_registration.session_id
+            assert client.is_registered
+        finally:
+            client.close()
+
+
+def test_unregistered_client_retries_registration_from_heartbeat() -> None:
+    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+        rpc_client = rpc_client_class.return_value
+        rpc_client.is_transport_connected = True
+        rpc_client.is_server_responsive = True
+        rpc_client.ping.return_value = "OK"
+        rpc_client.request.side_effect = [MPServerBusyError("busy"), [b"OK"]]
+
+        client = KVCacheClient("tcp://127.0.0.1:12345")
+        try:
+            assert not client.register_scheduler(_make_vllm_config(), None, 0)
+            heartbeat_callback = rpc_client.start_heartbeat.call_args.kwargs["heartbeat_callback"]
+            heartbeat_callback()
+            assert client.is_registered
+        finally:
+            client.close()
+
+
+def test_stale_service_heartbeat_supersedes_client() -> None:
+    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+        rpc_client = rpc_client_class.return_value
+        rpc_client.is_transport_connected = True
+        rpc_client.is_server_responsive = True
+        rpc_client.ping.return_value = "OK"
+        rpc_client.request.side_effect = [[b"OK"], MPRemoteError("StaleSessionError: old session")]
+
+        client = KVCacheClient("tcp://127.0.0.1:12345")
+        try:
+            assert client.register_scheduler(_make_vllm_config(), None, 0)
+            heartbeat_callback = rpc_client.start_heartbeat.call_args.kwargs["heartbeat_callback"]
+            heartbeat_callback()
+
+            assert not client.is_registered
+            with pytest.raises(ServiceSessionExpiredError, match="superseded"):
+                client.lookup(_make_request(), 0)
+        finally:
+            client.close()

@@ -82,6 +82,7 @@ class MPClient:
         self._heartbeat_interval_ms = 0
         self._heartbeat_timeout_ms = 0
         self._recovery_callback: Callable[[], bool] | None = None
+        self._heartbeat_callback: Callable[[], None] | None = None
 
         self._io_ready = threading.Event()
         self._io_error: Exception | None = None
@@ -139,7 +140,6 @@ class MPClient:
         with self._lifecycle_lock:
             if self._close_requested.is_set() or self._resources_released:
                 raise MPClientClosedError("MP client is closed")
-
             if self._io_error is not None:
                 raise MPServerUnavailableError("MP client I/O thread is unavailable") from self._io_error
 
@@ -168,7 +168,6 @@ class MPClient:
         with self._lifecycle_lock:
             if self._close_requested.is_set() or self._resources_released:
                 raise MPClientClosedError("MP client is closed")
-
             if not self._transport_connected.is_set():
                 raise MPServerUnavailableError("MP server is unavailable")
 
@@ -207,15 +206,12 @@ class MPClient:
                 request = self._outbound_queue.get_nowait()
                 if not request.future.set_running_or_notify_cancel():
                     continue
-
                 if request.deadline is not None and request.deadline <= time.monotonic():
                     self._set_request_timeout(request.method, request.future)
                     continue
 
                 self._pending_requests[request.request_id] = _PendingRequest(
-                    request.method,
-                    request.future,
-                    request.deadline,
+                    request.method, request.future, request.deadline
                 )
                 zmq_socket.send_multipart(request.frames)
         except queue.Empty:
@@ -232,7 +228,6 @@ class MPClient:
         if pending is None:
             logger.debug("Discarding response for inactive request ID %r", request_id)
             return
-
         if pending.future.done():
             return
 
@@ -264,7 +259,6 @@ class MPClient:
         with self._lifecycle_lock:
             if self._close_requested.is_set() or not self._transport_connected.is_set():
                 return
-
             self._transport_connected.clear()
             self._server_responsive.clear()
 
@@ -275,7 +269,6 @@ class MPClient:
         with self._lifecycle_lock:
             if self._close_requested.is_set() or self._resources_released:
                 return
-
             self._transport_connected.set()
 
         if not self.is_heartbeat_running:
@@ -284,7 +277,6 @@ class MPClient:
     def _process_monitor_event(self, zmq_socket: zmq.Socket, monitor_socket: zmq.Socket) -> None:
         monitor_event = recv_monitor_message(monitor_socket)
         event = monitor_event["event"]
-
         if event == zmq.EVENT_DISCONNECTED:
             self._handle_transport_disconnected(zmq_socket)
         elif event == zmq.EVENT_CONNECTED:
@@ -305,7 +297,6 @@ class MPClient:
             for request_id, request in self._pending_requests.items()
             if request.deadline is not None and request.deadline <= now
         ]
-
         for request_id in expired_request_ids:
             request = self._pending_requests.pop(request_id)
             self._set_request_timeout(request.method, request.future)
@@ -313,7 +304,6 @@ class MPClient:
     def _io_loop(self) -> None:
         zmq_socket = None
         monitor_socket = None
-
         try:
             zmq_socket = self._context.socket(zmq.DEALER)
             monitor_socket = zmq_socket.get_monitor_socket(events=zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED)
@@ -331,39 +321,30 @@ class MPClient:
 
                 if self._notify_reader.fileno() in events:
                     self._notify_reader.recv(4096)
-
                     if self._close_requested.is_set():
                         self._fail_pending(MPClientClosedError("MP client was closed"))
                         break
-
                     self._process_outbound(zmq_socket)
 
                 if zmq_socket in events:
                     self._process_inbound(zmq_socket)
-
                 if monitor_socket in events:
                     self._process_monitor_event(zmq_socket, monitor_socket)
-
                 self._expire_pending_requests()
         except Exception as exc:
             self._io_error = exc
-
             with self._lifecycle_lock:
                 self._transport_connected.clear()
                 self._server_responsive.clear()
-
             self._fail_pending(exc)
             self._io_ready.set()
         finally:
             self._transport_connected.clear()
             self._server_responsive.clear()
-
             if monitor_socket is not None:
                 monitor_socket.close(linger=0)
-
             if zmq_socket is not None:
                 zmq_socket.close(linger=0)
-
             self._notify_reader.close()
 
     def _fail_pending(self, exc: Exception) -> None:
@@ -378,7 +359,6 @@ class MPClient:
         for request in self._pending_requests.values():
             if not request.future.done():
                 request.future.set_exception(exc)
-
         self._pending_requests.clear()
 
     def start_heartbeat(
@@ -386,6 +366,7 @@ class MPClient:
             interval_ms: int = 10000,
             timeout_ms: int | None = None,
             recovery_callback: Callable[[], bool] | None = None,
+            heartbeat_callback: Callable[[], None] | None = None,
     ) -> None:
         if interval_ms <= 0:
             raise ValueError(f"interval_ms must be greater than 0, got {interval_ms}")
@@ -405,18 +386,16 @@ class MPClient:
                 self._heartbeat_interval_ms = interval_ms
                 self._heartbeat_timeout_ms = heartbeat_timeout_ms
                 self._recovery_callback = recovery_callback
+                self._heartbeat_callback = heartbeat_callback
                 self._heartbeat_stop.clear()
                 self._heartbeat_thread = threading.Thread(
-                    target=self._heartbeat_loop,
-                    daemon=True,
-                    name="ascend-store-mp-heartbeat",
+                    target=self._heartbeat_loop, daemon=True, name="ascend-store-mp-heartbeat"
                 )
                 self._heartbeat_thread.start()
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.is_set():
             was_responsive = self._server_responsive.is_set()
-
             try:
                 responsive = self.ping(timeout_ms=self._heartbeat_timeout_ms) == "OK"
             except Exception:
@@ -432,6 +411,12 @@ class MPClient:
                 except Exception:
                     logger.exception("MP server heartbeat recovery callback failed")
                     responsive = False
+
+            if responsive and self._heartbeat_callback is not None:
+                try:
+                    self._heartbeat_callback()
+                except Exception:
+                    logger.exception("MP server heartbeat callback failed")
 
             if self._heartbeat_stop.is_set():
                 break
@@ -467,7 +452,6 @@ class MPClient:
 
     def close(self) -> None:
         heartbeat_thread: threading.Thread | None = None
-
         with self._lifecycle_lock:
             if self._resources_released:
                 return
@@ -480,13 +464,11 @@ class MPClient:
                 self._close_requested.set()
                 self._transport_connected.clear()
                 self._server_responsive.clear()
-
                 if self._io_thread.is_alive():
                     with contextlib.suppress(OSError):
                         self._notify_io_thread()
 
         self._io_thread.join()
-
         if heartbeat_thread is not None and heartbeat_thread is not threading.current_thread():
             heartbeat_thread.join()
 
@@ -497,7 +479,6 @@ class MPClient:
         with self._lifecycle_lock:
             if self._resources_released:
                 return
-
             self._notify_writer.close()
             self._context.term()
             self._resources_released = True
