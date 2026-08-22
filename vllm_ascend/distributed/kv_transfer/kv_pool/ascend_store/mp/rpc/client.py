@@ -17,7 +17,7 @@ import queue
 import socket
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 
@@ -71,18 +71,8 @@ class MPClient:
 
         self._close_requested = threading.Event()
         self._transport_connected = threading.Event()
-        self._server_responsive = threading.Event()
-        self._server_responsive.set()
         self._lifecycle_lock = threading.Lock()
         self._resources_released = False
-
-        self._heartbeat_lock = threading.Lock()
-        self._heartbeat_stop = threading.Event()
-        self._heartbeat_thread: threading.Thread | None = None
-        self._heartbeat_interval_ms = 0
-        self._heartbeat_timeout_ms = 0
-        self._recovery_callback: Callable[[], bool] | None = None
-        self._heartbeat_callback: Callable[[], None] | None = None
 
         self._io_ready = threading.Event()
         self._io_error: Exception | None = None
@@ -110,21 +100,6 @@ class MPClient:
     def is_transport_connected(self) -> bool:
         """Whether ZMQ reports an active transport connection."""
         return self._transport_connected.is_set()
-
-    @property
-    def is_server_responsive(self) -> bool:
-        """Whether the connected server is considered responsive.
-
-        Without heartbeat monitoring, a transport connection is optimistically
-        treated as responsive.
-        """
-        return self._transport_connected.is_set() and self._server_responsive.is_set()
-
-    @property
-    def is_heartbeat_running(self) -> bool:
-        """Whether the heartbeat monitoring thread is running."""
-        with self._heartbeat_lock:
-            return self._heartbeat_thread is not None and self._heartbeat_thread.is_alive()
 
     def wait_until_connected(self, timeout_ms: int = 5000) -> None:
         if timeout_ms <= 0:
@@ -260,7 +235,6 @@ class MPClient:
             if self._close_requested.is_set() or not self._transport_connected.is_set():
                 return
             self._transport_connected.clear()
-            self._server_responsive.clear()
 
         self._drain_inbound(zmq_socket)
         self._fail_pending(MPServerUnavailableError(f"MP server disconnected: {self._server_url}"))
@@ -270,9 +244,6 @@ class MPClient:
             if self._close_requested.is_set() or self._resources_released:
                 return
             self._transport_connected.set()
-
-        if not self.is_heartbeat_running:
-            self._server_responsive.set()
 
     def _process_monitor_event(self, zmq_socket: zmq.Socket, monitor_socket: zmq.Socket) -> None:
         monitor_event = recv_monitor_message(monitor_socket)
@@ -335,12 +306,10 @@ class MPClient:
             self._io_error = exc
             with self._lifecycle_lock:
                 self._transport_connected.clear()
-                self._server_responsive.clear()
             self._fail_pending(exc)
             self._io_ready.set()
         finally:
             self._transport_connected.clear()
-            self._server_responsive.clear()
             if monitor_socket is not None:
                 monitor_socket.close(linger=0)
             if zmq_socket is not None:
@@ -361,120 +330,19 @@ class MPClient:
                 request.future.set_exception(exc)
         self._pending_requests.clear()
 
-    def start_heartbeat(
-        self,
-        interval_ms: int = 10000,
-        timeout_ms: int | None = None,
-        recovery_callback: Callable[[], bool] | None = None,
-        heartbeat_callback: Callable[[], None] | None = None,
-    ) -> None:
-        if interval_ms <= 0:
-            raise ValueError(f"interval_ms must be greater than 0, got {interval_ms}")
-
-        heartbeat_timeout_ms = interval_ms if timeout_ms is None else timeout_ms
-        if heartbeat_timeout_ms <= 0:
-            raise ValueError(f"timeout_ms must be greater than 0, got {heartbeat_timeout_ms}")
-
-        with self._lifecycle_lock:
-            if self._close_requested.is_set() or self._resources_released:
-                raise MPClientClosedError("MP client is closed")
-
-            with self._heartbeat_lock:
-                if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
-                    return
-
-                self._heartbeat_interval_ms = interval_ms
-                self._heartbeat_timeout_ms = heartbeat_timeout_ms
-                self._recovery_callback = recovery_callback
-                self._heartbeat_callback = heartbeat_callback
-                self._heartbeat_stop.clear()
-                self._heartbeat_thread = threading.Thread(
-                    target=self._heartbeat_loop, daemon=True, name="ascend-store-mp-heartbeat"
-                )
-                self._heartbeat_thread.start()
-
-    def _heartbeat_loop(self) -> None:
-        while not self._heartbeat_stop.is_set():
-            was_responsive = self._server_responsive.is_set()
-            try:
-                responsive = self.ping(timeout_ms=self._heartbeat_timeout_ms) == "OK"
-            except Exception:
-                logger.debug("MP server heartbeat failed", exc_info=True)
-                responsive = False
-
-            if self._heartbeat_stop.is_set():
-                break
-
-            if responsive and not was_responsive and self._recovery_callback is not None:
-                try:
-                    responsive = bool(self._recovery_callback())
-                except Exception:
-                    logger.exception("MP server heartbeat recovery callback failed")
-                    responsive = False
-
-            if responsive and self._heartbeat_callback is not None:
-                try:
-                    self._heartbeat_callback()
-                except Exception:
-                    logger.exception("MP server heartbeat callback failed")
-
-            if self._heartbeat_stop.is_set():
-                break
-
-            if responsive:
-                self._server_responsive.set()
-                if not was_responsive:
-                    logger.info("MP server is responsive again")
-            else:
-                self._server_responsive.clear()
-                if was_responsive:
-                    logger.warning("MP server is unresponsive")
-
-            if self._heartbeat_stop.wait(self._heartbeat_interval_ms / 1000):
-                break
-
-    def stop_heartbeat(self) -> None:
-        with self._heartbeat_lock:
-            heartbeat_thread = self._heartbeat_thread
-            if heartbeat_thread is None:
-                return
-            self._heartbeat_stop.set()
-
-        if heartbeat_thread is not threading.current_thread():
-            heartbeat_thread.join()
-
-        with self._heartbeat_lock:
-            if self._heartbeat_thread is heartbeat_thread:
-                self._heartbeat_thread = None
-
-        if not self._close_requested.is_set() and self._transport_connected.is_set():
-            self._server_responsive.set()
-
     def close(self) -> None:
-        heartbeat_thread: threading.Thread | None = None
         with self._lifecycle_lock:
             if self._resources_released:
                 return
 
-            with self._heartbeat_lock:
-                heartbeat_thread = self._heartbeat_thread
-                self._heartbeat_stop.set()
-
             if not self._close_requested.is_set():
                 self._close_requested.set()
                 self._transport_connected.clear()
-                self._server_responsive.clear()
                 if self._io_thread.is_alive():
                     with contextlib.suppress(OSError):
                         self._notify_io_thread()
 
         self._io_thread.join()
-        if heartbeat_thread is not None and heartbeat_thread is not threading.current_thread():
-            heartbeat_thread.join()
-
-        with self._heartbeat_lock:
-            if self._heartbeat_thread is heartbeat_thread:
-                self._heartbeat_thread = None
 
         with self._lifecycle_lock:
             if self._resources_released:

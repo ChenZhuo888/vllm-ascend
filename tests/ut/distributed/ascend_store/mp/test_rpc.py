@@ -261,8 +261,6 @@ def test_client_server_round_trip():
         client.wait_until_connected()
 
         assert client.is_transport_connected
-        assert client.is_server_responsive
-        assert not client.is_heartbeat_running
         assert client.ping() == "OK"
         assert client.echo(b"hello ascend store") == b"hello ascend store"
 
@@ -572,27 +570,3 @@ def test_affinity_executor_requires_affinity_key() -> None:
             executor.submit(ExecutionTask(lambda: None))
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
-
-
-def test_heartbeat_callback_runs_after_successful_ping() -> None:
-    client = object.__new__(MPClient)
-    client._heartbeat_stop = threading.Event()
-    client._server_responsive = threading.Event()
-    client._server_responsive.set()
-    client._heartbeat_interval_ms = 1
-    client._heartbeat_timeout_ms = 100
-    client._recovery_callback = None
-
-    callback_called = threading.Event()
-
-    def heartbeat_callback() -> None:
-        callback_called.set()
-        client._heartbeat_stop.set()
-
-    client._heartbeat_callback = heartbeat_callback
-    client.ping = lambda timeout_ms: "OK"
-
-    client._heartbeat_loop()
-
-    assert callback_called.is_set()
-    assert client._server_responsive.is_set()

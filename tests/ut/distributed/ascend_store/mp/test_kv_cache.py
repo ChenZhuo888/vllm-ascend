@@ -253,25 +253,29 @@ def test_client_creation_does_not_wait_for_server() -> None:
 
 
 def test_registration_checks_application_readiness() -> None:
-    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
+    with (
+        patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class,
+        patch(f"{KV_CACHE_CLIENT_MODULE}.KVCacheClient._start_lease_loop"),
+    ):
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
-        rpc_client.ping.side_effect = MPRequestTimeoutError("PING timeout")
+        rpc_client.request.side_effect = MPRequestTimeoutError("registration timeout")
 
         with KVCacheClient("tcp://127.0.0.1:12345") as client:
             registered = client.register_scheduler(_make_vllm_config(), kv_cache_config=None, page_size_bytes=0)
 
         assert not registered
-        rpc_client.request.assert_not_called()
-        rpc_client.start_heartbeat.assert_called_once()
+        rpc_client.ping.assert_not_called()
+        rpc_client.request.assert_called_once()
 
 
 def test_lookup_retries_registration_after_server_busy() -> None:
-    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
+    with (
+        patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class,
+        patch(f"{KV_CACHE_CLIENT_MODULE}.KVCacheClient._start_lease_loop"),
+    ):
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
-        rpc_client.is_server_responsive = True
-        rpc_client.ping.return_value = "OK"
         rpc_client.request.side_effect = [
             MPServerBusyError("Server busy"),
             [b"OK"],
@@ -283,15 +287,16 @@ def test_lookup_retries_registration_after_server_busy() -> None:
             assert client.lookup(_make_request(), 0) == (16, False)
             assert client.is_registered
 
-        rpc_client.start_heartbeat.assert_called_once()
+        rpc_client.ping.assert_not_called()
 
 
 def test_lookup_returns_cache_miss_on_transport_failure() -> None:
-    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
+    with (
+        patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class,
+        patch(f"{KV_CACHE_CLIENT_MODULE}.KVCacheClient._start_lease_loop"),
+    ):
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
-        rpc_client.is_server_responsive = True
-        rpc_client.ping.return_value = "OK"
         rpc_client.request.side_effect = [[b"OK"], MPServerUnavailableError("Server unavailable")]
 
         with KVCacheClient("tcp://127.0.0.1:12345") as client:
@@ -301,11 +306,12 @@ def test_lookup_returns_cache_miss_on_transport_failure() -> None:
 
 
 def test_lookup_returns_cache_miss_without_unregistering_when_server_is_busy() -> None:
-    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
+    with (
+        patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class,
+        patch(f"{KV_CACHE_CLIENT_MODULE}.KVCacheClient._start_lease_loop"),
+    ):
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
-        rpc_client.is_server_responsive = True
-        rpc_client.ping.return_value = "OK"
         rpc_client.request.side_effect = [[b"OK"], MPServerBusyError("Server busy")]
 
         with KVCacheClient("tcp://127.0.0.1:12345") as client:
@@ -315,7 +321,10 @@ def test_lookup_returns_cache_miss_without_unregistering_when_server_is_busy() -
 
 
 def test_lookup_validates_request_before_degrading() -> None:
-    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
+    with (
+        patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class,
+        patch(f"{KV_CACHE_CLIENT_MODULE}.KVCacheClient._start_lease_loop"),
+    ):
         rpc_client_class.return_value.is_transport_connected = False
 
         with KVCacheClient("tcp://127.0.0.1:12345") as client:

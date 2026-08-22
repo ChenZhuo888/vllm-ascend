@@ -47,8 +47,8 @@ class KVCacheServer:
                 KVCacheMethod.REGISTER_WORKER: self._handle_register_worker,
                 KVCacheMethod.UNREGISTER_SCHEDULER: self._handle_unregister_scheduler,
                 KVCacheMethod.UNREGISTER_WORKER: self._handle_unregister_worker,
-                KVCacheMethod.HEARTBEAT_SCHEDULER: HandlerSpec(self._handle_scheduler_heartbeat, ExecutionMode.INLINE),
-                KVCacheMethod.HEARTBEAT_WORKER: HandlerSpec(self._handle_worker_heartbeat, ExecutionMode.INLINE),
+                KVCacheMethod.RENEW_SCHEDULER: HandlerSpec(self._handle_renew_scheduler, ExecutionMode.INLINE),
+                KVCacheMethod.RENEW_WORKER: HandlerSpec(self._handle_renew_worker, ExecutionMode.INLINE),
                 KVCacheMethod.LOOKUP: HandlerSpec(self._handle_lookup, ExecutionMode.AFFINITY, lookup_affinity_key),
             },
         )
@@ -103,14 +103,14 @@ class KVCacheServer:
         self._service.unregister_worker(identity, session_id)
         return (ACK_RESPONSE,)
 
-    def _handle_scheduler_heartbeat(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+    def _handle_renew_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id = decode_scheduler_session(payloads)
-        self._service.heartbeat_scheduler(identity, session_id)
+        self._service.renew_scheduler(identity, session_id)
         return (ACK_RESPONSE,)
 
-    def _handle_worker_heartbeat(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+    def _handle_renew_worker(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id = decode_worker_session(payloads)
-        self._service.heartbeat_worker(identity, session_id)
+        self._service.renew_worker(identity, session_id)
         return (ACK_RESPONSE,)
 
     def _handle_lookup(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:

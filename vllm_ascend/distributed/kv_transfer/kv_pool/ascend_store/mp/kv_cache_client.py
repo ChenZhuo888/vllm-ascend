@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_MS = 5000
 _REGISTRATION_TIMEOUT_MS = 500
-_HEARTBEAT_INTERVAL_MS = 1000
-_HEARTBEAT_TIMEOUT_MS = 1000
+_LEASE_RENEW_INTERVAL_MS = 1000
+_LEASE_REQUEST_TIMEOUT_MS = 1000
 
 
 class KVCacheClient:
@@ -43,6 +43,9 @@ class KVCacheClient:
     def __init__(self, server_url: str):
         self._rpc_client = MPClient(server_url)
         self._registration_lock = threading.Lock()
+        self._lease_lock = threading.Lock()
+        self._lease_stop = threading.Event()
+        self._lease_thread: threading.Thread | None = None
         self._registration: tuple[SchedulerRegistration | WorkerRegistration, bytes] | None = None
         self._session_id = uuid.uuid4().hex
         self._registered = False
@@ -62,9 +65,7 @@ class KVCacheClient:
     @property
     def is_registered(self) -> bool:
         with self._registration_lock:
-            return (
-                not self._closed and not self._superseded and self._registered and self._rpc_client.is_server_responsive
-            )
+            return not self._closed and not self._superseded and self._registered
 
     def register_scheduler(
         self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig | None, page_size_bytes: int
@@ -91,22 +92,10 @@ class KVCacheClient:
             self._registered = False
 
         registered = self._try_register()
-        self._rpc_client.start_heartbeat(
-            interval_ms=_HEARTBEAT_INTERVAL_MS,
-            timeout_ms=_HEARTBEAT_TIMEOUT_MS,
-            recovery_callback=self._recover_registration,
-            heartbeat_callback=self._heartbeat_service,
-        )
+        self._start_lease_loop()
         return registered
 
-    def _recover_registration(self) -> bool:
-        try:
-            return self._try_register()
-        except ServiceSessionExpiredError:
-            # The server is responsive; only this client incarnation is no longer valid.
-            return True
-
-    def _heartbeat_service(self) -> None:
+    def _maintain_lease(self) -> None:
         with self._registration_lock:
             if self._closed or self._superseded or self._registration is None:
                 return
@@ -119,15 +108,16 @@ class KVCacheClient:
             return
 
         if isinstance(registration, SchedulerRegistration):
-            method = KVCacheMethod.HEARTBEAT_SCHEDULER
+            method = KVCacheMethod.RENEW_SCHEDULER
             payloads = encode_scheduler_session(registration.identity, registration.session_id)
         else:
-            method = KVCacheMethod.HEARTBEAT_WORKER
+            method = KVCacheMethod.RENEW_WORKER
             payloads = encode_worker_session(registration.identity, registration.session_id)
 
         try:
-            responses = self._rpc_client.request(method, payloads, timeout_ms=_HEARTBEAT_TIMEOUT_MS)
+            responses = self._rpc_client.request(method, payloads, timeout_ms=_LEASE_REQUEST_TIMEOUT_MS)
         except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError):
+            self._mark_unregistered()
             return
         except MPRemoteError as exc:
             if str(exc).startswith(SERVICE_NOT_REGISTERED_PREFIX):
@@ -143,6 +133,43 @@ class KVCacheClient:
         if responses != [ACK_RESPONSE]:
             raise MPProtocolError(f"{method.value} expects an OK response, got {responses!r}")
 
+    def _start_lease_loop(self) -> None:
+        with self._registration_lock:
+            if self._closed:
+                return
+
+            with self._lease_lock:
+                if self._lease_thread is not None and self._lease_thread.is_alive():
+                    return
+
+                self._lease_stop.clear()
+                self._lease_thread = threading.Thread(
+                    target=self._lease_loop, daemon=True, name="ascend-store-kv-lease"
+                )
+                self._lease_thread.start()
+
+    def _lease_loop(self) -> None:
+        interval_s = _LEASE_RENEW_INTERVAL_MS / 1000
+        while not self._lease_stop.wait(interval_s):
+            try:
+                self._maintain_lease()
+            except Exception:
+                logger.exception("KV cache service lease maintenance failed")
+
+    def _stop_lease_loop(self) -> None:
+        with self._lease_lock:
+            lease_thread = self._lease_thread
+            if lease_thread is None:
+                return
+            self._lease_stop.set()
+
+        if lease_thread is not threading.current_thread():
+            lease_thread.join()
+
+        with self._lease_lock:
+            if self._lease_thread is lease_thread:
+                self._lease_thread = None
+
     def _try_register(self) -> bool:
         with self._registration_lock:
             if self._closed:
@@ -153,7 +180,7 @@ class KVCacheClient:
             configured_registration = self._registration
             if configured_registration is None:
                 return False
-            if self._registered and self._rpc_client.is_server_responsive:
+            if self._registered:
                 return True
 
         registration, payload = configured_registration
@@ -167,8 +194,6 @@ class KVCacheClient:
             return False
 
         try:
-            if self._rpc_client.ping(timeout_ms=_REGISTRATION_TIMEOUT_MS) != "OK":
-                raise MPProtocolError("KV cache server returned an invalid PING response")
             responses = self._rpc_client.request(method, (payload,), timeout_ms=_REGISTRATION_TIMEOUT_MS)
         except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError):
             self._mark_unregistered()
@@ -269,6 +294,6 @@ class KVCacheClient:
                 return
             self._closed = True
 
-        self._rpc_client.stop_heartbeat()
+        self._stop_lease_loop()
         self._unregister()
         self._rpc_client.close()

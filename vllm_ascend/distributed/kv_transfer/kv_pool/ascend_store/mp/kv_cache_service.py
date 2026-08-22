@@ -84,11 +84,11 @@ class KVCacheService:
     def unregister_worker(self, identity: WorkerIdentity, session_id: str) -> None:
         self._registry.unregister_worker(identity, session_id)
 
-    def heartbeat_scheduler(self, identity: SchedulerIdentity, session_id: str) -> None:
+    def renew_scheduler(self, identity: SchedulerIdentity, session_id: str) -> None:
         if not self._registry.touch_scheduler(identity, session_id):
             raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
 
-    def heartbeat_worker(self, identity: WorkerIdentity, session_id: str) -> None:
+    def renew_worker(self, identity: WorkerIdentity, session_id: str) -> None:
         if not self._registry.touch_worker(identity, session_id):
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
 
