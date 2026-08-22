@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from ..pool_scheduler import KVPoolScheduler
     from ..pool_worker import KVPoolWorker
 
+_LOOKUP_COORDINATOR_RANK = 0
+
 
 class KVCacheService:
     """Own KV cache services and coordinate calls between them."""
@@ -117,11 +119,7 @@ class KVCacheService:
         use_layerwise: bool,
         hbm_hit_tokens: int,
     ) -> int:
-        worker_identity = WorkerIdentity(
-            scheduler_identity.engine_id,
-            rank=0,
-            data_parallel_rank=scheduler_identity.data_parallel_rank,
-        )
+        worker_identity = self._get_lookup_worker_identity(scheduler_identity)
         worker = self._registry.get_worker(worker_identity)
         if worker is None:
             return 0
@@ -132,19 +130,22 @@ class KVCacheService:
     def _bind_lookup_store(self, scheduler_identity: SchedulerIdentity) -> None:
         with self._binding_lock:
             scheduler = self._registry.get_scheduler(scheduler_identity)
-            if scheduler is None:
+            worker = self._registry.get_worker(self._get_lookup_worker_identity(scheduler_identity))
+            if scheduler is None or worker is None:
                 return
 
             store = getattr(scheduler, "store_scheduler", None)
             if store is None:
                 return
 
-            for identity, worker in self._registry.worker_items():
-                if (
-                    identity.engine_id != scheduler_identity.engine_id
-                    or identity.data_parallel_rank != scheduler_identity.data_parallel_rank
-                ):
-                    continue
-                bind_lookup_store = getattr(worker, "bind_lookup_store", None)
-                if callable(bind_lookup_store):
-                    bind_lookup_store(store)
+            bind_lookup_store = getattr(worker, "bind_lookup_store", None)
+            if callable(bind_lookup_store):
+                bind_lookup_store(store)
+
+    @staticmethod
+    def _get_lookup_worker_identity(scheduler_identity: SchedulerIdentity) -> WorkerIdentity:
+        return WorkerIdentity(
+            scheduler_identity.engine_id,
+            rank=_LOOKUP_COORDINATOR_RANK,
+            data_parallel_rank=scheduler_identity.data_parallel_rank,
+        )

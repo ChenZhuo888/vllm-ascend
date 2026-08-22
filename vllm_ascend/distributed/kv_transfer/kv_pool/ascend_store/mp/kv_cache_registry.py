@@ -84,9 +84,6 @@ class KVCacheServiceRegistry:
     def get_worker(self, identity: WorkerIdentity, session_id: str | None = None) -> "KVPoolWorker | None":
         return self._workers.get(identity, session_id)
 
-    def worker_items(self) -> tuple[tuple[WorkerIdentity, "KVPoolWorker"], ...]:
-        return self._workers.items()
-
     def reap_stale(self, stale_before: float) -> tuple[int, int]:
         return self._schedulers.reap_stale(stale_before), self._workers.reap_stale(stale_before)
 

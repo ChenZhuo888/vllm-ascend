@@ -68,7 +68,7 @@ class MPKVPoolScheduler(KVPoolScheduler):
 
 
 class LookupKVPoolWorker(KVPoolWorker):
-    """Initialize only the CPU-side state required by lookup_scheduler."""
+    """Initialize CPU-side state and use the Scheduler metadata store for Lookup."""
 
     def __init__(
         self,

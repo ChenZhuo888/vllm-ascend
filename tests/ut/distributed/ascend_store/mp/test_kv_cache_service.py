@@ -155,3 +155,26 @@ def test_lookup_routes_to_rank_zero_worker_in_the_same_dp_group() -> None:
     assert workers[(0, 0)].lookup_hashes == [block_hash.hex() for block_hash in _BLOCK_HASHES]
     assert workers[(0, 1)].lookup_hashes is None
     assert workers[(1, 0)].lookup_hashes is None
+    assert workers[(0, 0)].bound_store is not None
+    assert workers[(0, 1)].bound_store is None
+    assert workers[(1, 0)].bound_store is None
+
+
+def test_lookup_does_not_fall_back_to_a_non_coordinator_worker() -> None:
+    worker = _FakeWorker(32)
+    service = KVCacheService(_create_scheduler, lambda registration: worker)
+    worker_registration = _worker_registration("worker-session", rank=1)
+    scheduler_registration = _scheduler_registration("scheduler-session")
+
+    service.register_worker(worker_registration, encode_registration(worker_registration))
+    service.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
+    request = SimpleNamespace(
+        request_id="request-0",
+        prompt_token_ids=list(range(32)),
+        block_hashes=_BLOCK_HASHES,
+        num_tokens=32,
+    )
+
+    assert service.lookup(scheduler_registration.identity, scheduler_registration.session_id, request, 0) == (0, False)
+    assert worker.bound_store is None
+    assert worker.lookup_hashes is None
