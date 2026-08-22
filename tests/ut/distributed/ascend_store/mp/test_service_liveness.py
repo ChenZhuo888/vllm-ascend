@@ -11,9 +11,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration im
     SchedulerRegistration,
     WorkerRegistration,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import MPServerBusyError
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.service import (
     RegistrationConflictError,
+    ServiceBusyError,
     StaleSessionError,
 )
 
@@ -22,7 +22,6 @@ REGISTRY_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.k
 
 class _FakeScheduler:
     def __init__(self):
-        self.store_scheduler = object()
         self.close_count = 0
 
     def close(self) -> None:
@@ -44,14 +43,10 @@ class _BlockingCloseScheduler(_FakeScheduler):
 
 class _FakeWorker:
     def __init__(self):
-        self.bound_store = None
         self.close_count = 0
 
     def close(self) -> None:
         self.close_count += 1
-
-    def bind_store(self, store) -> None:
-        self.bound_store = store
 
 
 def _make_vllm_config(engine_id: str = "engine-0", rank: int = 0, data_parallel_rank: int = 0, marker: str = ""):
@@ -70,22 +65,17 @@ def _worker_registration(session_id: str) -> WorkerRegistration:
     return WorkerRegistration.create(_make_vllm_config(), None, session_id=session_id)
 
 
-def _lookup_worker(*_args) -> int:
-    return 0
-
-
 def _create_registry(scheduler_factory=None, worker_factory=None) -> KVCacheServiceRegistry:
     return KVCacheServiceRegistry(
-        scheduler_factory or (lambda registration, lookup_handler: _FakeScheduler()),
+        scheduler_factory or (lambda registration: _FakeScheduler()),
         worker_factory or (lambda registration: _FakeWorker()),
-        _lookup_worker,
     )
 
 
 def test_reaped_scheduler_can_recover_with_the_same_session() -> None:
     created = []
 
-    def scheduler_factory(registration, lookup_handler):
+    def scheduler_factory(registration):
         scheduler = _FakeScheduler()
         created.append(scheduler)
         return scheduler
@@ -143,7 +133,7 @@ def test_registration_is_busy_while_stale_service_is_closing() -> None:
     close_started = threading.Event()
     release_close = threading.Event()
 
-    def scheduler_factory(registration, lookup_handler):
+    def scheduler_factory(registration):
         return _BlockingCloseScheduler(close_started, release_close)
 
     registry = _create_registry(scheduler_factory=scheduler_factory)
@@ -157,7 +147,7 @@ def test_registration_is_busy_while_stale_service_is_closing() -> None:
         reap_future = executor.submit(registry.reap_stale, 11.0)
         assert close_started.wait(5), "Stale Scheduler did not start closing"
         try:
-            with pytest.raises(MPServerBusyError, match="being reaped"):
+            with pytest.raises(ServiceBusyError, match="being reaped"):
                 registry.register_scheduler(registration, payload)
         finally:
             release_close.set()
@@ -172,7 +162,7 @@ def test_scheduler_access_refreshes_liveness_but_internal_worker_access_does_not
     scheduler = _FakeScheduler()
     worker = _FakeWorker()
     registry = _create_registry(
-        scheduler_factory=lambda registration, lookup_handler: scheduler,
+        scheduler_factory=lambda registration: scheduler,
         worker_factory=lambda registration: worker,
     )
     scheduler_registration = _scheduler_registration("scheduler-session")

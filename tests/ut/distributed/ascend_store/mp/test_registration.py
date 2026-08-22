@@ -7,7 +7,6 @@ import pytest
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import encode_registration
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_registry import KVCacheServiceRegistry
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
-    SchedulerIdentity,
     SchedulerRegistration,
     WorkerRegistration,
 )
@@ -19,7 +18,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.service import 
 
 class _FakeScheduler:
     def __init__(self):
-        self.store_scheduler = object()
         self.close_count = 0
 
     def close(self) -> None:
@@ -31,14 +29,10 @@ class _FakeScheduler:
 
 class _FakeWorker:
     def __init__(self):
-        self.bound_store = None
         self.close_count = 0
 
     def close(self) -> None:
         self.close_count += 1
-
-    def bind_store(self, store) -> None:
-        self.bound_store = store
 
     def lookup_scheduler(
         self,
@@ -76,15 +70,10 @@ def _worker_registration(session_id: str, *, data_parallel_rank: int = 0, rank: 
     )
 
 
-def _lookup_worker(*_args) -> int:
-    return 0
-
-
 def _create_registry(scheduler_factory=None, worker_factory=None) -> KVCacheServiceRegistry:
     return KVCacheServiceRegistry(
-        scheduler_factory or (lambda registration, lookup_handler: _FakeScheduler()),
+        scheduler_factory or (lambda registration: _FakeScheduler()),
         worker_factory or (lambda registration: _FakeWorker()),
-        _lookup_worker,
     )
 
 
@@ -93,7 +82,7 @@ def test_scheduler_factories_for_different_identities_run_in_parallel() -> None:
     second_started = threading.Event()
     release_first = threading.Event()
 
-    def scheduler_factory(registration, lookup_handler):
+    def scheduler_factory(registration):
         if registration.identity.data_parallel_rank == 0:
             first_started.set()
             assert release_first.wait(5), "First Scheduler factory was not released"
@@ -130,7 +119,7 @@ def test_concurrent_identical_scheduler_registration_shares_one_factory_result()
     release_factory = threading.Event()
     created_schedulers = []
 
-    def scheduler_factory(registration, lookup_handler):
+    def scheduler_factory(registration):
         scheduler = _FakeScheduler()
         created_schedulers.append(scheduler)
         factory_started.set()
@@ -159,7 +148,7 @@ def test_conflicting_scheduler_registration_fails_while_original_is_registering(
     factory_started = threading.Event()
     release_factory = threading.Event()
 
-    def scheduler_factory(registration, lookup_handler):
+    def scheduler_factory(registration):
         factory_started.set()
         assert release_factory.wait(5), "Scheduler factory was not released"
         return _FakeScheduler()
@@ -186,7 +175,7 @@ def test_concurrent_scheduler_registration_shares_factory_failure_and_next_reque
     release_factory = threading.Event()
     attempts = 0
 
-    def scheduler_factory(registration, lookup_handler):
+    def scheduler_factory(registration):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -221,7 +210,7 @@ def test_concurrent_scheduler_registration_shares_factory_failure_and_next_reque
 def test_new_scheduler_session_replaces_and_retires_old_session() -> None:
     created = []
 
-    def scheduler_factory(registration, lookup_handler):
+    def scheduler_factory(registration):
         scheduler = _FakeScheduler()
         created.append(scheduler)
         return scheduler
@@ -243,36 +232,11 @@ def test_new_scheduler_session_replaces_and_retires_old_session() -> None:
         registry.get_scheduler(old_registration.identity, "old-session")
 
 
-def test_new_scheduler_session_rebinds_existing_worker_store() -> None:
-    schedulers = []
-
-    def scheduler_factory(registration, lookup_handler):
-        scheduler = _FakeScheduler()
-        schedulers.append(scheduler)
-        return scheduler
-
-    worker = _FakeWorker()
-    registry = _create_registry(
-        scheduler_factory=scheduler_factory,
-        worker_factory=lambda registration: worker,
-    )
-    worker_registration = _worker_registration("worker-session")
-    old_scheduler = _scheduler_registration("old-session")
-    new_scheduler = _scheduler_registration("new-session")
-
-    registry.register_worker(worker_registration, encode_registration(worker_registration))
-    registry.register_scheduler(old_scheduler, encode_registration(old_scheduler))
-    assert worker.bound_store is schedulers[0].store_scheduler
-
-    registry.register_scheduler(new_scheduler, encode_registration(new_scheduler))
-    assert worker.bound_store is schedulers[1].store_scheduler
-
-
 def test_old_session_is_fenced_while_new_session_is_registering() -> None:
     new_factory_started = threading.Event()
     release_new_factory = threading.Event()
 
-    def scheduler_factory(registration, lookup_handler):
+    def scheduler_factory(registration):
         if registration.session_id == "new-session":
             new_factory_started.set()
             assert release_new_factory.wait(5), "New Scheduler factory was not released"
@@ -299,7 +263,7 @@ def test_different_new_session_is_rejected_while_session_transition_is_running()
     factory_started = threading.Event()
     release_factory = threading.Event()
 
-    def scheduler_factory(registration, lookup_handler):
+    def scheduler_factory(registration):
         if registration.session_id == "session-1":
             factory_started.set()
             assert release_factory.wait(5), "Scheduler factory was not released"
@@ -364,25 +328,3 @@ def test_concurrent_identical_worker_registration_shares_one_factory_result() ->
     assert first_service is second_service
     assert created_workers == [first_service]
     assert registry.worker_count == 1
-
-
-@pytest.mark.parametrize("worker_first", [True, False])
-def test_scheduler_store_is_bound_to_worker_regardless_of_registration_order(worker_first: bool) -> None:
-    scheduler = _FakeScheduler()
-    worker = _FakeWorker()
-    registry = _create_registry(
-        scheduler_factory=lambda registration, lookup_handler: scheduler,
-        worker_factory=lambda registration: worker,
-    )
-    scheduler_registration = _scheduler_registration("scheduler-session")
-    worker_registration = _worker_registration("worker-session")
-
-    if worker_first:
-        registry.register_worker(worker_registration, encode_registration(worker_registration))
-        registry.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
-    else:
-        registry.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
-        registry.register_worker(worker_registration, encode_registration(worker_registration))
-
-    assert worker.bound_store is scheduler.store_scheduler
-    assert registry.get_scheduler(SchedulerIdentity("engine-0"), "scheduler-session") is scheduler

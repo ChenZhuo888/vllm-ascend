@@ -22,17 +22,19 @@ class _MissingLookupStore:
         return [0] * len(keys)
 
 
-class _WorkerLookupAdapter:
+class _WorkerLookupBridge:
+    """Expose the registered Worker through KVPoolScheduler's existing client interface."""
+
     def __init__(self, identity: SchedulerIdentity, lookup_handler: WorkerLookupHandler):
         self._identity = identity
         self._lookup_handler = lookup_handler
 
     def lookup(
-            self,
-            token_len: int,
-            block_hashes: Sequence[BlockHash],
-            kv_cache_group_ids: list[int] | None = None,
-            hbm_hit_tokens: int = 0,
+        self,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        kv_cache_group_ids: list[int] | None = None,
+        hbm_hit_tokens: int = 0,
     ) -> int:
         return self._lookup_handler(
             self._identity,
@@ -54,7 +56,7 @@ class MPKVPoolScheduler(KVPoolScheduler):
             kv_cache_config=registration.kv_cache_config,
             page_size_bytes=registration.page_size_bytes,
         )
-        self.client = _WorkerLookupAdapter(  # type: ignore[assignment]
+        self.client = _WorkerLookupBridge(  # type: ignore[assignment]
             registration.identity,
             lookup_handler,
         )
@@ -69,11 +71,11 @@ class LookupKVPoolWorker(KVPoolWorker):
     """Initialize only the CPU-side state required by lookup_scheduler."""
 
     def __init__(
-            self,
-            vllm_config: VllmConfig,
-            store: LookupStore | None = None,
-            kv_cache_config: KVCacheConfig | None = None,
-            rank: int | None = None,
+        self,
+        vllm_config: VllmConfig,
+        store: LookupStore | None = None,
+        kv_cache_config: KVCacheConfig | None = None,
+        rank: int | None = None,
     ):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -123,7 +125,7 @@ class LookupKVPoolWorker(KVPoolWorker):
         self._store_is_external = store is not None
         self.m_store: LookupStore = store or _MissingLookupStore()
 
-    def bind_store(self, store: LookupStore) -> None:
+    def bind_lookup_store(self, store: LookupStore) -> None:
         if self._store_is_external:
             return
         self.m_store = store

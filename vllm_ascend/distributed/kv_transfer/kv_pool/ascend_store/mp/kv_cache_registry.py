@@ -1,25 +1,24 @@
-"""KV cache service registration and Scheduler-Worker binding."""
+"""KV cache service instance lifecycle management."""
 
 import hashlib
-import threading
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from .registration import (
-    SchedulerFactory,
     SchedulerIdentity,
     SchedulerRegistration,
     WorkerFactory,
     WorkerIdentity,
-    WorkerLookupHandler,
     WorkerRegistration,
 )
-from .rpc import MPServerBusyError
-from .service import ServiceBusyError, ServiceRegistry
+from .service import ServiceRegistry
 
 if TYPE_CHECKING:
     from ..pool_scheduler import KVPoolScheduler
     from ..pool_worker import KVPoolWorker
+
+SchedulerServiceFactory = Callable[[SchedulerRegistration], "KVPoolScheduler"]
 
 
 def _monotonic() -> float:
@@ -27,18 +26,15 @@ def _monotonic() -> float:
 
 
 class KVCacheServiceRegistry:
-    """Orchestrate Scheduler and Worker services for the KV cache domain."""
+    """Manage Scheduler and Worker service instance lifecycles."""
 
     def __init__(
         self,
-        scheduler_factory: SchedulerFactory,
+        scheduler_factory: SchedulerServiceFactory,
         worker_factory: WorkerFactory,
-        worker_lookup_handler: WorkerLookupHandler,
     ):
         self._scheduler_factory = scheduler_factory
         self._worker_factory = worker_factory
-        self._worker_lookup_handler = worker_lookup_handler
-        self._binding_lock = threading.Lock()
         self._schedulers = ServiceRegistry[SchedulerIdentity, "KVPoolScheduler"](
             "Scheduler", self._close_service, _monotonic
         )
@@ -54,37 +50,21 @@ class KVCacheServiceRegistry:
 
     def register_scheduler(self, registration: SchedulerRegistration, payload: bytes) -> "KVPoolScheduler":
         self._validate_scheduler_registration(registration)
-        try:
-            scheduler = self._schedulers.register(
-                registration.identity,
-                registration.session_id,
-                hashlib.sha256(payload).digest(),
-                lambda: self._scheduler_factory(registration, self._worker_lookup_handler),
-            )
-        except ServiceBusyError as exc:
-            raise MPServerBusyError(str(exc)) from exc
-
-        self._bind_engine_store(registration.identity)
-        return scheduler
+        return self._schedulers.register(
+            registration.identity,
+            registration.session_id,
+            hashlib.sha256(payload).digest(),
+            lambda: self._scheduler_factory(registration),
+        )
 
     def register_worker(self, registration: WorkerRegistration, payload: bytes) -> "KVPoolWorker":
         self._validate_worker_registration(registration)
-        try:
-            worker = self._workers.register(
-                registration.identity,
-                registration.session_id,
-                hashlib.sha256(payload).digest(),
-                lambda: self._worker_factory(registration),
-            )
-        except ServiceBusyError as exc:
-            raise MPServerBusyError(str(exc)) from exc
-
-        scheduler_identity = SchedulerIdentity(
-            registration.identity.engine_id,
-            registration.identity.data_parallel_rank,
+        return self._workers.register(
+            registration.identity,
+            registration.session_id,
+            hashlib.sha256(payload).digest(),
+            lambda: self._worker_factory(registration),
         )
-        self._bind_engine_store(scheduler_identity)
-        return worker
 
     def unregister_scheduler(self, identity: SchedulerIdentity, session_id: str) -> bool:
         return self._schedulers.unregister(identity, session_id)
@@ -104,32 +84,15 @@ class KVCacheServiceRegistry:
     def get_worker(self, identity: WorkerIdentity, session_id: str | None = None) -> "KVPoolWorker | None":
         return self._workers.get(identity, session_id)
 
+    def worker_items(self) -> tuple[tuple[WorkerIdentity, "KVPoolWorker"], ...]:
+        return self._workers.items()
+
     def reap_stale(self, stale_before: float) -> tuple[int, int]:
         return self._schedulers.reap_stale(stale_before), self._workers.reap_stale(stale_before)
 
     def close(self) -> None:
         self._workers.close()
         self._schedulers.close()
-
-    def _bind_engine_store(self, scheduler_identity: SchedulerIdentity) -> None:
-        with self._binding_lock:
-            scheduler = self._schedulers.get(scheduler_identity)
-            if scheduler is None:
-                return
-
-            store = getattr(scheduler, "store_scheduler", None)
-            if store is None:
-                return
-
-            for identity, worker in self._workers.items():
-                if (
-                    identity.engine_id != scheduler_identity.engine_id
-                    or identity.data_parallel_rank != scheduler_identity.data_parallel_rank
-                ):
-                    continue
-                bind_store = getattr(worker, "bind_store", None)
-                if callable(bind_store):
-                    bind_store(store)
 
     @staticmethod
     def _close_service(service) -> None:
