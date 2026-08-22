@@ -6,16 +6,18 @@ from unittest.mock import patch
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import encode_registration
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_registry import KVCacheServiceRegistry
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
-    KVCacheServiceRegistry,
-    RegistrationConflictError,
     SchedulerRegistration,
-    StaleSessionError,
     WorkerRegistration,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import MPServerBusyError
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.service import (
+    RegistrationConflictError,
+    StaleSessionError,
+)
 
-REGISTRATION_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration"
+REGISTRY_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_registry"
 
 
 class _FakeScheduler:
@@ -92,14 +94,14 @@ def test_reaped_scheduler_can_recover_with_the_same_session() -> None:
     registration = _scheduler_registration("session-0")
     payload = encode_registration(registration)
 
-    with patch(f"{REGISTRATION_MODULE}.time.monotonic", return_value=10.0):
+    with patch(f"{REGISTRY_MODULE}.time.monotonic", return_value=10.0):
         first_service = registry.register_scheduler(registration, payload)
 
     assert registry.reap_stale(11.0) == (1, 0)
     assert first_service.close_count == 1
     assert registry.scheduler_count == 0
 
-    with patch(f"{REGISTRATION_MODULE}.time.monotonic", return_value=20.0):
+    with patch(f"{REGISTRY_MODULE}.time.monotonic", return_value=20.0):
         second_service = registry.register_scheduler(registration, payload)
 
     assert second_service is created[1]
@@ -112,7 +114,7 @@ def test_reaped_session_keeps_its_configuration_fingerprint() -> None:
     registration = _scheduler_registration("session-0", marker="first")
     payload = encode_registration(registration)
 
-    with patch(f"{REGISTRATION_MODULE}.time.monotonic", return_value=10.0):
+    with patch(f"{REGISTRY_MODULE}.time.monotonic", return_value=10.0):
         registry.register_scheduler(registration, payload)
     registry.reap_stale(11.0)
 
@@ -126,11 +128,11 @@ def test_new_session_after_reap_retires_the_old_session() -> None:
     old_registration = _scheduler_registration("old-session")
     new_registration = _scheduler_registration("new-session")
 
-    with patch(f"{REGISTRATION_MODULE}.time.monotonic", return_value=10.0):
+    with patch(f"{REGISTRY_MODULE}.time.monotonic", return_value=10.0):
         registry.register_scheduler(old_registration, encode_registration(old_registration))
     registry.reap_stale(11.0)
 
-    with patch(f"{REGISTRATION_MODULE}.time.monotonic", return_value=20.0):
+    with patch(f"{REGISTRY_MODULE}.time.monotonic", return_value=20.0):
         registry.register_scheduler(new_registration, encode_registration(new_registration))
 
     with pytest.raises(StaleSessionError, match="retired"):
@@ -148,7 +150,7 @@ def test_registration_is_busy_while_stale_service_is_closing() -> None:
     registration = _scheduler_registration("session-0")
     payload = encode_registration(registration)
 
-    with patch(f"{REGISTRATION_MODULE}.time.monotonic", return_value=10.0):
+    with patch(f"{REGISTRY_MODULE}.time.monotonic", return_value=10.0):
         registry.register_scheduler(registration, payload)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -162,7 +164,7 @@ def test_registration_is_busy_while_stale_service_is_closing() -> None:
 
         assert reap_future.result(timeout=5) == (1, 0)
 
-    with patch(f"{REGISTRATION_MODULE}.time.monotonic", return_value=20.0):
+    with patch(f"{REGISTRY_MODULE}.time.monotonic", return_value=20.0):
         assert registry.register_scheduler(registration, payload) is not None
 
 
@@ -176,11 +178,11 @@ def test_scheduler_access_refreshes_liveness_but_internal_worker_access_does_not
     scheduler_registration = _scheduler_registration("scheduler-session")
     worker_registration = _worker_registration("worker-session")
 
-    with patch(f"{REGISTRATION_MODULE}.time.monotonic", return_value=10.0):
+    with patch(f"{REGISTRY_MODULE}.time.monotonic", return_value=10.0):
         registry.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
         registry.register_worker(worker_registration, encode_registration(worker_registration))
 
-    with patch(f"{REGISTRATION_MODULE}.time.monotonic", return_value=100.0):
+    with patch(f"{REGISTRY_MODULE}.time.monotonic", return_value=100.0):
         assert registry.get_scheduler(scheduler_registration.identity, scheduler_registration.session_id) is scheduler
         assert registry.get_worker(worker_registration.identity) is worker
 
@@ -194,7 +196,7 @@ def test_unregistering_recoverable_session_retires_it() -> None:
     registration = _scheduler_registration("session-0")
     payload = encode_registration(registration)
 
-    with patch(f"{REGISTRATION_MODULE}.time.monotonic", return_value=10.0):
+    with patch(f"{REGISTRY_MODULE}.time.monotonic", return_value=10.0):
         registry.register_scheduler(registration, payload)
     registry.reap_stale(11.0)
 

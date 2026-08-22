@@ -9,13 +9,13 @@ import zmq.asyncio  # noqa: F401
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheServer
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache import WorkerLookupHandler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.lookup_worker import (
     LookupKVPoolWorker,
     MPKVPoolScheduler,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
     SchedulerRegistration,
+    WorkerLookupHandler,
     WorkerRegistration,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import KVPoolScheduler

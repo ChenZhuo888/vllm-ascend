@@ -5,13 +5,15 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import encode_registration
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_registry import KVCacheServiceRegistry
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
-    KVCacheServiceRegistry,
-    RegistrationConflictError,
     SchedulerIdentity,
     SchedulerRegistration,
-    StaleSessionError,
     WorkerRegistration,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.service import (
+    RegistrationConflictError,
+    StaleSessionError,
 )
 
 

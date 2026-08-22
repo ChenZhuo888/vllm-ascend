@@ -27,8 +27,8 @@ from .kv_cache_protocol import (
     encode_worker_session,
     lookup_affinity_key,
 )
+from .kv_cache_registry import KVCacheServiceRegistry
 from .registration import (
-    KVCacheServiceRegistry,
     SchedulerFactory,
     SchedulerIdentity,
     SchedulerRegistration,
