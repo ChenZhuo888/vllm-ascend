@@ -35,7 +35,12 @@ class _FakeStore:
         return self._exists_result[: len(keys)]
 
 
-def _make_vllm_config(tp_size: int = 1, rank: int = 0) -> MagicMock:
+def _make_vllm_config(
+    tp_size: int = 1,
+    rank: int = 0,
+    engine_id: str = "engine-0",
+    data_parallel_rank: int = 0,
+) -> MagicMock:
     config = MagicMock()
 
     hf_config = MagicMock(spec=[])
@@ -49,7 +54,7 @@ def _make_vllm_config(tp_size: int = 1, rank: int = 0) -> MagicMock:
 
     config.parallel_config.rank = rank
     config.parallel_config.world_size = tp_size
-    config.parallel_config.data_parallel_rank = 0
+    config.parallel_config.data_parallel_rank = data_parallel_rank
     config.parallel_config.data_parallel_size = 1
     config.parallel_config.tensor_parallel_size = tp_size
     config.parallel_config.pipeline_parallel_size = 1
@@ -57,7 +62,7 @@ def _make_vllm_config(tp_size: int = 1, rank: int = 0) -> MagicMock:
     config.parallel_config.decode_context_parallel_size = 1
 
     config.kv_transfer_config.kv_role = "kv_producer"
-    config.kv_transfer_config.engine_id = "engine-0"
+    config.kv_transfer_config.engine_id = engine_id
     config.kv_transfer_config.kv_connector_extra_config = {"backend": "mooncake"}
     config.kv_transfer_config.get_from_extra_config.return_value = True
 
@@ -77,21 +82,26 @@ def _create_scheduler(
         return MPKVPoolScheduler(registration, lookup_handler)
 
 
-def _create_worker(registration: WorkerRegistration, exists_result: list[int]) -> LookupKVPoolWorker:
+def _create_worker(
+    registration: WorkerRegistration,
+    worker_results: dict[tuple[str, int, int], list[int]],
+) -> LookupKVPoolWorker:
+    identity = registration.identity
+    worker_key = (identity.engine_id, identity.data_parallel_rank, identity.rank)
     return LookupKVPoolWorker(
         registration.vllm_config,
-        store=_FakeStore(exists_result),
+        store=_FakeStore(worker_results[worker_key]),
         kv_cache_config=registration.kv_cache_config,
-        rank=registration.identity.rank,
+        rank=identity.rank,
     )
 
 
-def _run_lookup_server(bind_url: str, conn, exists_result: list[int]) -> None:
+def _run_lookup_server(bind_url: str, conn, worker_results: dict[tuple[str, int, int], list[int]]) -> None:
     server = KVCacheServer(
         bind_url,
         max_workers=4,
         scheduler_factory=_create_scheduler,
-        worker_factory=partial(_create_worker, exists_result=exists_result),
+        worker_factory=partial(_create_worker, worker_results=worker_results),
     )
     try:
         conn.send(server.endpoint)
@@ -101,10 +111,10 @@ def _run_lookup_server(bind_url: str, conn, exists_result: list[int]) -> None:
         server.close()
 
 
-def _start_lookup_server(exists_result: list[int]) -> tuple[mp.Process, str]:
+def _start_lookup_server(worker_results: dict[tuple[str, int, int], list[int]]) -> tuple[mp.Process, str]:
     context = mp.get_context("fork")
     parent_conn, child_conn = context.Pipe()
-    process = context.Process(target=_run_lookup_server, args=(_DEFAULT_URL, child_conn, exists_result))
+    process = context.Process(target=_run_lookup_server, args=(_DEFAULT_URL, child_conn, worker_results))
     process.start()
     child_conn.close()
 
@@ -136,36 +146,108 @@ def _wait_until_connected(client: KVCacheClient, timeout: float = 5) -> None:
         time.sleep(0.01)
 
 
+def _create_client(endpoint: str) -> KVCacheClient:
+    client = KVCacheClient(endpoint)
+    _wait_until_connected(client)
+    return client
+
+
+def _make_request(request_id: str = "request-0") -> MagicMock:
+    request = MagicMock()
+    request.request_id = request_id
+    request.prompt_token_ids = list(range(32))
+    request.block_hashes = _BLOCK_HASHES
+    request.num_tokens = 32
+    return request
+
+
 def test_scheduler_lookup_round_trip_uses_original_logic() -> None:
-    process, endpoint = _start_lookup_server([1, 1, 1, 0])
+    worker_results = {
+        ("engine-0", 0, 0): [1, 1, 1, 0],
+        ("engine-0", 0, 1): [0, 0, 0, 0],
+    }
+    process, endpoint = _start_lookup_server(worker_results)
     clients: list[KVCacheClient] = []
 
     try:
         for rank in range(2):
-            worker_client = KVCacheClient(endpoint)
+            worker_client = _create_client(endpoint)
             clients.append(worker_client)
-            _wait_until_connected(worker_client)
             assert worker_client.register_worker(_make_vllm_config(tp_size=2, rank=rank), kv_cache_config=None)
 
-        scheduler_client = KVCacheClient(endpoint)
+        scheduler_client = _create_client(endpoint)
         clients.append(scheduler_client)
-        _wait_until_connected(scheduler_client)
         assert scheduler_client.register_scheduler(
             _make_vllm_config(tp_size=2),
             kv_cache_config=None,
             page_size_bytes=0,
         )
 
-        request = MagicMock()
-        request.request_id = "request-0"
-        request.prompt_token_ids = list(range(32))
-        request.block_hashes = _BLOCK_HASHES
-        request.num_tokens = 32
-
-        assert scheduler_client.lookup(request, num_computed_tokens=0) == (16, False)
+        assert scheduler_client.lookup(_make_request(), num_computed_tokens=0) == (16, False)
     finally:
         for client in clients:
             client.close()
+        _stop_lookup_server(process)
+
+
+def test_lookup_isolated_by_engine_and_data_parallel_rank() -> None:
+    worker_results = {
+        ("engine-0", 0, 0): [1, 0],
+        ("engine-0", 1, 0): [0, 0],
+        ("engine-1", 0, 0): [1, 1],
+    }
+    expected_results = {
+        ("engine-0", 0): (16, False),
+        ("engine-0", 1): (0, False),
+        ("engine-1", 0): (31, False),
+    }
+    process, endpoint = _start_lookup_server(worker_results)
+    clients: list[KVCacheClient] = []
+
+    try:
+        for engine_id, data_parallel_rank, rank in worker_results:
+            worker_client = _create_client(endpoint)
+            clients.append(worker_client)
+            config = _make_vllm_config(
+                rank=rank,
+                engine_id=engine_id,
+                data_parallel_rank=data_parallel_rank,
+            )
+            assert worker_client.register_worker(config, kv_cache_config=None)
+
+        for (engine_id, data_parallel_rank), expected in expected_results.items():
+            scheduler_client = _create_client(endpoint)
+            clients.append(scheduler_client)
+            config = _make_vllm_config(engine_id=engine_id, data_parallel_rank=data_parallel_rank)
+            assert scheduler_client.register_scheduler(config, kv_cache_config=None, page_size_bytes=0)
+            assert scheduler_client.lookup(_make_request(), num_computed_tokens=0) == expected
+    finally:
+        for client in clients:
+            client.close()
+        _stop_lookup_server(process)
+
+
+def test_lookup_returns_miss_after_coordinator_unregisters() -> None:
+    worker_results = {("engine-0", 0, 0): [1, 0]}
+    process, endpoint = _start_lookup_server(worker_results)
+    worker_client = _create_client(endpoint)
+    scheduler_client = _create_client(endpoint)
+
+    try:
+        assert worker_client.register_worker(_make_vllm_config(), kv_cache_config=None)
+        assert scheduler_client.register_scheduler(
+            _make_vllm_config(),
+            kv_cache_config=None,
+            page_size_bytes=0,
+        )
+        assert scheduler_client.lookup(_make_request(), num_computed_tokens=0) == (16, False)
+
+        worker_client.close()
+
+        assert scheduler_client.lookup(_make_request("request-1"), num_computed_tokens=0) == (0, False)
+    finally:
+        worker_client.close()
+        scheduler_client.close()
         _stop_lookup_server(process)
 
 

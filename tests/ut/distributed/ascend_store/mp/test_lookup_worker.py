@@ -57,6 +57,14 @@ def test_lookup_worker_uses_registered_rank() -> None:
     assert worker.pp_rank == 0
 
 
+def test_lookup_worker_initializes_parent_cpu_state() -> None:
+    worker = _make_worker([1, 1])
+
+    assert worker.kv_send_thread is None
+    assert worker.kv_recv_thread is None
+    assert worker.physical_layer_to_group_layers == {}
+
+
 @pytest.mark.parametrize(
     ("exists_result", "expected"),
     [
@@ -99,3 +107,26 @@ def test_lookup_worker_returns_miss_before_store_is_bound() -> None:
 
     result = worker.lookup_scheduler(32, ["01" * 32, "02" * 32], use_layerwise=False)
     assert result == 0
+
+
+def test_lookup_worker_uses_bound_scheduler_store() -> None:
+    worker = LookupKVPoolWorker(_make_vllm_config())
+    store = MagicMock()
+    store.exists.return_value = [1, 1]
+
+    worker.bind_lookup_store(store)
+
+    assert worker.lookup_scheduler(32, ["01" * 32, "02" * 32], use_layerwise=False) == 32
+
+
+def test_lookup_worker_keeps_explicit_store_when_scheduler_store_is_bound() -> None:
+    explicit_store = MagicMock()
+    explicit_store.exists.return_value = [1, 0]
+    worker = LookupKVPoolWorker(_make_vllm_config(), store=explicit_store)
+    scheduler_store = MagicMock()
+    scheduler_store.exists.return_value = [1, 1]
+
+    worker.bind_lookup_store(scheduler_store)
+
+    assert worker.lookup_scheduler(32, ["01" * 32, "02" * 32], use_layerwise=False) == 16
+    scheduler_store.exists.assert_not_called()

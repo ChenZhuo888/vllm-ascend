@@ -261,5 +261,11 @@ def test_manager_expires_idle_worker_while_lookup_renews_scheduler() -> None:
         assert worker_closed.wait(1), "Idle Worker lease did not expire"
         assert service_manager.scheduler_count == 1
         assert service_manager.worker_count == 0
+        assert service_manager.lookup(
+            scheduler_registration.identity,
+            scheduler_registration.session_id,
+            request,
+            0,
+        ) == (0, False)
     finally:
         service_manager.close()
