@@ -295,7 +295,7 @@ def test_server_request_stop_wakes_run_loop() -> None:
         server.close()
 
 
-def test_server_does_not_dispatch_requests_after_stop_is_requested() -> None:
+def test_server_rejects_requests_after_stop_is_requested() -> None:
     handler = MagicMock(return_value=(b"response",))
     server = MPServer("tcp://127.0.0.1:*", routes=(Route(UPPERCASE_METHOD, handler, InlineExecutor()),))
 
@@ -304,13 +304,19 @@ def test_server_does_not_dispatch_requests_after_stop_is_requested() -> None:
         server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, (b"request",))
 
         handler.assert_not_called()
-        assert server._output_queue.empty()
+        identity, *response_frames = server._output_queue.get_nowait()
+        _, method, status, responses = decode_response(response_frames)
+        assert identity == b"client"
+        assert method == UPPERCASE_METHOD
+        assert status is ResponseStatus.BUSY
+        assert responses == (b"MPServerBusyError: MP server is stopping",)
     finally:
         server.close()
 
 
-def test_server_close_disconnects_client_before_waiting_for_running_handler() -> None:
+def test_server_close_drains_running_handler_and_returns_response() -> None:
     handler_started = threading.Event()
+    queued_request_submitted = threading.Event()
     release_handler = threading.Event()
 
     def blocking_handler(payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
@@ -319,7 +325,19 @@ def test_server_close_disconnects_client_before_waiting_for_running_handler() ->
             raise TimeoutError("Timed out waiting to release the handler")
         return payloads
 
-    executor = BoundedThreadPoolExecutor(1, 0, "test-server-close")
+    executor = BoundedThreadPoolExecutor(1, 1, "test-server-close")
+    original_submit = executor.submit
+    submitted_requests = 0
+
+    def tracking_submit(*args, **kwargs):
+        nonlocal submitted_requests
+        future = original_submit(*args, **kwargs)
+        submitted_requests += 1
+        if submitted_requests == 2:
+            queued_request_submitted.set()
+        return future
+
+    executor.submit = tracking_submit
     server = MPServer("tcp://127.0.0.1:*", routes=(Route(BLOCKING_METHOD, blocking_handler, executor),))
     server_thread = threading.Thread(target=server.run)
     close_thread = threading.Thread(target=server.close)
@@ -328,14 +346,20 @@ def test_server_close_disconnects_client_before_waiting_for_running_handler() ->
     try:
         server_thread.start()
         client.wait_until_connected()
-        future = client.submit_request(BLOCKING_METHOD, [b"request"])
+        running_future = client.submit_request(BLOCKING_METHOD, [b"running"])
         assert handler_started.wait(5), "Handler did not start in time"
+        queued_future = client.submit_request(BLOCKING_METHOD, [b"queued"])
+        assert queued_request_submitted.wait(5), "Queued request was not submitted in time"
 
         close_thread.start()
-        with pytest.raises(MPServerUnavailableError, match="disconnected"):
-            future.result(timeout=5)
-
         assert close_thread.is_alive()
+        assert not running_future.done()
+        assert not queued_future.done()
+        assert not server.wait_until_stopped(timeout=0.1)
+
+        release_handler.set()
+        assert running_future.result(timeout=5) == [b"running"]
+        assert queued_future.result(timeout=5) == [b"queued"]
     finally:
         release_handler.set()
         if close_thread.ident is None:
@@ -347,6 +371,60 @@ def test_server_close_disconnects_client_before_waiting_for_running_handler() ->
 
     assert not close_thread.is_alive()
     assert not server_thread.is_alive()
+
+
+def test_server_abort_cancels_queued_requests_without_waiting_for_running_handler() -> None:
+    handler_started = threading.Event()
+    queued_request_submitted = threading.Event()
+    release_handler = threading.Event()
+
+    def blocking_handler(payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        handler_started.set()
+        if not release_handler.wait(5):
+            raise TimeoutError("Timed out waiting to release the handler")
+        return payloads
+
+    executor = BoundedThreadPoolExecutor(1, 1, "test-server-abort")
+    original_submit = executor.submit
+    submitted_requests = 0
+
+    def tracking_submit(*args, **kwargs):
+        nonlocal submitted_requests
+        future = original_submit(*args, **kwargs)
+        submitted_requests += 1
+        if submitted_requests == 2:
+            queued_request_submitted.set()
+        return future
+
+    executor.submit = tracking_submit
+    server = MPServer("tcp://127.0.0.1:*", routes=(Route(BLOCKING_METHOD, blocking_handler, executor),))
+    server_thread = threading.Thread(target=server.run)
+    client = MPClient(server.endpoint)
+
+    try:
+        server_thread.start()
+        client.wait_until_connected()
+        running_future = client.submit_request(BLOCKING_METHOD, [b"running"])
+        assert handler_started.wait(5), "Handler did not start in time"
+        queued_future = client.submit_request(BLOCKING_METHOD, [b"queued"])
+        assert queued_request_submitted.wait(5), "Queued request was not submitted in time"
+
+        server.request_stop()
+        assert not server.wait_until_stopped(timeout=0.1)
+        server.abort()
+        server_thread.join(timeout=5)
+
+        assert not server_thread.is_alive()
+        assert not release_handler.is_set()
+        with pytest.raises(MPServerUnavailableError, match="disconnected"):
+            running_future.result(timeout=5)
+        with pytest.raises(MPServerUnavailableError, match="disconnected"):
+            queued_future.result(timeout=5)
+    finally:
+        release_handler.set()
+        server_thread.join(timeout=5)
+        client.close()
+        server.abort()
 
 
 def test_client_backpressure_does_not_leave_an_unsent_request_pending() -> None:

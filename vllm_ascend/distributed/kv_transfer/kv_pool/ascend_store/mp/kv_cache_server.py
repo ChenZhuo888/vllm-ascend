@@ -141,15 +141,30 @@ class KVCacheServer:
         return encode_lookup_response(matched_tokens, is_async)
 
     def run(self) -> None:
-        self._service.start_lease_maintenance()
         try:
+            self._service.start_lease_maintenance()
             self._rpc_server.run()
-        finally:
+        except BaseException:
+            self.abort()
+            raise
+        else:
             self.close()
 
     def request_stop(self) -> None:
         """Ask a running server to exit without waiting for shutdown to finish."""
         self._rpc_server.request_stop()
+
+    def wait_until_stopped(self, timeout: float | None = None) -> bool:
+        """Wait until accepted RPC requests have drained."""
+        return self._rpc_server.wait_until_stopped(timeout)
+
+    def abort(self) -> None:
+        """Cancel queued RPC work without waiting for running business code."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._rpc_server.abort()
 
     def close(self) -> None:
         with self._close_lock:
@@ -157,9 +172,9 @@ class KVCacheServer:
                 return
             self._closed = True
             self.request_stop()
+            self._service.stop_lease_maintenance()
             self._rpc_server.wait_until_stopped()
             try:
-                self._service.stop_lease_maintenance()
                 # MPServer still owns live route executors while services close on their owner lanes.
                 self._service.close()
             finally:

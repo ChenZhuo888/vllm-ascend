@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -257,6 +257,38 @@ def test_server_request_stop_completes_run_loop() -> None:
         assert not server_thread.is_alive()
     finally:
         server.close()
+
+
+def test_server_close_drains_rpc_before_closing_services() -> None:
+    calls = []
+    server = KVCacheServer.__new__(KVCacheServer)
+    server._close_lock = threading.Lock()
+    server._closed = False
+    server._rpc_server = MagicMock()
+    server._service = MagicMock()
+    server._rpc_server.request_stop.side_effect = lambda: calls.append("request_stop")
+    server._service.stop_lease_maintenance.side_effect = lambda: calls.append("stop_maintenance")
+    server._rpc_server.wait_until_stopped.side_effect = lambda: calls.append("drain_rpc")
+    server._service.close.side_effect = lambda: calls.append("close_service")
+    server._rpc_server.close.side_effect = lambda: calls.append("close_rpc")
+
+    server.close()
+
+    assert calls == ["request_stop", "stop_maintenance", "drain_rpc", "close_service", "close_rpc"]
+
+
+def test_server_abort_skips_graceful_service_close() -> None:
+    server = KVCacheServer.__new__(KVCacheServer)
+    server._close_lock = threading.Lock()
+    server._closed = False
+    server._rpc_server = MagicMock()
+    server._service = MagicMock()
+
+    server.abort()
+
+    server._rpc_server.abort.assert_called_once_with()
+    server._service.stop_lease_maintenance.assert_not_called()
+    server._service.close.assert_not_called()
 
 
 def test_client_creation_does_not_wait_for_server() -> None:

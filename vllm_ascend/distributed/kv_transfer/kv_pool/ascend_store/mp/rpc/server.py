@@ -83,9 +83,11 @@ class MPServer:
         self._state_lock = threading.Lock()
         self._transport_lock = threading.Lock()
         self._stop_requested = threading.Event()
+        self._abort_requested = threading.Event()
         self._run_stopped = threading.Event()
         self._run_stopped.set()
         self._run_thread: threading.Thread | None = None
+        self._inflight_requests = 0
         self._run_started = False
         self._transport_closed = False
         self._closed = False
@@ -134,10 +136,10 @@ class MPServer:
             executors.setdefault(id(route.executor), route.executor)
         return tuple(executors.values())
 
-    def _shutdown_executors(self) -> None:
+    def _shutdown_executors(self, wait: bool = True, cancel_futures: bool = True) -> None:
         for executor in self._executors:
             try:
-                executor.shutdown(wait=True, cancel_futures=True)
+                executor.shutdown(wait=wait, cancel_futures=cancel_futures)
             except Exception:
                 logger.exception("Failed to shut down MP server executor")
 
@@ -209,22 +211,48 @@ class MPServer:
         self._output_queue.put(response)
         self._notify_response_ready()
 
+    def _complete_request(self, response: ServerResponse | None) -> None:
+        if response is not None and not self._abort_requested.is_set():
+            self._output_queue.put(response)
+
+        with self._state_lock:
+            self._inflight_requests -= 1
+        self._notify_response_ready()
+
     def _on_request_done(self, future: Future[ServerResponse]) -> None:
         if future.cancelled():
+            self._complete_request(None)
             return
 
         try:
             response = future.result()
         except Exception:
             logger.exception("Failed to process MP server request")
-            return
+            response = None
+        self._complete_request(response)
 
-        self._publish_response(response)
+    def _is_stopping(self) -> bool:
+        with self._state_lock:
+            return self._closed or self._stop_requested.is_set()
 
-    def _dispatch_request(self, identity: bytes, request_id: bytes, method: str, payloads: tuple[bytes, ...]) -> None:
+    def _try_accept_request(self) -> bool:
         with self._state_lock:
             if self._closed or self._stop_requested.is_set():
-                return
+                return False
+            self._inflight_requests += 1
+            return True
+
+    def _reject_stopping_request(self, identity: bytes, request_id: bytes, method: str) -> None:
+        if self._abort_requested.is_set():
+            return
+        self._publish_response(
+            self._encode_error_response(identity, request_id, method, MPServerBusyError("MP server is stopping"))
+        )
+
+    def _dispatch_request(self, identity: bytes, request_id: bytes, method: str, payloads: tuple[bytes, ...]) -> None:
+        if self._is_stopping():
+            self._reject_stopping_request(identity, request_id, method)
+            return
 
         route = self._routes.get(method)
         if route is None:
@@ -236,9 +264,18 @@ class MPServer:
         try:
             callback = partial(self._execute_handler, identity, request_id, method, payloads, route.handler)
             key = None if route.key_factory is None else route.key_factory(identity, payloads)
-            future = route.executor.submit(callback, key)
         except Exception as exc:
             self._publish_response(self._encode_error_response(identity, request_id, method, exc))
+            return
+
+        if not self._try_accept_request():
+            self._reject_stopping_request(identity, request_id, method)
+            return
+
+        try:
+            future = route.executor.submit(callback, key)
+        except Exception as exc:
+            self._complete_request(self._encode_error_response(identity, request_id, method, exc))
             return
 
         future.add_done_callback(self._on_request_done)
@@ -274,6 +311,16 @@ class MPServer:
         except queue.Empty:
             pass
 
+    def _should_stop_run(self) -> bool:
+        if self._abort_requested.is_set():
+            return True
+        if not self._stop_requested.is_set():
+            return False
+
+        with self._state_lock:
+            requests_completed = self._inflight_requests == 0
+        return requests_completed and self._output_queue.empty()
+
     def run(self) -> None:
         with self._state_lock:
             if self._closed:
@@ -289,51 +336,68 @@ class MPServer:
             poller.register(self._socket, zmq.POLLIN)
             poller.register(self._notify_reader.fileno(), zmq.POLLIN)
 
-            while not self._stop_requested.is_set():
+            while not self._should_stop_run():
                 events = dict(poller.poll())
-                if self._stop_requested.is_set():
+                if self._abort_requested.is_set():
                     break
-
-                if self._socket in events:
-                    self._receive_request()
 
                 if self._notify_reader.fileno() in events:
                     self._send_responses()
+
+                if self._socket in events:
+                    self._receive_request()
         finally:
-            # Disconnect clients before business services and executors are drained.
-            # Running handlers cannot be interrupted safely, but clients must not
-            # remain blocked while the server waits for them to finish.
             self._close_transport()
             with self._state_lock:
                 self._run_thread = None
                 self._run_stopped.set()
 
     def request_stop(self) -> None:
-        """Ask the run loop to stop accepting requests without waiting for it."""
+        """Stop accepting requests and let the run loop drain accepted work."""
         with self._state_lock:
             if self._closed or self._stop_requested.is_set():
                 return
             self._stop_requested.set()
         self._notify_response_ready()
 
-    def wait_until_stopped(self) -> None:
-        """Wait until the run loop has stopped and disconnected its clients."""
+    def wait_until_stopped(self, timeout: float | None = None) -> bool:
+        """Wait until the run loop has drained and stopped."""
         with self._state_lock:
             run_thread = self._run_thread
-        if run_thread is not None and run_thread is not threading.current_thread():
-            self._run_stopped.wait()
+        if run_thread is None or run_thread is threading.current_thread():
+            return self._run_stopped.is_set()
+        return self._run_stopped.wait(timeout)
+
+    def abort(self) -> None:
+        """Cancel queued work and stop without waiting for running handlers."""
+        with self._state_lock:
+            if self._closed or self._abort_requested.is_set():
+                return
+            self._abort_requested.set()
+            self._stop_requested.set()
+
+        self._shutdown_executors(wait=False, cancel_futures=True)
+        self._notify_response_ready()
+        self.wait_until_stopped()
+        self._release_resources()
 
     def close(self) -> None:
+        self.request_stop()
+        self.wait_until_stopped()
+        self._release_resources()
+
+    def _release_resources(self) -> None:
         with self._close_lock:
-            self.request_stop()
             with self._state_lock:
                 if self._closed:
                     return
                 self._closed = True
 
-            self.wait_until_stopped()
             self._close_transport()
-            self._shutdown_executors()
+            if self._abort_requested.is_set():
+                self._shutdown_executors(wait=False, cancel_futures=True)
+            else:
+                self._shutdown_executors(wait=True, cancel_futures=False)
             self._notify_reader.close()
             self._notify_writer.close()
             self._context.term()
