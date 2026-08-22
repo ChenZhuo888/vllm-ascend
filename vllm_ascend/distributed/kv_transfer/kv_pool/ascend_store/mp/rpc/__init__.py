@@ -5,6 +5,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.error impor
     MPProtocolError,
     MPRemoteError,
     MPRequestTimeoutError,
+    MPServerAbortedError,
     MPServerBusyError,
     MPServerUnavailableError,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "MPRemoteError",
     "MPRequestTimeoutError",
     "MPServer",
+    "MPServerAbortedError",
     "MPServerBusyError",
     "MPServerUnavailableError",
     "RequestHandler",

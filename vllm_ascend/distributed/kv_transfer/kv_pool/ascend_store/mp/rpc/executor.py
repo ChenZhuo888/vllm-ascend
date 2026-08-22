@@ -116,23 +116,24 @@ class AffinityExecutor:
     def submit(self, fn: Callable[[], _ResultT], key: Hashable | None = None, block: bool = False) -> Future[_ResultT]:
         if key is None:
             raise ValueError("Affinity task must define an affinity key")
-
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("Affinity executor is closed")
-            if not self._capacity.acquire(blocking=block):
-                raise MPServerBusyError("Affinity executor is at capacity")
+        if not self._capacity.acquire(blocking=block):
+            raise MPServerBusyError("Affinity executor is at capacity")
 
-            try:
+        try:
+            with self._state_lock:
+                if self._closed:
+                    raise RuntimeError("Affinity executor is closed")
                 worker_index = hash(key) % len(self._queues)
-            except BaseException:
-                self._capacity.release()
-                raise
-
-            future: Future[_ResultT] = Future()
-            future.add_done_callback(self._release_capacity)
-            self._queues[worker_index].put_nowait(_AffinityTask(future, fn))
-            return future
+                future: Future[_ResultT] = Future()
+                future.add_done_callback(self._release_capacity)
+                self._queues[worker_index].put_nowait(_AffinityTask(future, fn))
+                return future
+        except BaseException:
+            self._capacity.release()
+            raise
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
         with self._state_lock:

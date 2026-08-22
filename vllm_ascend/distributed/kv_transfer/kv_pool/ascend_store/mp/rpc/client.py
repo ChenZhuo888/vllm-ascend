@@ -29,6 +29,7 @@ from .error import (
     MPProtocolError,
     MPRemoteError,
     MPRequestTimeoutError,
+    MPServerAbortedError,
     MPServerBusyError,
     MPServerUnavailableError,
 )
@@ -50,14 +51,14 @@ class _OutboundRequest:
     method: str
     frames: MultipartMessage
     future: Future[list[bytes]]
-    deadline: float | None
+    deadline_ns: int | None
 
 
 @dataclass(frozen=True)
 class _PendingRequest:
     method: str
     future: Future[list[bytes]]
-    deadline: float | None
+    deadline_ns: int | None
 
 
 class MPClient:
@@ -121,12 +122,12 @@ class MPClient:
         raise MPServerUnavailableError(f"Timed out connecting to MP server: {self._server_url}")
 
     @staticmethod
-    def _deadline_from_timeout(timeout_ms: int | None) -> float | None:
+    def _deadline_from_timeout(timeout_ms: int | None) -> int | None:
         if timeout_ms is None:
             return None
         if timeout_ms <= 0:
             raise ValueError(f"timeout_ms must be greater than 0, got {timeout_ms}")
-        return time.monotonic() + timeout_ms / 1000
+        return time.monotonic_ns() + timeout_ms * 1_000_000
 
     def _notify_io_thread(self) -> None:
         with contextlib.suppress(BlockingIOError):
@@ -147,11 +148,11 @@ class MPClient:
                 raise MPServerUnavailableError("MP server is unavailable")
 
             request_id = str(next(self._request_ids)).encode()
-            frames = encode_request(request_id, method_name, payloads or ())
             future: Future[list[bytes]] = Future()
-            deadline = self._deadline_from_timeout(timeout_ms)
+            deadline_ns = self._deadline_from_timeout(timeout_ms)
+            frames = encode_request(request_id, method_name, payloads or (), deadline_ns)
 
-            self._outbound_queue.put(_OutboundRequest(request_id, method_name, frames, future, deadline))
+            self._outbound_queue.put(_OutboundRequest(request_id, method_name, frames, future, deadline_ns))
             self._notify_io_thread()
 
         return future
@@ -181,7 +182,7 @@ class MPClient:
                 request = self._outbound_queue.get_nowait()
                 if not request.future.set_running_or_notify_cancel():
                     continue
-                if request.deadline is not None and request.deadline <= time.monotonic():
+                if request.deadline_ns is not None and request.deadline_ns <= time.monotonic_ns():
                     self._set_request_timeout(request.method, request.future)
                     continue
 
@@ -192,7 +193,7 @@ class MPClient:
                     continue
 
                 self._pending_requests[request.request_id] = _PendingRequest(
-                    request.method, request.future, request.deadline
+                    request.method, request.future, request.deadline_ns
                 )
         except queue.Empty:
             pass
@@ -225,7 +226,12 @@ class MPClient:
 
         if status is not ResponseStatus.OK:
             message = responses[0].decode(errors="replace") if responses else "Unknown server error"
-            error = MPServerBusyError(message) if status is ResponseStatus.BUSY else MPRemoteError(message)
+            if status is ResponseStatus.BUSY:
+                error = MPServerBusyError(message)
+            elif status is ResponseStatus.ABORTED:
+                error = MPServerAbortedError(message)
+            else:
+                error = MPRemoteError(message)
             pending.future.set_exception(error)
             return
 
@@ -259,19 +265,21 @@ class MPClient:
             self._handle_transport_connected()
 
     def _next_poll_timeout_ms(self) -> int | None:
-        deadlines = [request.deadline for request in self._pending_requests.values() if request.deadline is not None]
-        if not deadlines:
+        deadlines_ns = [
+            request.deadline_ns for request in self._pending_requests.values() if request.deadline_ns is not None
+        ]
+        if not deadlines_ns:
             return None
 
-        remaining_seconds = min(deadlines) - time.monotonic()
-        return max(0, math.ceil(remaining_seconds * 1000))
+        remaining_ns = min(deadlines_ns) - time.monotonic_ns()
+        return max(0, math.ceil(remaining_ns / 1_000_000))
 
     def _expire_pending_requests(self) -> None:
-        now = time.monotonic()
+        now_ns = time.monotonic_ns()
         expired_request_ids = [
             request_id
             for request_id, request in self._pending_requests.items()
-            if request.deadline is not None and request.deadline <= now
+            if request.deadline_ns is not None and request.deadline_ns <= now_ns
         ]
         for request_id in expired_request_ids:
             request = self._pending_requests.pop(request_id)

@@ -260,6 +260,29 @@ def test_maintenance_loop_survives_expiration_failure() -> None:
     assert attempts >= 2
 
 
+def test_stop_maintenance_can_signal_without_waiting() -> None:
+    expiration_started = threading.Event()
+    release_expiration = threading.Event()
+    manager = _create_manager()
+
+    def expire_leases() -> int:
+        expiration_started.set()
+        release_expiration.wait()
+        return 0
+
+    with patch.object(manager, "expire_leases", side_effect=expire_leases):
+        manager.start_maintenance()
+        assert expiration_started.wait(1), "Lifecycle maintenance did not start"
+        try:
+            manager.stop_maintenance(wait=False)
+            assert manager.is_running
+        finally:
+            release_expiration.set()
+            manager.stop_maintenance()
+
+    assert not manager.is_running
+
+
 @pytest.mark.parametrize(
     ("lease_timeout_s", "check_interval_s", "field_name"),
     [(0.0, 1.0, "lease_timeout_s"), (1.0, 0.0, "check_interval_s")],

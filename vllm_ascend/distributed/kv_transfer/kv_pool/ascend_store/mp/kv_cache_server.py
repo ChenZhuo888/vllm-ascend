@@ -51,6 +51,7 @@ class KVCacheServer:
         worker_executor = AffinityExecutor(max_workers, _MAX_PENDING_REQUESTS, "ascend-store-kv-worker")
         lease_executor = InlineExecutor()
         self._close_lock = threading.Lock()
+        self._abort_requested = threading.Event()
         self._closed = False
         self._service = KVCacheServiceManager(
             scheduler_factory,
@@ -150,32 +151,43 @@ class KVCacheServer:
         else:
             self.close()
 
-    def request_stop(self) -> None:
-        """Ask a running server to exit without waiting for shutdown to finish."""
-        self._rpc_server.request_stop()
+    def request_stop(self) -> bool:
+        """Ask a running server to drain if all accepted requests are bounded."""
+        return self._rpc_server.request_stop()
 
     def wait_until_stopped(self, timeout: float | None = None) -> bool:
-        """Wait until accepted RPC requests have drained."""
+        """Wait until the RPC run loop stops."""
         return self._rpc_server.wait_until_stopped(timeout)
 
     def abort(self) -> None:
         """Cancel queued RPC work without waiting for running business code."""
-        with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._rpc_server.abort()
+        if self._closed or self._abort_requested.is_set():
+            return
+        self._abort_requested.set()
+        self._rpc_server.abort()
+        self._service.stop_lease_maintenance(wait=False)
 
-    def close(self) -> None:
+    def close(self) -> bool:
+        """Gracefully close the server, or return ``False`` when abort is required."""
+        if self._closed:
+            return True
+        if self._abort_requested.is_set() or not self.request_stop():
+            return False
+
+        self._service.stop_lease_maintenance(wait=False)
+        if not self._rpc_server.wait_for_drain():
+            return False
+        self._service.stop_lease_maintenance()
+
         with self._close_lock:
             if self._closed:
-                return
-            self._closed = True
-            self.request_stop()
-            self._service.stop_lease_maintenance()
-            self._rpc_server.wait_until_stopped()
+                return True
+            if self._abort_requested.is_set():
+                return False
             try:
                 # MPServer still owns live route executors while services close on their owner lanes.
                 self._service.close()
             finally:
-                self._rpc_server.close()
+                rpc_closed = self._rpc_server.close()
+            self._closed = rpc_closed
+            return rpc_closed

@@ -1,10 +1,12 @@
 import multiprocessing as mp
 import queue
 import threading
+import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import zmq
@@ -15,11 +17,12 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     InlineExecutor,
     MPClient,
     MPClientClosedError,
+    MPProtocolError,
     MPRemoteError,
     MPRequestTimeoutError,
     MPServer,
+    MPServerAbortedError,
     MPServerBusyError,
-    MPServerUnavailableError,
     Route,
     SystemMethod,
 )
@@ -78,7 +81,7 @@ def _send_ok_response(
     responses: tuple[bytes, ...] | None = None,
 ) -> None:
     identity, *request_frames = request
-    request_id, method, payloads = decode_request(request_frames)
+    request_id, method, _, payloads = decode_request(request_frames)
     response_payloads = payloads if responses is None else responses
     response = [identity, *encode_response(request_id, method, ResponseStatus.OK, response_payloads)]
     router.send_multipart(response)
@@ -247,8 +250,9 @@ def _run_hanging_server(conn) -> None:
 
 
 def test_protocol_round_trip():
-    request_frames = encode_request(b"request-1", SystemMethod.ECHO, (b"payload",))
-    assert decode_request(request_frames) == (b"request-1", "ECHO", (b"payload",))
+    deadline_ns = time.monotonic_ns() + 1_000_000_000
+    request_frames = encode_request(b"request-1", SystemMethod.ECHO, (b"payload",), deadline_ns)
+    assert decode_request(request_frames) == (b"request-1", "ECHO", deadline_ns, (b"payload",))
 
     response_frames = encode_response(b"request-1", SystemMethod.ECHO, ResponseStatus.OK, (b"response",))
     assert decode_response(response_frames) == (
@@ -257,6 +261,11 @@ def test_protocol_round_trip():
         ResponseStatus.OK,
         (b"response",),
     )
+
+
+def test_protocol_rejects_invalid_request_deadline() -> None:
+    with pytest.raises(MPProtocolError, match="Invalid request deadline"):
+        decode_request((b"request-1", b"ECHO", b"invalid"))
 
 
 def test_client_server_round_trip():
@@ -295,6 +304,19 @@ def test_server_request_stop_wakes_run_loop() -> None:
         server.close()
 
 
+def test_server_constructor_closes_executor_after_route_validation_failure() -> None:
+    executor = MagicMock()
+    routes = (
+        Route(UPPERCASE_METHOD, _uppercase_handler, executor),
+        Route(UPPERCASE_METHOD, _uppercase_handler, executor),
+    )
+
+    with pytest.raises(ValueError, match="Duplicate RPC method"):
+        MPServer("tcp://127.0.0.1:*", routes)
+
+    executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+
+
 def test_server_rejects_requests_after_stop_is_requested() -> None:
     handler = MagicMock(return_value=(b"response",))
     server = MPServer("tcp://127.0.0.1:*", routes=(Route(UPPERCASE_METHOD, handler, InlineExecutor()),))
@@ -304,7 +326,7 @@ def test_server_rejects_requests_after_stop_is_requested() -> None:
         server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, (b"request",))
 
         handler.assert_not_called()
-        identity, *response_frames = server._output_queue.get_nowait()
+        identity, *response_frames = server._output_queue.get_nowait().frames
         _, method, status, responses = decode_response(response_frames)
         assert identity == b"client"
         assert method == UPPERCASE_METHOD
@@ -312,6 +334,52 @@ def test_server_rejects_requests_after_stop_is_requested() -> None:
         assert responses == (b"MPServerBusyError: MP server is stopping",)
     finally:
         server.close()
+
+
+def test_server_returns_handler_base_exception_without_leaking_request() -> None:
+    def fail(_payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        raise KeyboardInterrupt("handler interrupted")
+
+    server = MPServer("tcp://127.0.0.1:*", routes=(Route(UPPERCASE_METHOD, fail, InlineExecutor()),))
+
+    try:
+        server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, ())
+
+        response = server._output_queue.get_nowait()
+        identity, *response_frames = response.frames
+        _, method, status, responses = decode_response(response_frames)
+        assert identity == b"client"
+        assert method == UPPERCASE_METHOD
+        assert status is ResponseStatus.ERROR
+        assert responses == (b"KeyboardInterrupt: handler interrupted",)
+
+        server._response_backlog.append(response)
+        socket = server._socket
+        server._socket = MagicMock()
+        server._send_responses()
+        server._socket = socket
+        assert server._accepted_requests == {}
+    finally:
+        server.close()
+
+
+def test_server_returns_executor_failure() -> None:
+    failed_future = Future()
+    failed_future.set_exception(RuntimeError("executor failed"))
+    executor = MagicMock()
+    executor.submit.return_value = failed_future
+    server = MPServer("tcp://127.0.0.1:*", routes=(Route(UPPERCASE_METHOD, _uppercase_handler, executor),))
+
+    try:
+        server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, (b"request",))
+
+        _, *response_frames = server._output_queue.get_nowait().frames
+        _, method, status, responses = decode_response(response_frames)
+        assert method == UPPERCASE_METHOD
+        assert status is ResponseStatus.ERROR
+        assert responses == (b"RuntimeError: executor failed",)
+    finally:
+        server.abort()
 
 
 def test_server_close_drains_running_handler_and_returns_response() -> None:
@@ -346,9 +414,9 @@ def test_server_close_drains_running_handler_and_returns_response() -> None:
     try:
         server_thread.start()
         client.wait_until_connected()
-        running_future = client.submit_request(BLOCKING_METHOD, [b"running"])
+        running_future = client.submit_request(BLOCKING_METHOD, [b"running"], timeout_ms=5000)
         assert handler_started.wait(5), "Handler did not start in time"
-        queued_future = client.submit_request(BLOCKING_METHOD, [b"queued"])
+        queued_future = client.submit_request(BLOCKING_METHOD, [b"queued"], timeout_ms=5000)
         assert queued_request_submitted.wait(5), "Queued request was not submitted in time"
 
         close_thread.start()
@@ -409,16 +477,16 @@ def test_server_abort_cancels_queued_requests_without_waiting_for_running_handle
         queued_future = client.submit_request(BLOCKING_METHOD, [b"queued"])
         assert queued_request_submitted.wait(5), "Queued request was not submitted in time"
 
-        server.request_stop()
-        assert not server.wait_until_stopped(timeout=0.1)
+        assert not server.request_stop()
+        assert not server._stop_requested.is_set()
         server.abort()
         server_thread.join(timeout=5)
 
         assert not server_thread.is_alive()
         assert not release_handler.is_set()
-        with pytest.raises(MPServerUnavailableError, match="disconnected"):
+        with pytest.raises(MPServerAbortedError, match="force-aborted"):
             running_future.result(timeout=5)
-        with pytest.raises(MPServerUnavailableError, match="disconnected"):
+        with pytest.raises(MPServerAbortedError, match="force-aborted"):
             queued_future.result(timeout=5)
     finally:
         release_handler.set()
@@ -438,7 +506,7 @@ def test_client_backpressure_does_not_leave_an_unsent_request_pending() -> None:
             method="TEST",
             frames=(b"request-0", b"TEST"),
             future=future,
-            deadline=None,
+            deadline_ns=None,
         )
     )
     zmq_socket = MagicMock()
@@ -451,19 +519,78 @@ def test_client_backpressure_does_not_leave_an_unsent_request_pending() -> None:
     assert client._pending_requests == {}
 
 
-def test_server_backpressure_drops_response_without_blocking() -> None:
+def test_server_backpressure_retains_response_without_blocking() -> None:
     server = MPServer.__new__(MPServer)
-    server._notify_reader = MagicMock()
-    server._output_queue = queue.Queue()
-    server._output_queue.put((b"client", b"request-0", b"TEST"))
+    response = (b"client", b"request-0", b"TEST")
+    response_envelope = SimpleNamespace(frames=response, request_key=None)
+    server._response_backlog = deque((response_envelope,))
     server._socket = MagicMock()
     server._socket.send_multipart.side_effect = zmq.Again()
 
-    with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.server.logger.warning") as log_warning:
-        server._send_responses()
+    server._send_responses()
 
-    assert server._output_queue.empty()
-    log_warning.assert_called_once_with("Dropping MP response because the outbound transport is busy")
+    assert server._response_backlog == deque((response_envelope,))
+
+
+def test_server_close_rejects_request_without_deadline() -> None:
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+
+    def blocking_handler(payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        handler_started.set()
+        release_handler.wait()
+        return payloads
+
+    executor = BoundedThreadPoolExecutor(1, 0, "test-server-indefinite-close")
+    server = MPServer("tcp://127.0.0.1:*", routes=(Route(BLOCKING_METHOD, blocking_handler, executor),))
+    server_thread = threading.Thread(target=server.run)
+    client = MPClient(server.endpoint)
+
+    try:
+        server_thread.start()
+        client.wait_until_connected()
+        request_future = client.submit_request(BLOCKING_METHOD, [b"request"])
+        assert handler_started.wait(5), "Handler did not start in time"
+
+        assert not server.close()
+        assert not server._stop_requested.is_set()
+        assert not request_future.done()
+    finally:
+        server.abort()
+        release_handler.set()
+        server_thread.join(timeout=5)
+        client.close()
+
+
+def test_server_close_returns_false_after_request_deadline() -> None:
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+
+    def blocking_handler(payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        handler_started.set()
+        release_handler.wait()
+        return payloads
+
+    executor = BoundedThreadPoolExecutor(1, 0, "test-server-expired-close")
+    server = MPServer("tcp://127.0.0.1:*", routes=(Route(BLOCKING_METHOD, blocking_handler, executor),))
+    server_thread = threading.Thread(target=server.run)
+    client = MPClient(server.endpoint)
+
+    try:
+        server_thread.start()
+        client.wait_until_connected()
+        request_future = client.submit_request(BLOCKING_METHOD, [b"request"], timeout_ms=500)
+        assert handler_started.wait(5), "Handler did not start in time"
+
+        assert not server.close()
+        assert server._stop_requested.is_set()
+        with pytest.raises(MPRequestTimeoutError):
+            request_future.result(timeout=5)
+    finally:
+        server.abort()
+        release_handler.set()
+        server_thread.join(timeout=5)
+        client.close()
 
 
 def test_multiple_worker_processes_receive_their_own_responses():
@@ -758,6 +885,41 @@ def test_affinity_executor_can_wait_for_capacity() -> None:
             release.set()
             waiting_submission.result(timeout=5).result(timeout=5)
         first_future.result(timeout=5)
+    finally:
+        release.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_affinity_executor_shutdown_does_not_wait_for_blocked_submission() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    submit_started = threading.Event()
+    executor = AffinityExecutor(1, 0, "test-affinity-shutdown")
+
+    def wait_for_release() -> None:
+        started.set()
+        release.wait()
+
+    def submit_waiting_task() -> None:
+        submit_started.set()
+        executor.submit(lambda: None, "engine-0", block=True)
+
+    try:
+        first_future = executor.submit(wait_for_release, "engine-0")
+        assert started.wait(5)
+        with ThreadPoolExecutor(max_workers=1) as submitter:
+            waiting_submission = submitter.submit(submit_waiting_task)
+            assert submit_started.wait(5)
+
+            shutdown_thread = threading.Thread(target=executor.shutdown, kwargs={"wait": False})
+            shutdown_thread.start()
+            shutdown_thread.join(timeout=1)
+            assert not shutdown_thread.is_alive()
+
+            release.set()
+            first_future.result(timeout=5)
+            with pytest.raises(RuntimeError, match="Affinity executor is closed"):
+                waiting_submission.result(timeout=5)
     finally:
         release.set()
         executor.shutdown(wait=True, cancel_futures=True)

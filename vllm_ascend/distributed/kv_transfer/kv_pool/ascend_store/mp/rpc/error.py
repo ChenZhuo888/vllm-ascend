@@ -18,6 +18,10 @@ class MPServerUnavailableError(MPError, ConnectionError):
     pass
 
 
+class MPServerAbortedError(MPServerUnavailableError):
+    pass
+
+
 class MPRequestTimeoutError(MPError, TimeoutError):
     pass
 

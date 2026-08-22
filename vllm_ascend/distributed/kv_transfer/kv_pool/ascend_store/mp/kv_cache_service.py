@@ -150,9 +150,9 @@ class KVCacheServiceManager:
         self._schedulers.start_maintenance()
         self._workers.start_maintenance()
 
-    def stop_lease_maintenance(self) -> None:
-        self._workers.stop_maintenance()
-        self._schedulers.stop_maintenance()
+    def stop_lease_maintenance(self, wait: bool = True) -> None:
+        self._workers.stop_maintenance(wait=wait)
+        self._schedulers.stop_maintenance(wait=wait)
 
     def close(self) -> None:
         self._workers.close()

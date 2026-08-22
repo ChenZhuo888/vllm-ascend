@@ -263,23 +263,51 @@ def test_server_close_drains_rpc_before_closing_services() -> None:
     calls = []
     server = KVCacheServer.__new__(KVCacheServer)
     server._close_lock = threading.Lock()
+    server._abort_requested = threading.Event()
     server._closed = False
     server._rpc_server = MagicMock()
     server._service = MagicMock()
-    server._rpc_server.request_stop.side_effect = lambda: calls.append("request_stop")
-    server._service.stop_lease_maintenance.side_effect = lambda: calls.append("stop_maintenance")
-    server._rpc_server.wait_until_stopped.side_effect = lambda: calls.append("drain_rpc")
+    server._rpc_server.request_stop.side_effect = lambda: calls.append("request_stop") or True
+    server._service.stop_lease_maintenance.side_effect = lambda wait=True: calls.append(
+        "stop_maintenance_wait" if wait else "stop_maintenance_signal"
+    )
+    server._rpc_server.wait_for_drain.side_effect = lambda: calls.append("drain_rpc") or True
     server._service.close.side_effect = lambda: calls.append("close_service")
-    server._rpc_server.close.side_effect = lambda: calls.append("close_rpc")
+    server._rpc_server.close.side_effect = lambda: calls.append("close_rpc") or True
 
-    server.close()
+    assert server.close()
 
-    assert calls == ["request_stop", "stop_maintenance", "drain_rpc", "close_service", "close_rpc"]
+    assert calls == [
+        "request_stop",
+        "stop_maintenance_signal",
+        "drain_rpc",
+        "stop_maintenance_wait",
+        "close_service",
+        "close_rpc",
+    ]
+
+
+def test_server_close_does_not_touch_services_when_rpc_cannot_drain() -> None:
+    server = KVCacheServer.__new__(KVCacheServer)
+    server._close_lock = threading.Lock()
+    server._abort_requested = threading.Event()
+    server._closed = False
+    server._rpc_server = MagicMock()
+    server._service = MagicMock()
+    server._rpc_server.request_stop.return_value = False
+
+    assert not server.close()
+
+    server._service.stop_lease_maintenance.assert_not_called()
+    server._service.close.assert_not_called()
+    server._rpc_server.wait_for_drain.assert_not_called()
+    server._rpc_server.close.assert_not_called()
 
 
 def test_server_abort_skips_graceful_service_close() -> None:
     server = KVCacheServer.__new__(KVCacheServer)
     server._close_lock = threading.Lock()
+    server._abort_requested = threading.Event()
     server._closed = False
     server._rpc_server = MagicMock()
     server._service = MagicMock()
@@ -287,7 +315,7 @@ def test_server_abort_skips_graceful_service_close() -> None:
     server.abort()
 
     server._rpc_server.abort.assert_called_once_with()
-    server._service.stop_lease_maintenance.assert_not_called()
+    server._service.stop_lease_maintenance.assert_called_once_with(wait=False)
     server._service.close.assert_not_called()
 
 

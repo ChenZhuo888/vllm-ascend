@@ -236,13 +236,15 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
                 )
                 self._maintenance_thread.start()
 
-    def stop_maintenance(self) -> None:
+    def stop_maintenance(self, wait: bool = True) -> None:
         with self._maintenance_lock:
             thread = self._maintenance_thread
             if thread is None:
                 return
             self._maintenance_stop.set()
 
+        if not wait:
+            return
         if thread is not threading.current_thread():
             thread.join()
 

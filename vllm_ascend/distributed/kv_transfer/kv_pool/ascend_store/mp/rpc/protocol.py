@@ -17,6 +17,7 @@ class ResponseStatus(str, enum.Enum):
     OK = "OK"
     ERROR = "ERROR"
     BUSY = "BUSY"
+    ABORTED = "ABORTED"
 
 
 def normalize_method(method: str) -> str:
@@ -59,18 +60,23 @@ def decode_response_status(data: bytes) -> ResponseStatus:
         raise MPProtocolError(f"Invalid response status: {data!r}") from exc
 
 
-def encode_request(request_id: bytes, method: str, payloads: Iterable[bytes] = ()) -> MultipartMessage:
+def encode_request(
+    request_id: bytes,
+    method: str,
+    payloads: Iterable[bytes] = (),
+    deadline_ns: int | None = None,
+) -> MultipartMessage:
     _validate_frame(request_id, "request ID")
-    return request_id, encode_method(method), *_normalize_payloads(payloads)
+    return request_id, encode_method(method), _encode_deadline(deadline_ns), *_normalize_payloads(payloads)
 
 
-def decode_request(frames: Sequence[bytes]) -> tuple[bytes, str, tuple[bytes, ...]]:
-    if len(frames) < 2:
-        raise MPProtocolError(f"Expected [request_id, method, *payloads], got {len(frames)} frames")
+def decode_request(frames: Sequence[bytes]) -> tuple[bytes, str, int | None, tuple[bytes, ...]]:
+    if len(frames) < 3:
+        raise MPProtocolError(f"Expected [request_id, method, deadline, *payloads], got {len(frames)} frames")
 
-    request_id, method_frame, *payloads = frames
+    request_id, method_frame, deadline_frame, *payloads = frames
     _validate_frame(request_id, "request ID")
-    return request_id, decode_method(method_frame), _normalize_payloads(payloads)
+    return request_id, decode_method(method_frame), _decode_deadline(deadline_frame), _normalize_payloads(payloads)
 
 
 def encode_response(
@@ -108,6 +114,30 @@ def _normalize_payloads(payloads: Iterable[bytes]) -> tuple[bytes, ...]:
     for index, payload in enumerate(normalized):
         _validate_frame(payload, f"payload {index}")
     return normalized
+
+
+def _encode_deadline(deadline_ns: int | None) -> bytes:
+    if deadline_ns is None:
+        return b""
+    if not isinstance(deadline_ns, int):
+        raise TypeError(f"deadline_ns must be an integer, got {type(deadline_ns).__name__}")
+    if deadline_ns <= 0:
+        raise ValueError(f"deadline_ns must be greater than 0, got {deadline_ns}")
+    return str(deadline_ns).encode()
+
+
+def _decode_deadline(data: bytes) -> int | None:
+    _validate_frame(data, "deadline")
+    if not data:
+        return None
+
+    try:
+        deadline_ns = int(data)
+    except ValueError as exc:
+        raise MPProtocolError(f"Invalid request deadline: {data!r}") from exc
+    if deadline_ns <= 0:
+        raise MPProtocolError(f"Request deadline must be greater than 0, got {deadline_ns}")
+    return deadline_ns
 
 
 def _validate_frame(frame: bytes, name: str) -> None:
