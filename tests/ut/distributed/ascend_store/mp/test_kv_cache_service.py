@@ -44,10 +44,12 @@ class _FakeWorker:
         self.binding_threads = []
         self.lookup_hashes = None
         self.lookup_threads = []
+        self.close_threads = []
         self.close_count = 0
 
     def close(self) -> None:
         self.close_count += 1
+        self.close_threads.append(threading.get_ident())
         if self._closed is not None:
             self._closed.set()
 
@@ -204,9 +206,11 @@ def test_scheduler_binding_and_lookup_run_on_the_worker_lane() -> None:
         assert len(worker.lookup_threads) == 1
         assert worker.binding_threads == worker.lookup_threads
         assert worker.lookup_threads != [threading.get_ident()]
-    finally:
-        worker_executor.shutdown(wait=True, cancel_futures=True)
         service_manager.close()
+        assert worker.close_threads == worker.lookup_threads
+    finally:
+        service_manager.close()
+        worker_executor.shutdown(wait=True, cancel_futures=True)
 
 
 def test_lookup_does_not_fall_back_to_a_non_coordinator_worker() -> None:
@@ -256,7 +260,7 @@ def test_manager_expires_idle_worker_while_lookup_renews_scheduler() -> None:
     service_manager.lookup(scheduler_registration.identity, scheduler_registration.session_id, request, 0)
     now[0] = 11.0
 
-    service_manager.start()
+    service_manager.start_lease_maintenance()
     try:
         assert worker_closed.wait(1), "Idle Worker lease did not expire"
         assert service_manager.scheduler_count == 1

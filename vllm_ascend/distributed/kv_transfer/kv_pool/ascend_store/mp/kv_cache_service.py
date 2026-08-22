@@ -54,7 +54,7 @@ class KVCacheServiceManager:
             check_interval_s=lease_check_interval_s,
             clock=clock,
             thread_name="ascend-store-scheduler-lifecycle",
-            expiration_handler=partial(self._expire_service, scheduler_executor),
+            owner_close_handler=partial(self._close_service_on_owner, scheduler_executor),
         )
         self._workers = ServiceLifecycleManager[WorkerIdentity, "KVPoolWorker"](
             "Worker",
@@ -63,7 +63,7 @@ class KVCacheServiceManager:
             check_interval_s=lease_check_interval_s,
             clock=clock,
             thread_name="ascend-store-worker-lifecycle",
-            expiration_handler=partial(self._expire_service, worker_executor),
+            owner_close_handler=partial(self._close_service_on_owner, worker_executor),
         )
 
     @property
@@ -94,14 +94,6 @@ class KVCacheServiceManager:
 
     def _build_scheduler(self, registration: SchedulerRegistration) -> "KVPoolScheduler":
         return self._scheduler_factory(registration, self._lookup_worker)
-
-    def start(self) -> None:
-        self._schedulers.start()
-        self._workers.start()
-
-    def stop(self) -> None:
-        self._workers.stop()
-        self._schedulers.stop()
 
     def register_scheduler(self, registration: SchedulerRegistration, payload: bytes) -> "KVPoolScheduler":
         self._validate_scheduler_registration(registration)
@@ -149,10 +141,18 @@ class KVCacheServiceManager:
         request: Request,
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
-        scheduler = self._schedulers.get_active(identity, session_id)
+        scheduler = self._schedulers.get_for_session(identity, session_id)
         if scheduler is None:
             raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
         return scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+
+    def start_lease_maintenance(self) -> None:
+        self._schedulers.start_maintenance()
+        self._workers.start_maintenance()
+
+    def stop_lease_maintenance(self) -> None:
+        self._workers.stop_maintenance()
+        self._schedulers.stop_maintenance()
 
     def close(self) -> None:
         self._workers.close()
@@ -190,14 +190,14 @@ class KVCacheServiceManager:
         use_layerwise: bool,
         hbm_hit_tokens: int,
     ) -> int:
-        worker = self._workers.get(worker_identity)
+        worker = self._workers.find(worker_identity)
         if worker is None:
             return 0
 
         hash_strings = [block_hash.hex() for block_hash in block_hashes]
         return worker.lookup_scheduler(token_len, hash_strings, kv_cache_group_ids, use_layerwise, hbm_hit_tokens)
 
-    def _expire_service(
+    def _close_service_on_owner(
         self,
         executor: TaskExecutor | None,
         identity: SchedulerIdentity | WorkerIdentity,
@@ -222,8 +222,8 @@ class KVCacheServiceManager:
         scheduler_identity: SchedulerIdentity,
         worker_identity: WorkerIdentity,
     ) -> None:
-        scheduler = self._schedulers.get(scheduler_identity)
-        worker = self._workers.get(worker_identity)
+        scheduler = self._schedulers.find(scheduler_identity)
+        worker = self._workers.find(worker_identity)
         if scheduler is None or worker is None:
             return
 

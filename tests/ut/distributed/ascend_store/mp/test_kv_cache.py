@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import socket
+import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -244,6 +245,20 @@ def kv_cache_server_url() -> Iterator[str]:
         _stop_server(process)
 
 
+def test_server_request_stop_completes_run_loop() -> None:
+    server = KVCacheServer(_DEFAULT_URL, scheduler_factory=_create_scheduler)
+    server_thread = threading.Thread(target=server.run)
+
+    try:
+        server_thread.start()
+        server.request_stop()
+        server_thread.join(timeout=5)
+
+        assert not server_thread.is_alive()
+    finally:
+        server.close()
+
+
 def test_client_creation_does_not_wait_for_server() -> None:
     with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         with KVCacheClient("tcp://127.0.0.1:12345"):
@@ -444,6 +459,31 @@ def test_lookup_serializes_requests_for_the_same_scheduler() -> None:
     finally:
         for event in release_events:
             event.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+        client.close()
+        _stop_server(process)
+
+
+def test_lease_renewal_is_not_blocked_by_scheduler_lookup() -> None:
+    process, endpoint, started_events, release_events = _start_affinity_server()
+    client = KVCacheClient(endpoint)
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    try:
+        _wait_until_connected(client)
+        with patch.object(client, "_start_lease_loop"):
+            assert client.register_scheduler(_make_vllm_config(), kv_cache_config=None, page_size_bytes=0)
+
+        lookup_future = executor.submit(client.lookup, _make_request("request-0"), 0)
+        assert started_events[0].wait(5), "Lookup did not start in time"
+
+        client._maintain_lease()
+
+        assert client.is_registered
+        release_events[0].set()
+        assert lookup_future.result(timeout=5) == (0, False)
+    finally:
+        release_events[0].set()
         executor.shutdown(wait=True, cancel_futures=True)
         client.close()
         _stop_server(process)

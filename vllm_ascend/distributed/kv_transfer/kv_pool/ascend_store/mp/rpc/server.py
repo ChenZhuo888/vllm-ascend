@@ -57,15 +57,6 @@ class Route:
         if self.key_factory is not None and not callable(self.key_factory):
             raise TypeError("key_factory must be callable")
 
-    def submit(
-        self,
-        identity: bytes,
-        payloads: tuple[bytes, ...],
-        callback: Callable[[], ServerResponse],
-    ) -> Future[ServerResponse]:
-        key = None if self.key_factory is None else self.key_factory(identity, payloads)
-        return self.executor.submit(callback, key)
-
 
 class MPServer:
     """Serve RPC routes and own their executors until the server is closed."""
@@ -89,6 +80,14 @@ class MPServer:
         self._notify_writer.setblocking(False)
         self._notify_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._transport_lock = threading.Lock()
+        self._stop_requested = threading.Event()
+        self._run_stopped = threading.Event()
+        self._run_stopped.set()
+        self._run_thread: threading.Thread | None = None
+        self._run_started = False
+        self._transport_closed = False
         self._closed = False
 
         context = None
@@ -141,6 +140,13 @@ class MPServer:
                 executor.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 logger.exception("Failed to shut down MP server executor")
+
+    def _close_transport(self) -> None:
+        with self._transport_lock:
+            if self._transport_closed:
+                return
+            self._transport_closed = True
+            self._socket.close(linger=0)
 
     @staticmethod
     def _bind(zmq_socket: zmq.Socket, bind_url: str) -> str:
@@ -216,6 +222,10 @@ class MPServer:
         self._publish_response(response)
 
     def _dispatch_request(self, identity: bytes, request_id: bytes, method: str, payloads: tuple[bytes, ...]) -> None:
+        with self._state_lock:
+            if self._closed or self._stop_requested.is_set():
+                return
+
         route = self._routes.get(method)
         if route is None:
             self._publish_response(
@@ -225,7 +235,8 @@ class MPServer:
 
         try:
             callback = partial(self._execute_handler, identity, request_id, method, payloads, route.handler)
-            future = route.submit(identity, payloads, callback)
+            key = None if route.key_factory is None else route.key_factory(identity, payloads)
+            future = route.executor.submit(callback, key)
         except Exception as exc:
             self._publish_response(self._encode_error_response(identity, request_id, method, exc))
             return
@@ -255,32 +266,74 @@ class MPServer:
 
         try:
             while True:
-                self._socket.send_multipart(self._output_queue.get_nowait())
+                response = self._output_queue.get_nowait()
+                try:
+                    self._socket.send_multipart(response, flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    logger.warning("Dropping MP response because the outbound transport is busy")
         except queue.Empty:
             pass
 
     def run(self) -> None:
-        poller = zmq.Poller()
-        poller.register(self._socket, zmq.POLLIN)
-        poller.register(self._notify_reader.fileno(), zmq.POLLIN)
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("MPServer is closed")
+            if self._run_started:
+                raise RuntimeError("MPServer.run() can only be called once")
+            self._run_started = True
+            self._run_thread = threading.current_thread()
+            self._run_stopped.clear()
 
-        while True:
-            events = dict(poller.poll())
+        try:
+            poller = zmq.Poller()
+            poller.register(self._socket, zmq.POLLIN)
+            poller.register(self._notify_reader.fileno(), zmq.POLLIN)
 
-            if self._socket in events:
-                self._receive_request()
+            while not self._stop_requested.is_set():
+                events = dict(poller.poll())
+                if self._stop_requested.is_set():
+                    break
 
-            if self._notify_reader.fileno() in events:
-                self._send_responses()
+                if self._socket in events:
+                    self._receive_request()
+
+                if self._notify_reader.fileno() in events:
+                    self._send_responses()
+        finally:
+            # Disconnect clients before business services and executors are drained.
+            # Running handlers cannot be interrupted safely, but clients must not
+            # remain blocked while the server waits for them to finish.
+            self._close_transport()
+            with self._state_lock:
+                self._run_thread = None
+                self._run_stopped.set()
+
+    def request_stop(self) -> None:
+        """Ask the run loop to stop accepting requests without waiting for it."""
+        with self._state_lock:
+            if self._closed or self._stop_requested.is_set():
+                return
+            self._stop_requested.set()
+        self._notify_response_ready()
+
+    def wait_until_stopped(self) -> None:
+        """Wait until the run loop has stopped and disconnected its clients."""
+        with self._state_lock:
+            run_thread = self._run_thread
+        if run_thread is not None and run_thread is not threading.current_thread():
+            self._run_stopped.wait()
 
     def close(self) -> None:
         with self._close_lock:
-            if self._closed:
-                return
+            self.request_stop()
+            with self._state_lock:
+                if self._closed:
+                    return
+                self._closed = True
 
-            self._closed = True
+            self.wait_until_stopped()
+            self._close_transport()
             self._shutdown_executors()
-            self._socket.close(linger=0)
             self._notify_reader.close()
             self._notify_writer.close()
             self._context.term()

@@ -43,7 +43,7 @@ def _create_manager(
     clock=lambda: 0.0,
     lease_timeout_s: float = 10.0,
     check_interval_s: float = 0.01,
-    expiration_handler: Callable[[str, _FakeService], None] | None = None,
+    owner_close_handler: Callable[[str, _FakeService], None] | None = None,
 ) -> ServiceLifecycleManager[str, _FakeService]:
     return ServiceLifecycleManager(
         "Test",
@@ -51,24 +51,24 @@ def _create_manager(
         lease_timeout_s=lease_timeout_s,
         check_interval_s=check_interval_s,
         clock=clock,
-        expiration_handler=expiration_handler,
+        owner_close_handler=owner_close_handler,
     )
 
 
-def test_get_is_read_only_and_get_active_renews_lease() -> None:
+def test_find_is_read_only_and_get_for_session_renews_lease() -> None:
     now = [10.0]
     manager = _create_manager(lambda: now[0])
     service = manager.register("service-0", "session-0", b"config", _FakeService)
 
     now[0] = 20.0
-    assert manager.get("service-0") is service
+    assert manager.find("service-0") is service
     now[0] = 21.0
     assert manager.expire_leases() == 1
     assert service.close_count == 1
 
     recovered = manager.register("service-0", "session-0", b"config", _FakeService)
     now[0] = 30.0
-    assert manager.get_active("service-0", "session-0") is recovered
+    assert manager.get_for_session("service-0", "session-0") is recovered
     now[0] = 39.0
     assert manager.expire_leases() == 0
     assert manager.items() == (("service-0", recovered),)
@@ -128,7 +128,7 @@ def test_expired_session_recovers_only_with_the_same_fingerprint() -> None:
     assert second_service is not first_service
 
 
-def test_expiration_uses_the_configured_handler() -> None:
+def test_expiration_uses_the_owner_close_handler() -> None:
     now = [0.0]
     expired = []
 
@@ -136,12 +136,28 @@ def test_expiration_uses_the_configured_handler() -> None:
         expired.append(identity)
         service.close()
 
-    manager = _create_manager(lambda: now[0], expiration_handler=expire_service)
+    manager = _create_manager(lambda: now[0], owner_close_handler=expire_service)
     service = manager.register("service-0", "session-0", b"config", _FakeService)
     now[0] = 11.0
 
     assert manager.expire_leases() == 1
     assert expired == ["service-0"]
+    assert service.close_count == 1
+
+
+def test_manager_close_uses_the_owner_close_handler() -> None:
+    closed_identities = []
+
+    def close_service(identity: str, service: _FakeService) -> None:
+        closed_identities.append(identity)
+        service.close()
+
+    manager = _create_manager(owner_close_handler=close_service)
+    service = manager.register("service-0", "session-0", b"config", _FakeService)
+
+    manager.close()
+
+    assert closed_identities == ["service-0"]
     assert service.close_count == 1
 
 
@@ -205,8 +221,8 @@ def test_maintenance_loop_expires_services_and_close_is_idempotent() -> None:
     manager.register("service-0", "session-0", b"config", lambda: _FakeService(closed))
 
     now[0] = 11.0
-    manager.start()
-    manager.start()
+    manager.start_maintenance()
+    manager.start_maintenance()
     try:
         assert closed.wait(1), "Lifecycle maintenance did not expire the service"
     finally:
@@ -233,7 +249,7 @@ def test_maintenance_loop_survives_expiration_failure() -> None:
         patch.object(manager, "expire_leases", side_effect=expire_leases),
         patch(f"{LIFECYCLE_MODULE}.logger.exception") as log_exception,
     ):
-        manager.start()
+        manager.start_maintenance()
         try:
             assert maintenance_finished.wait(1), "Lifecycle maintenance stopped after an expiration failure"
         finally:

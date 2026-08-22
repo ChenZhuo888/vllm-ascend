@@ -36,7 +36,12 @@ class _RegistrationFlight(Generic[ServiceT]):
 
 
 class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
-    """Manage the registration, lease, expiration, and closure of one service type."""
+    """Manage the registration, lease, expiration, and closure of one service type.
+
+    Internal orchestration uses ``find`` without renewing a lease. Requests from
+    a service owner use ``get_for_session``. Background expiration and manager
+    shutdown use ``owner_close_handler`` when the service has an owner lane.
+    """
 
     def __init__(
         self,
@@ -46,7 +51,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         check_interval_s: float,
         clock: Callable[[], float] = time.monotonic,
         thread_name: str | None = None,
-        expiration_handler: Callable[[IdentityT, ServiceT], None] | None = None,
+        owner_close_handler: Callable[[IdentityT, ServiceT], None] | None = None,
     ):
         if not service_name:
             raise ValueError("service_name must not be empty")
@@ -61,7 +66,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         self._check_interval_s = check_interval_s
         self._clock = clock
         self._thread_name = thread_name or f"{service_name.lower()}-service-lifecycle"
-        self._expiration_handler = expiration_handler
+        self._owner_close_handler = owner_close_handler
 
         self._lock = threading.RLock()
         self._services: dict[IdentityT, _ServiceEntry[ServiceT]] = {}
@@ -89,22 +94,6 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     def items(self) -> tuple[tuple[IdentityT, ServiceT], ...]:
         with self._lock:
             return tuple((identity, entry.service) for identity, entry in self._services.items())
-
-    def start(self) -> None:
-        with self._lock:
-            self._raise_if_closed()
-            with self._maintenance_lock:
-                if self._maintenance_thread is not None and self._maintenance_thread.is_alive():
-                    return
-
-                self._maintenance_stop.clear()
-                self._maintenance_thread = threading.Thread(
-                    target=self._maintenance_loop, daemon=True, name=self._thread_name
-                )
-                self._maintenance_thread.start()
-
-    def stop(self) -> None:
-        self._stop_maintenance()
 
     def register(
         self,
@@ -163,13 +152,15 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
             entry.last_seen = self._clock()
             return True
 
-    def get(self, identity: IdentityT) -> ServiceT | None:
+    def find(self, identity: IdentityT) -> ServiceT | None:
+        """Return a service without validating or renewing its owner session."""
         with self._lock:
             self._raise_if_closed()
             entry = self._services.get(identity)
             return None if entry is None else entry.service
 
-    def get_active(self, identity: IdentityT, session_id: str) -> ServiceT | None:
+    def get_for_session(self, identity: IdentityT, session_id: str) -> ServiceT | None:
+        """Validate the owner session, renew its lease, and return the service."""
         self._validate_session_id(session_id)
         with self._lock:
             self._raise_if_closed()
@@ -228,37 +219,24 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
                     self._expiring[identity] = entry
 
             for identity, entry in expired_services:
-                self._expire_service_safely(identity, entry.service)
+                self._close_on_owner_safely(identity, entry.service)
                 self._finish_expiration(identity, entry)
             return len(expired_services)
 
-    def close(self) -> None:
+    def start_maintenance(self) -> None:
         with self._lock:
-            if self._closed:
-                return
-            self._closed = True
+            self._raise_if_closed()
+            with self._maintenance_lock:
+                if self._maintenance_thread is not None and self._maintenance_thread.is_alive():
+                    return
 
-        self._stop_maintenance()
-        with self._expiration_lock, self._lock:
-            services = [entry.service for entry in self._services.values()]
-            services.extend(entry.service for entry in self._expiring.values())
-            self._services.clear()
-            self._registering.clear()
-            self._expiring.clear()
-            self._recoverable_sessions.clear()
-            self._retired_sessions.clear()
+                self._maintenance_stop.clear()
+                self._maintenance_thread = threading.Thread(
+                    target=self._maintenance_loop, daemon=True, name=self._thread_name
+                )
+                self._maintenance_thread.start()
 
-        for service in services:
-            self._close_service_safely(service)
-
-    def _maintenance_loop(self) -> None:
-        while not self._maintenance_stop.wait(self._check_interval_s):
-            try:
-                self.expire_leases()
-            except Exception:
-                logger.exception("%s service lifecycle maintenance failed", self._service_name)
-
-    def _stop_maintenance(self) -> None:
+    def stop_maintenance(self) -> None:
         with self._maintenance_lock:
             thread = self._maintenance_thread
             if thread is None:
@@ -271,6 +249,32 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         with self._maintenance_lock:
             if self._maintenance_thread is thread:
                 self._maintenance_thread = None
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        self.stop_maintenance()
+        with self._expiration_lock, self._lock:
+            services = [(identity, entry.service) for identity, entry in self._services.items()]
+            services.extend((identity, entry.service) for identity, entry in self._expiring.items())
+            self._services.clear()
+            self._registering.clear()
+            self._expiring.clear()
+            self._recoverable_sessions.clear()
+            self._retired_sessions.clear()
+
+        for identity, service in services:
+            self._close_on_owner_safely(identity, service)
+
+    def _maintenance_loop(self) -> None:
+        while not self._maintenance_stop.wait(self._check_interval_s):
+            try:
+                self.expire_leases()
+            except Exception:
+                logger.exception("%s service lifecycle maintenance failed", self._service_name)
 
     def _prepare_recoverable_locked(self, identity: IdentityT, session_id: str, fingerprint: bytes) -> None:
         recoverable = self._recoverable_sessions.get(identity)
@@ -379,15 +383,15 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         except Exception:
             logger.exception("Failed to close %s service %r", self._service_name, service)
 
-    def _expire_service_safely(self, identity: IdentityT, service: ServiceT) -> None:
-        if self._expiration_handler is None:
+    def _close_on_owner_safely(self, identity: IdentityT, service: ServiceT) -> None:
+        if self._owner_close_handler is None:
             self._close_service_safely(service)
             return
 
         try:
-            self._expiration_handler(identity, service)
+            self._owner_close_handler(identity, service)
         except Exception:
-            logger.exception("Failed to expire %s service %r", self._service_name, service)
+            logger.exception("Failed to close %s service %r on its owner", self._service_name, service)
 
     @staticmethod
     def _validate_session_id(session_id: str) -> None:

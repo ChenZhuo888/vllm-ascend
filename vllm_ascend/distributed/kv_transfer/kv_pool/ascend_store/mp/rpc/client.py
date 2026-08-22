@@ -185,10 +185,15 @@ class MPClient:
                     self._set_request_timeout(request.method, request.future)
                     continue
 
+                try:
+                    zmq_socket.send_multipart(request.frames, flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    request.future.set_exception(MPServerBusyError("MP client outbound transport is busy"))
+                    continue
+
                 self._pending_requests[request.request_id] = _PendingRequest(
                     request.method, request.future, request.deadline
                 )
-                zmq_socket.send_multipart(request.frames)
         except queue.Empty:
             pass
 

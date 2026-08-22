@@ -1,5 +1,6 @@
 """Server-side KV cache service orchestration."""
 
+import threading
 from functools import partial
 from typing import cast
 
@@ -26,6 +27,7 @@ from .registration import (
 )
 from .rpc import (
     AffinityExecutor,
+    InlineExecutor,
     MPServer,
     MPServerBusyError,
     Route,
@@ -47,6 +49,9 @@ class KVCacheServer:
     ):
         scheduler_executor = AffinityExecutor(max_workers, _MAX_PENDING_REQUESTS, "ascend-store-kv-scheduler")
         worker_executor = AffinityExecutor(max_workers, _MAX_PENDING_REQUESTS, "ascend-store-kv-worker")
+        lease_executor = InlineExecutor()
+        self._close_lock = threading.Lock()
+        self._closed = False
         self._service = KVCacheServiceManager(
             scheduler_factory,
             worker_factory,
@@ -56,16 +61,18 @@ class KVCacheServer:
         scheduler_route = partial(Route, executor=scheduler_executor, key_factory=scheduler_affinity_key)
         lookup_route = partial(Route, executor=scheduler_executor, key_factory=lookup_affinity_key)
         worker_route = partial(Route, executor=worker_executor, key_factory=worker_affinity_key)
+        # Renewal only updates lifecycle metadata and must not wait behind business work.
+        lease_route = partial(Route, executor=lease_executor)
         self._rpc_server = MPServer(
             bind_url,
             routes=(
                 scheduler_route(KVCacheMethod.REGISTER_SCHEDULER, self._handle_register_scheduler),
                 scheduler_route(KVCacheMethod.UNREGISTER_SCHEDULER, self._handle_unregister_scheduler),
-                scheduler_route(KVCacheMethod.RENEW_SCHEDULER, self._handle_renew_scheduler),
+                lease_route(KVCacheMethod.RENEW_SCHEDULER, self._handle_renew_scheduler),
                 lookup_route(KVCacheMethod.LOOKUP, self._handle_lookup),
                 worker_route(KVCacheMethod.REGISTER_WORKER, self._handle_register_worker),
                 worker_route(KVCacheMethod.UNREGISTER_WORKER, self._handle_unregister_worker),
-                worker_route(KVCacheMethod.RENEW_WORKER, self._handle_renew_worker),
+                lease_route(KVCacheMethod.RENEW_WORKER, self._handle_renew_worker),
             ),
         )
 
@@ -134,13 +141,26 @@ class KVCacheServer:
         return encode_lookup_response(matched_tokens, is_async)
 
     def run(self) -> None:
-        self._service.start()
+        self._service.start_lease_maintenance()
         try:
             self._rpc_server.run()
         finally:
             self.close()
 
+    def request_stop(self) -> None:
+        """Ask a running server to exit without waiting for shutdown to finish."""
+        self._rpc_server.request_stop()
+
     def close(self) -> None:
-        self._service.stop()
-        self._rpc_server.close()
-        self._service.close()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.request_stop()
+            self._rpc_server.wait_until_stopped()
+            try:
+                self._service.stop_lease_maintenance()
+                # MPServer still owns live route executors while services close on their owner lanes.
+                self._service.close()
+            finally:
+                self._rpc_server.close()

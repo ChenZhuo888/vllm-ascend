@@ -1,7 +1,10 @@
 import multiprocessing as mp
+import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import zmq
@@ -16,6 +19,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPRequestTimeoutError,
     MPServer,
     MPServerBusyError,
+    MPServerUnavailableError,
     Route,
     SystemMethod,
 )
@@ -274,6 +278,114 @@ def test_client_server_round_trip():
         assert client.ping() == "OK"
     finally:
         _cleanup(client, parent_conn, process)
+
+
+def test_server_request_stop_wakes_run_loop() -> None:
+    server = MPServer("tcp://127.0.0.1:*")
+    server_thread = threading.Thread(target=server.run)
+
+    try:
+        server_thread.start()
+        server.request_stop()
+        server_thread.join(timeout=5)
+
+        assert not server_thread.is_alive()
+        assert server._socket.closed
+    finally:
+        server.close()
+
+
+def test_server_does_not_dispatch_requests_after_stop_is_requested() -> None:
+    handler = MagicMock(return_value=(b"response",))
+    server = MPServer("tcp://127.0.0.1:*", routes=(Route(UPPERCASE_METHOD, handler, InlineExecutor()),))
+
+    try:
+        server.request_stop()
+        server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, (b"request",))
+
+        handler.assert_not_called()
+        assert server._output_queue.empty()
+    finally:
+        server.close()
+
+
+def test_server_close_disconnects_client_before_waiting_for_running_handler() -> None:
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+
+    def blocking_handler(payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        handler_started.set()
+        if not release_handler.wait(5):
+            raise TimeoutError("Timed out waiting to release the handler")
+        return payloads
+
+    executor = BoundedThreadPoolExecutor(1, 0, "test-server-close")
+    server = MPServer("tcp://127.0.0.1:*", routes=(Route(BLOCKING_METHOD, blocking_handler, executor),))
+    server_thread = threading.Thread(target=server.run)
+    close_thread = threading.Thread(target=server.close)
+    client = MPClient(server.endpoint)
+
+    try:
+        server_thread.start()
+        client.wait_until_connected()
+        future = client.submit_request(BLOCKING_METHOD, [b"request"])
+        assert handler_started.wait(5), "Handler did not start in time"
+
+        close_thread.start()
+        with pytest.raises(MPServerUnavailableError, match="disconnected"):
+            future.result(timeout=5)
+
+        assert close_thread.is_alive()
+    finally:
+        release_handler.set()
+        if close_thread.ident is None:
+            close_thread.start()
+        close_thread.join(timeout=5)
+        server_thread.join(timeout=5)
+        client.close()
+        server.close()
+
+    assert not close_thread.is_alive()
+    assert not server_thread.is_alive()
+
+
+def test_client_backpressure_does_not_leave_an_unsent_request_pending() -> None:
+    client = MPClient.__new__(MPClient)
+    client._outbound_queue = queue.Queue()
+    client._pending_requests = {}
+    future = Future()
+    client._outbound_queue.put(
+        SimpleNamespace(
+            request_id=b"request-0",
+            method="TEST",
+            frames=(b"request-0", b"TEST"),
+            future=future,
+            deadline=None,
+        )
+    )
+    zmq_socket = MagicMock()
+    zmq_socket.send_multipart.side_effect = zmq.Again()
+
+    client._process_outbound(zmq_socket)
+
+    with pytest.raises(MPServerBusyError, match="outbound transport is busy"):
+        future.result()
+    assert client._pending_requests == {}
+
+
+def test_server_backpressure_drops_response_without_blocking() -> None:
+    server = MPServer.__new__(MPServer)
+    server._notify_reader = MagicMock()
+    server._output_queue = queue.Queue()
+    server._output_queue.put((b"client", b"request-0", b"TEST"))
+    server._socket = MagicMock()
+    server._socket.send_multipart.side_effect = zmq.Again()
+
+    with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.server.logger.warning") as log_warning:
+        server._send_responses()
+
+    assert server._output_queue.empty()
+    log_warning.assert_called_once_with("Dropping MP response because the outbound transport is busy")
 
 
 def test_multiple_worker_processes_receive_their_own_responses():
