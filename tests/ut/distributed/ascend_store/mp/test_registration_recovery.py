@@ -14,7 +14,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPServerBusyError,
 )
 
-KV_CACHE_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache"
+KV_CACHE_CLIENT_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_client"
 
 
 def _make_vllm_config():
@@ -38,7 +38,7 @@ def _make_request():
 
 
 def test_recovery_reuses_the_same_session_after_initial_registration_failure() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = False
@@ -67,7 +67,7 @@ def test_recovery_reuses_the_same_session_after_initial_registration_failure() -
 
 
 def test_stale_session_during_recovery_becomes_terminal_for_kv_cache_client() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = True
@@ -90,7 +90,7 @@ def test_stale_session_during_recovery_becomes_terminal_for_kv_cache_client() ->
 
 
 def test_lookup_maps_remote_stale_session_to_terminal_client_state() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = True
@@ -112,7 +112,7 @@ def test_lookup_maps_remote_stale_session_to_terminal_client_state() -> None:
 
 
 def test_close_stops_heartbeat_then_unregisters_the_same_session() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = True
@@ -137,7 +137,8 @@ def test_close_stops_heartbeat_then_unregisters_the_same_session() -> None:
         unregister_index = next(
             index
             for index, method_call in enumerate(rpc_client.method_calls)
-            if method_call == call.request(
+            if method_call
+            == call.request(
                 KVCacheMethod.UNREGISTER_SCHEDULER,
                 unregister_call.args[1],
                 timeout_ms=500,
@@ -148,7 +149,7 @@ def test_close_stops_heartbeat_then_unregisters_the_same_session() -> None:
 
 
 def test_service_heartbeat_uses_the_registered_session() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = True
@@ -171,7 +172,7 @@ def test_service_heartbeat_uses_the_registered_session() -> None:
 
 
 def test_service_not_registered_heartbeat_reregisters_the_same_session() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = True
@@ -203,7 +204,7 @@ def test_service_not_registered_heartbeat_reregisters_the_same_session() -> None
 
 
 def test_unregistered_client_retries_registration_from_heartbeat() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = True
@@ -221,7 +222,7 @@ def test_unregistered_client_retries_registration_from_heartbeat() -> None:
 
 
 def test_stale_service_heartbeat_supersedes_client() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = True

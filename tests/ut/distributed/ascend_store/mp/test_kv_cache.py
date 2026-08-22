@@ -26,7 +26,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPServerUnavailableError,
 )
 
-KV_CACHE_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache"
+KV_CACHE_CLIENT_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_client"
 _DEFAULT_URL = "tcp://127.0.0.1:*"
 _BLOCK_HASHES = [bytes.fromhex("01" * 32), bytes.fromhex("02" * 32)]
 
@@ -243,7 +243,7 @@ def kv_cache_server_url() -> Iterator[str]:
 
 
 def test_client_creation_does_not_wait_for_server() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         with KVCacheClient("tcp://127.0.0.1:12345"):
             pass
 
@@ -253,7 +253,7 @@ def test_client_creation_does_not_wait_for_server() -> None:
 
 
 def test_registration_checks_application_readiness() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.ping.side_effect = MPRequestTimeoutError("PING timeout")
@@ -267,7 +267,7 @@ def test_registration_checks_application_readiness() -> None:
 
 
 def test_lookup_retries_registration_after_server_busy() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = True
@@ -287,7 +287,7 @@ def test_lookup_retries_registration_after_server_busy() -> None:
 
 
 def test_lookup_returns_cache_miss_on_transport_failure() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = True
@@ -301,7 +301,7 @@ def test_lookup_returns_cache_miss_on_transport_failure() -> None:
 
 
 def test_lookup_returns_cache_miss_without_unregistering_when_server_is_busy() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client = rpc_client_class.return_value
         rpc_client.is_transport_connected = True
         rpc_client.is_server_responsive = True
@@ -315,7 +315,7 @@ def test_lookup_returns_cache_miss_without_unregistering_when_server_is_busy() -
 
 
 def test_lookup_validates_request_before_degrading() -> None:
-    with patch(f"{KV_CACHE_MODULE}.MPClient") as rpc_client_class:
+    with patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class:
         rpc_client_class.return_value.is_transport_connected = False
 
         with KVCacheClient("tcp://127.0.0.1:12345") as client:
