@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import encode_registration
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_registry import KVCacheServiceRegistry
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_service import KVCacheServiceManager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
     SchedulerRegistration,
     WorkerRegistration,
@@ -70,9 +70,10 @@ def _worker_registration(session_id: str, *, data_parallel_rank: int = 0, rank: 
     )
 
 
-def _create_registry(scheduler_factory=None, worker_factory=None) -> KVCacheServiceRegistry:
-    return KVCacheServiceRegistry(
-        scheduler_factory or (lambda registration: _FakeScheduler()),
+def _create_service_manager(scheduler_factory=None, worker_factory=None) -> KVCacheServiceManager:
+    scheduler_factory = scheduler_factory or (lambda registration: _FakeScheduler())
+    return KVCacheServiceManager(
+        lambda registration, _lookup_handler: scheduler_factory(registration),
         worker_factory or (lambda registration: _FakeWorker()),
     )
 
@@ -90,18 +91,18 @@ def test_scheduler_factories_for_different_identities_run_in_parallel() -> None:
             second_started.set()
         return _FakeScheduler()
 
-    registry = _create_registry(scheduler_factory=scheduler_factory)
+    service_manager = _create_service_manager(scheduler_factory=scheduler_factory)
     first_registration = _scheduler_registration("session-0", data_parallel_rank=0)
     second_registration = _scheduler_registration("session-1", data_parallel_rank=1)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         first_future = executor.submit(
-            registry.register_scheduler, first_registration, encode_registration(first_registration)
+            service_manager.register_scheduler, first_registration, encode_registration(first_registration)
         )
         assert first_started.wait(5), "First Scheduler factory did not start"
 
         second_future = executor.submit(
-            registry.register_scheduler, second_registration, encode_registration(second_registration)
+            service_manager.register_scheduler, second_registration, encode_registration(second_registration)
         )
         try:
             assert second_started.wait(1), "Second Scheduler factory was blocked by the first registration"
@@ -111,7 +112,7 @@ def test_scheduler_factories_for_different_identities_run_in_parallel() -> None:
         assert isinstance(first_future.result(timeout=5), _FakeScheduler)
         assert isinstance(second_future.result(timeout=5), _FakeScheduler)
 
-    assert registry.scheduler_count == 2
+    assert service_manager.scheduler_count == 2
 
 
 def test_concurrent_identical_scheduler_registration_shares_one_factory_result() -> None:
@@ -126,14 +127,14 @@ def test_concurrent_identical_scheduler_registration_shares_one_factory_result()
         assert release_factory.wait(5), "Scheduler factory was not released"
         return scheduler
 
-    registry = _create_registry(scheduler_factory=scheduler_factory)
+    service_manager = _create_service_manager(scheduler_factory=scheduler_factory)
     registration = _scheduler_registration("session-0")
     payload = encode_registration(registration)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first_future = executor.submit(registry.register_scheduler, registration, payload)
+        first_future = executor.submit(service_manager.register_scheduler, registration, payload)
         assert factory_started.wait(5), "Scheduler factory did not start"
-        second_future = executor.submit(registry.register_scheduler, registration, payload)
+        second_future = executor.submit(service_manager.register_scheduler, registration, payload)
         release_factory.set()
 
         first_service = first_future.result(timeout=5)
@@ -141,7 +142,7 @@ def test_concurrent_identical_scheduler_registration_shares_one_factory_result()
 
     assert first_service is second_service
     assert created_schedulers == [first_service]
-    assert registry.scheduler_count == 1
+    assert service_manager.scheduler_count == 1
 
 
 def test_conflicting_scheduler_registration_fails_while_original_is_registering() -> None:
@@ -153,17 +154,17 @@ def test_conflicting_scheduler_registration_fails_while_original_is_registering(
         assert release_factory.wait(5), "Scheduler factory was not released"
         return _FakeScheduler()
 
-    registry = _create_registry(scheduler_factory=scheduler_factory)
+    service_manager = _create_service_manager(scheduler_factory=scheduler_factory)
     registration = _scheduler_registration("session-0", marker="first")
     conflicting = _scheduler_registration("session-0", marker="second")
 
     with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(registry.register_scheduler, registration, encode_registration(registration))
+        future = executor.submit(service_manager.register_scheduler, registration, encode_registration(registration))
         assert factory_started.wait(5), "Scheduler factory did not start"
 
         try:
             with pytest.raises(RegistrationConflictError, match="different configuration"):
-                registry.register_scheduler(conflicting, encode_registration(conflicting))
+                service_manager.register_scheduler(conflicting, encode_registration(conflicting))
         finally:
             release_factory.set()
 
@@ -184,14 +185,14 @@ def test_concurrent_scheduler_registration_shares_factory_failure_and_next_reque
             raise RuntimeError("factory failed")
         return _FakeScheduler()
 
-    registry = _create_registry(scheduler_factory=scheduler_factory)
+    service_manager = _create_service_manager(scheduler_factory=scheduler_factory)
     registration = _scheduler_registration("session-0")
     payload = encode_registration(registration)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first_future = executor.submit(registry.register_scheduler, registration, payload)
+        first_future = executor.submit(service_manager.register_scheduler, registration, payload)
         assert factory_started.wait(5), "Scheduler factory did not start"
-        second_future = executor.submit(registry.register_scheduler, registration, payload)
+        second_future = executor.submit(service_manager.register_scheduler, registration, payload)
         release_factory.set()
 
         with pytest.raises(RuntimeError, match="factory failed"):
@@ -200,11 +201,11 @@ def test_concurrent_scheduler_registration_shares_factory_failure_and_next_reque
             second_future.result(timeout=5)
 
     assert attempts == 1
-    assert registry.scheduler_count == 0
+    assert service_manager.scheduler_count == 0
 
-    assert isinstance(registry.register_scheduler(registration, payload), _FakeScheduler)
+    assert isinstance(service_manager.register_scheduler(registration, payload), _FakeScheduler)
     assert attempts == 2
-    assert registry.scheduler_count == 1
+    assert service_manager.scheduler_count == 1
 
 
 def test_new_scheduler_session_replaces_and_retires_old_session() -> None:
@@ -215,21 +216,21 @@ def test_new_scheduler_session_replaces_and_retires_old_session() -> None:
         created.append(scheduler)
         return scheduler
 
-    registry = _create_registry(scheduler_factory=scheduler_factory)
+    service_manager = _create_service_manager(scheduler_factory=scheduler_factory)
     old_registration = _scheduler_registration("old-session")
     new_registration = _scheduler_registration("new-session")
 
-    old_service = registry.register_scheduler(old_registration, encode_registration(old_registration))
-    new_service = registry.register_scheduler(new_registration, encode_registration(new_registration))
+    old_service = service_manager.register_scheduler(old_registration, encode_registration(old_registration))
+    new_service = service_manager.register_scheduler(new_registration, encode_registration(new_registration))
 
     assert old_service.close_count == 1
     assert new_service is created[1]
-    assert registry.get_scheduler(new_registration.identity, "new-session") is new_service
+    assert service_manager.lookup(new_registration.identity, "new-session", SimpleNamespace(), 0) == (0, False)
 
     with pytest.raises(StaleSessionError, match="retired"):
-        registry.register_scheduler(old_registration, encode_registration(old_registration))
+        service_manager.register_scheduler(old_registration, encode_registration(old_registration))
     with pytest.raises(StaleSessionError):
-        registry.get_scheduler(old_registration.identity, "old-session")
+        service_manager.lookup(old_registration.identity, "old-session", SimpleNamespace(), 0)
 
 
 def test_old_session_is_fenced_while_new_session_is_registering() -> None:
@@ -242,17 +243,19 @@ def test_old_session_is_fenced_while_new_session_is_registering() -> None:
             assert release_new_factory.wait(5), "New Scheduler factory was not released"
         return _FakeScheduler()
 
-    registry = _create_registry(scheduler_factory=scheduler_factory)
+    service_manager = _create_service_manager(scheduler_factory=scheduler_factory)
     old_registration = _scheduler_registration("old-session")
     new_registration = _scheduler_registration("new-session")
-    registry.register_scheduler(old_registration, encode_registration(old_registration))
+    service_manager.register_scheduler(old_registration, encode_registration(old_registration))
 
     with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(registry.register_scheduler, new_registration, encode_registration(new_registration))
+        future = executor.submit(
+            service_manager.register_scheduler, new_registration, encode_registration(new_registration)
+        )
         assert new_factory_started.wait(5), "New Scheduler factory did not start"
         try:
             with pytest.raises(StaleSessionError, match="retired"):
-                registry.register_scheduler(old_registration, encode_registration(old_registration))
+                service_manager.register_scheduler(old_registration, encode_registration(old_registration))
         finally:
             release_new_factory.set()
 
@@ -269,18 +272,18 @@ def test_different_new_session_is_rejected_while_session_transition_is_running()
             assert release_factory.wait(5), "Scheduler factory was not released"
         return _FakeScheduler()
 
-    registry = _create_registry(scheduler_factory=scheduler_factory)
+    service_manager = _create_service_manager(scheduler_factory=scheduler_factory)
     first = _scheduler_registration("session-0")
     second = _scheduler_registration("session-1")
     third = _scheduler_registration("session-2")
-    registry.register_scheduler(first, encode_registration(first))
+    service_manager.register_scheduler(first, encode_registration(first))
 
     with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(registry.register_scheduler, second, encode_registration(second))
+        future = executor.submit(service_manager.register_scheduler, second, encode_registration(second))
         assert factory_started.wait(5), "Scheduler factory did not start"
         try:
             with pytest.raises(RegistrationConflictError, match="already registering session"):
-                registry.register_scheduler(third, encode_registration(third))
+                service_manager.register_scheduler(third, encode_registration(third))
         finally:
             release_factory.set()
 
@@ -288,16 +291,16 @@ def test_different_new_session_is_rejected_while_session_transition_is_running()
 
 
 def test_unregister_retires_current_session_and_closes_service() -> None:
-    registry = _create_registry()
+    service_manager = _create_service_manager()
     registration = _scheduler_registration("session-0")
-    service = registry.register_scheduler(registration, encode_registration(registration))
+    service = service_manager.register_scheduler(registration, encode_registration(registration))
 
-    assert registry.unregister_scheduler(registration.identity, registration.session_id)
+    assert service_manager.unregister_scheduler(registration.identity, registration.session_id)
     assert service.close_count == 1
-    assert registry.scheduler_count == 0
+    assert service_manager.scheduler_count == 0
 
     with pytest.raises(StaleSessionError, match="retired"):
-        registry.register_scheduler(registration, encode_registration(registration))
+        service_manager.register_scheduler(registration, encode_registration(registration))
 
 
 def test_concurrent_identical_worker_registration_shares_one_factory_result() -> None:
@@ -312,14 +315,14 @@ def test_concurrent_identical_worker_registration_shares_one_factory_result() ->
         assert release_factory.wait(5), "Worker factory was not released"
         return worker
 
-    registry = _create_registry(worker_factory=worker_factory)
+    service_manager = _create_service_manager(worker_factory=worker_factory)
     registration = _worker_registration("worker-session")
     payload = encode_registration(registration)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first_future = executor.submit(registry.register_worker, registration, payload)
+        first_future = executor.submit(service_manager.register_worker, registration, payload)
         assert factory_started.wait(5), "Worker factory did not start"
-        second_future = executor.submit(registry.register_worker, registration, payload)
+        second_future = executor.submit(service_manager.register_worker, registration, payload)
         release_factory.set()
 
         first_service = first_future.result(timeout=5)
@@ -327,4 +330,4 @@ def test_concurrent_identical_worker_registration_shares_one_factory_result() ->
 
     assert first_service is second_service
     assert created_workers == [first_service]
-    assert registry.worker_count == 1
+    assert service_manager.worker_count == 1

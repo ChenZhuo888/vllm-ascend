@@ -1,6 +1,6 @@
 """Public KV cache multiprocessing API.
 
-The implementation lives in focused client, server, protocol, and registry modules. This facade preserves the original
+The implementation lives in focused client, server, protocol, and service modules. This facade preserves the original
 import path for callers.
 """
 

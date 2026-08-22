@@ -1,11 +1,9 @@
 from .error import RegistrationConflictError, ServiceBusyError, StaleSessionError
-from .reaper import ServiceReaper
-from .registry import ServiceRegistry
+from .lifecycle import ServiceLifecycleManager
 
 __all__ = [
     "RegistrationConflictError",
     "ServiceBusyError",
-    "ServiceReaper",
-    "ServiceRegistry",
+    "ServiceLifecycleManager",
     "StaleSessionError",
 ]

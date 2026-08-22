@@ -35,36 +35,71 @@ class _RegistrationFlight(Generic[ServiceT]):
     future: Future[ServiceT]
 
 
-class ServiceRegistry(Generic[IdentityT, ServiceT]):
-    """Manage session-aware service instances for one service type."""
+class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
+    """Manage the registration, lease, expiration, and closure of one service type."""
 
     def __init__(
         self,
         service_name: str,
         close_service: Callable[[ServiceT], None],
+        lease_timeout_s: float,
+        check_interval_s: float,
         clock: Callable[[], float] = time.monotonic,
+        thread_name: str | None = None,
     ):
         if not service_name:
             raise ValueError("service_name must not be empty")
+        if lease_timeout_s <= 0:
+            raise ValueError(f"lease_timeout_s must be greater than 0, got {lease_timeout_s}")
+        if check_interval_s <= 0:
+            raise ValueError(f"check_interval_s must be greater than 0, got {check_interval_s}")
 
         self._service_name = service_name
         self._close_service = close_service
+        self._lease_timeout_s = lease_timeout_s
+        self._check_interval_s = check_interval_s
         self._clock = clock
+        self._thread_name = thread_name or f"{service_name.lower()}-service-lifecycle"
+
         self._lock = threading.RLock()
         self._services: dict[IdentityT, _ServiceEntry[ServiceT]] = {}
         self._registering: dict[IdentityT, _RegistrationFlight[ServiceT]] = {}
-        self._reaping: dict[IdentityT, _ServiceEntry[ServiceT]] = {}
+        self._expiring: dict[IdentityT, _ServiceEntry[ServiceT]] = {}
         self._recoverable_sessions: dict[IdentityT, _RecoverableSession] = {}
         self._retired_sessions: dict[IdentityT, set[str]] = {}
+        self._closed = False
+
+        self._expiration_lock = threading.RLock()
+        self._maintenance_lock = threading.Lock()
+        self._maintenance_stop = threading.Event()
+        self._maintenance_thread: threading.Thread | None = None
 
     @property
     def count(self) -> int:
         with self._lock:
             return len(self._services)
 
+    @property
+    def is_running(self) -> bool:
+        with self._maintenance_lock:
+            return self._maintenance_thread is not None and self._maintenance_thread.is_alive()
+
     def items(self) -> tuple[tuple[IdentityT, ServiceT], ...]:
         with self._lock:
             return tuple((identity, entry.service) for identity, entry in self._services.items())
+
+    def start(self) -> None:
+        with self._lock:
+            self._raise_if_closed()
+            with self._maintenance_lock:
+                if self._maintenance_thread is not None and self._maintenance_thread.is_alive():
+                    return
+
+                self._maintenance_stop.clear()
+                self._maintenance_thread = threading.Thread(
+                    target=self._maintenance_loop, daemon=True, name=self._thread_name
+                )
+                self._maintenance_thread.start()
 
     def register(
         self,
@@ -77,9 +112,10 @@ class ServiceRegistry(Generic[IdentityT, ServiceT]):
         old_service = None
 
         with self._lock:
+            self._raise_if_closed()
             self._raise_if_retired(identity, session_id)
-            if identity in self._reaping:
-                raise ServiceBusyError(f"{self._service_name} {identity!r} is being reaped")
+            if identity in self._expiring:
+                raise ServiceBusyError(f"{self._service_name} {identity!r} is being expired")
 
             entry = self._services.get(identity)
             if entry is not None:
@@ -108,19 +144,49 @@ class ServiceRegistry(Generic[IdentityT, ServiceT]):
 
         if wait_future is not None:
             return wait_future.result()
-
         return self._create_and_publish(identity, session_id, fingerprint, factory, flight, old_service)
+
+    def renew(self, identity: IdentityT, session_id: str) -> bool:
+        self._validate_session_id(session_id)
+        with self._lock:
+            self._raise_if_closed()
+            self._raise_if_retired(identity, session_id)
+            entry = self._services.get(identity)
+            if entry is None:
+                return False
+            self._validate_session(identity, session_id, entry.session_id)
+            entry.last_seen = self._clock()
+            return True
+
+    def get(self, identity: IdentityT) -> ServiceT | None:
+        with self._lock:
+            self._raise_if_closed()
+            entry = self._services.get(identity)
+            return None if entry is None else entry.service
+
+    def get_active(self, identity: IdentityT, session_id: str) -> ServiceT | None:
+        self._validate_session_id(session_id)
+        with self._lock:
+            self._raise_if_closed()
+            self._raise_if_retired(identity, session_id)
+            entry = self._services.get(identity)
+            if entry is None:
+                return None
+            self._validate_session(identity, session_id, entry.session_id)
+            entry.last_seen = self._clock()
+            return entry.service
 
     def unregister(self, identity: IdentityT, session_id: str) -> bool:
         self._validate_session_id(session_id)
         service = None
 
         with self._lock:
+            self._raise_if_closed()
             self._raise_if_retired(identity, session_id)
 
-            reaping = self._reaping.get(identity)
-            if reaping is not None:
-                self._validate_session(identity, session_id, reaping.session_id)
+            expiring = self._expiring.get(identity)
+            if expiring is not None:
+                self._validate_session(identity, session_id, expiring.session_id)
                 self._retire_session_locked(identity, session_id)
                 return True
 
@@ -143,57 +209,63 @@ class ServiceRegistry(Generic[IdentityT, ServiceT]):
         self._close_service(service)
         return True
 
-    def touch(self, identity: IdentityT, session_id: str) -> bool:
-        self._validate_session_id(session_id)
-        with self._lock:
-            self._raise_if_retired(identity, session_id)
-            entry = self._services.get(identity)
-            if entry is None:
-                return False
-            self._validate_session(identity, session_id, entry.session_id)
-            entry.last_seen = self._clock()
-            return True
+    def expire_leases(self) -> int:
+        with self._expiration_lock:
+            stale_before = self._clock() - self._lease_timeout_s
+            with self._lock:
+                if self._closed:
+                    return 0
+                expired_services = [
+                    (identity, entry) for identity, entry in self._services.items() if entry.last_seen <= stale_before
+                ]
+                for identity, entry in expired_services:
+                    del self._services[identity]
+                    self._expiring[identity] = entry
 
-    def get(self, identity: IdentityT, session_id: str | None = None) -> ServiceT | None:
-        with self._lock:
-            if session_id is not None:
-                self._validate_session_id(session_id)
-                self._raise_if_retired(identity, session_id)
-
-            entry = self._services.get(identity)
-            if entry is None:
-                return None
-            if session_id is not None:
-                self._validate_session(identity, session_id, entry.session_id)
-                entry.last_seen = self._clock()
-            return entry.service
-
-    def reap_stale(self, stale_before: float) -> int:
-        with self._lock:
-            stale_services = [
-                (identity, entry) for identity, entry in self._services.items() if entry.last_seen < stale_before
-            ]
-            for identity, entry in stale_services:
-                del self._services[identity]
-                self._reaping[identity] = entry
-
-        for identity, entry in stale_services:
-            self._close_service_safely(entry.service)
-            self._finish_reap(identity, entry)
-        return len(stale_services)
+            for identity, entry in expired_services:
+                self._close_service_safely(entry.service)
+                self._finish_expiration(identity, entry)
+            return len(expired_services)
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        self._stop_maintenance()
+        with self._expiration_lock, self._lock:
             services = [entry.service for entry in self._services.values()]
-            services.extend(entry.service for entry in self._reaping.values())
+            services.extend(entry.service for entry in self._expiring.values())
             self._services.clear()
             self._registering.clear()
-            self._reaping.clear()
+            self._expiring.clear()
             self._recoverable_sessions.clear()
             self._retired_sessions.clear()
 
         for service in services:
             self._close_service_safely(service)
+
+    def _maintenance_loop(self) -> None:
+        while not self._maintenance_stop.wait(self._check_interval_s):
+            try:
+                self.expire_leases()
+            except Exception:
+                logger.exception("%s service lifecycle maintenance failed", self._service_name)
+
+    def _stop_maintenance(self) -> None:
+        with self._maintenance_lock:
+            thread = self._maintenance_thread
+            if thread is None:
+                return
+            self._maintenance_stop.set()
+
+        if thread is not threading.current_thread():
+            thread.join()
+
+        with self._maintenance_lock:
+            if self._maintenance_thread is thread:
+                self._maintenance_thread = None
 
     def _prepare_recoverable_locked(self, identity: IdentityT, session_id: str, fingerprint: bytes) -> None:
         recoverable = self._recoverable_sessions.get(identity)
@@ -238,8 +310,10 @@ class ServiceRegistry(Generic[IdentityT, ServiceT]):
         flight: _RegistrationFlight[ServiceT],
         service: ServiceT,
     ) -> None:
+        self._raise_if_closed()
         current_flight = self._registering.get(identity)
-        assert current_flight is flight
+        if current_flight is not flight:
+            raise RuntimeError(f"{self._service_name} {identity!r} registration is no longer active")
 
         self._services[identity] = _ServiceEntry(session_id, fingerprint, service, self._clock())
         recoverable = self._recoverable_sessions.get(identity)
@@ -263,16 +337,20 @@ class ServiceRegistry(Generic[IdentityT, ServiceT]):
         if not flight.future.done():
             flight.future.set_exception(exc)
 
-    def _finish_reap(self, identity: IdentityT, entry: _ServiceEntry[ServiceT]) -> None:
+    def _finish_expiration(self, identity: IdentityT, entry: _ServiceEntry[ServiceT]) -> None:
         with self._lock:
-            if self._reaping.get(identity) is not entry:
+            if self._expiring.get(identity) is not entry:
                 return
-            del self._reaping[identity]
+            del self._expiring[identity]
             if entry.session_id not in self._retired_sessions.get(identity, ()):
                 self._recoverable_sessions[identity] = _RecoverableSession(entry.session_id, entry.fingerprint)
 
     def _retire_session_locked(self, identity: IdentityT, session_id: str) -> None:
         self._retired_sessions.setdefault(identity, set()).add(session_id)
+
+    def _raise_if_closed(self) -> None:
+        if self._closed:
+            raise RuntimeError(f"{self._service_name} lifecycle manager is closed")
 
     def _raise_if_retired(self, identity: IdentityT, session_id: str) -> None:
         if session_id in self._retired_sessions.get(identity, ()):

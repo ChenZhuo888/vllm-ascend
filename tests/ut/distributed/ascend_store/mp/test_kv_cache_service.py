@@ -1,9 +1,10 @@
+import threading
 from types import SimpleNamespace
 
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import encode_registration
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_service import KVCacheService
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_service import KVCacheServiceManager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
     SchedulerRegistration,
     WorkerRegistration,
@@ -17,6 +18,10 @@ class _FakeScheduler:
         self._identity = identity
         self._lookup_handler = lookup_handler
         self.store_scheduler = object()
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens: int) -> tuple[int, bool]:
         matched_tokens = self._lookup_handler(
@@ -31,10 +36,17 @@ class _FakeScheduler:
 
 
 class _FakeWorker:
-    def __init__(self, matched_tokens: int = 0):
+    def __init__(self, matched_tokens: int = 0, closed: threading.Event | None = None):
         self._matched_tokens = matched_tokens
+        self._closed = closed
         self.bound_store = None
         self.lookup_hashes = None
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
+        if self._closed is not None:
+            self._closed.set()
 
     def bind_lookup_store(self, store) -> None:
         self.bound_store = store
@@ -89,16 +101,16 @@ def test_lookup_store_is_bound_regardless_of_registration_order(worker_first: bo
         scheduler = _FakeScheduler(registration.identity, lookup_handler)
         return scheduler
 
-    service = KVCacheService(scheduler_factory, lambda registration: worker)
+    service_manager = KVCacheServiceManager(scheduler_factory, lambda registration: worker)
     scheduler_registration = _scheduler_registration("scheduler-session")
     worker_registration = _worker_registration("worker-session")
 
     if worker_first:
-        service.register_worker(worker_registration, encode_registration(worker_registration))
-        service.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
+        service_manager.register_worker(worker_registration, encode_registration(worker_registration))
+        service_manager.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
     else:
-        service.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
-        service.register_worker(worker_registration, encode_registration(worker_registration))
+        service_manager.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
+        service_manager.register_worker(worker_registration, encode_registration(worker_registration))
 
     assert scheduler is not None
     assert worker.bound_store is scheduler.store_scheduler
@@ -113,16 +125,16 @@ def test_new_scheduler_session_rebinds_existing_worker_store() -> None:
         schedulers.append(scheduler)
         return scheduler
 
-    service = KVCacheService(scheduler_factory, lambda registration: worker)
+    service_manager = KVCacheServiceManager(scheduler_factory, lambda registration: worker)
     worker_registration = _worker_registration("worker-session")
     old_scheduler = _scheduler_registration("old-session")
     new_scheduler = _scheduler_registration("new-session")
 
-    service.register_worker(worker_registration, encode_registration(worker_registration))
-    service.register_scheduler(old_scheduler, encode_registration(old_scheduler))
+    service_manager.register_worker(worker_registration, encode_registration(worker_registration))
+    service_manager.register_scheduler(old_scheduler, encode_registration(old_scheduler))
     assert worker.bound_store is schedulers[0].store_scheduler
 
-    service.register_scheduler(new_scheduler, encode_registration(new_scheduler))
+    service_manager.register_scheduler(new_scheduler, encode_registration(new_scheduler))
     assert worker.bound_store is schedulers[1].store_scheduler
 
 
@@ -133,17 +145,17 @@ def test_lookup_routes_to_rank_zero_worker_in_the_same_dp_group() -> None:
         identity = registration.identity
         return workers[(identity.data_parallel_rank, identity.rank)]
 
-    service = KVCacheService(_create_scheduler, worker_factory)
+    service_manager = KVCacheServiceManager(_create_scheduler, worker_factory)
     for data_parallel_rank, rank in workers:
         registration = _worker_registration(
             f"worker-{data_parallel_rank}-{rank}",
             rank,
             data_parallel_rank,
         )
-        service.register_worker(registration, encode_registration(registration))
+        service_manager.register_worker(registration, encode_registration(registration))
 
     scheduler_registration = _scheduler_registration("scheduler-session")
-    service.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
+    service_manager.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
     request = SimpleNamespace(
         request_id="request-0",
         prompt_token_ids=list(range(64)),
@@ -151,7 +163,8 @@ def test_lookup_routes_to_rank_zero_worker_in_the_same_dp_group() -> None:
         num_tokens=64,
     )
 
-    assert service.lookup(scheduler_registration.identity, scheduler_registration.session_id, request, 0) == (16, False)
+    result = service_manager.lookup(scheduler_registration.identity, scheduler_registration.session_id, request, 0)
+    assert result == (16, False)
     assert workers[(0, 0)].lookup_hashes == [block_hash.hex() for block_hash in _BLOCK_HASHES]
     assert workers[(0, 1)].lookup_hashes is None
     assert workers[(1, 0)].lookup_hashes is None
@@ -162,12 +175,12 @@ def test_lookup_routes_to_rank_zero_worker_in_the_same_dp_group() -> None:
 
 def test_lookup_does_not_fall_back_to_a_non_coordinator_worker() -> None:
     worker = _FakeWorker(32)
-    service = KVCacheService(_create_scheduler, lambda registration: worker)
+    service_manager = KVCacheServiceManager(_create_scheduler, lambda registration: worker)
     worker_registration = _worker_registration("worker-session", rank=1)
     scheduler_registration = _scheduler_registration("scheduler-session")
 
-    service.register_worker(worker_registration, encode_registration(worker_registration))
-    service.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
+    service_manager.register_worker(worker_registration, encode_registration(worker_registration))
+    service_manager.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
     request = SimpleNamespace(
         request_id="request-0",
         prompt_token_ids=list(range(32)),
@@ -175,6 +188,42 @@ def test_lookup_does_not_fall_back_to_a_non_coordinator_worker() -> None:
         num_tokens=32,
     )
 
-    assert service.lookup(scheduler_registration.identity, scheduler_registration.session_id, request, 0) == (0, False)
+    result = service_manager.lookup(scheduler_registration.identity, scheduler_registration.session_id, request, 0)
+    assert result == (0, False)
     assert worker.bound_store is None
     assert worker.lookup_hashes is None
+
+
+def test_manager_expires_idle_worker_while_lookup_renews_scheduler() -> None:
+    now = [0.0]
+    worker_closed = threading.Event()
+    worker = _FakeWorker(closed=worker_closed)
+    service_manager = KVCacheServiceManager(
+        _create_scheduler,
+        lambda registration: worker,
+        lease_timeout_s=10.0,
+        lease_check_interval_s=0.01,
+        clock=lambda: now[0],
+    )
+    scheduler_registration = _scheduler_registration("scheduler-session")
+    worker_registration = _worker_registration("worker-session")
+    request = SimpleNamespace(
+        request_id="request-0",
+        prompt_token_ids=list(range(16)),
+        block_hashes=_BLOCK_HASHES,
+        num_tokens=16,
+    )
+
+    service_manager.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
+    service_manager.register_worker(worker_registration, encode_registration(worker_registration))
+    now[0] = 9.0
+    service_manager.lookup(scheduler_registration.identity, scheduler_registration.session_id, request, 0)
+    now[0] = 11.0
+
+    service_manager.start()
+    try:
+        assert worker_closed.wait(1), "Idle Worker lease did not expire"
+        assert service_manager.scheduler_count == 1
+        assert service_manager.worker_count == 0
+    finally:
+        service_manager.close()

@@ -14,7 +14,7 @@ from .kv_cache_protocol import (
     encode_lookup_response,
     lookup_affinity_key,
 )
-from .kv_cache_service import KVCacheService
+from .kv_cache_service import KVCacheServiceManager
 from .registration import (
     SchedulerFactory,
     SchedulerRegistration,
@@ -22,10 +22,7 @@ from .registration import (
     WorkerRegistration,
 )
 from .rpc import ExecutionMode, HandlerSpec, MPServer, MPServerBusyError
-from .service import ServiceBusyError, ServiceReaper
-
-_SERVICE_STALE_TIMEOUT_S = 60.0
-_SERVICE_REAP_INTERVAL_S = 5.0
+from .service import ServiceBusyError
 
 
 class KVCacheServer:
@@ -38,7 +35,7 @@ class KVCacheServer:
         scheduler_factory: SchedulerFactory | None = None,
         worker_factory: WorkerFactory | None = None,
     ):
-        self._service = KVCacheService(scheduler_factory, worker_factory)
+        self._service = KVCacheServiceManager(scheduler_factory, worker_factory)
         self._rpc_server = MPServer(
             bind_url,
             max_workers=max_workers,
@@ -51,12 +48,6 @@ class KVCacheServer:
                 KVCacheMethod.RENEW_WORKER: HandlerSpec(self._handle_renew_worker, ExecutionMode.INLINE),
                 KVCacheMethod.LOOKUP: HandlerSpec(self._handle_lookup, ExecutionMode.AFFINITY, lookup_affinity_key),
             },
-        )
-        self._service_reaper = ServiceReaper(
-            self._service.reap_stale,
-            stale_timeout_s=_SERVICE_STALE_TIMEOUT_S,
-            interval_s=_SERVICE_REAP_INTERVAL_S,
-            thread_name="ascend-store-kv-reaper",
         )
 
     def __enter__(self) -> "KVCacheServer":
@@ -124,13 +115,12 @@ class KVCacheServer:
         return encode_lookup_response(matched_tokens, is_async)
 
     def run(self) -> None:
-        self._service_reaper.start()
+        self._service.start()
         try:
             self._rpc_server.run()
         finally:
-            self._service_reaper.stop()
+            self._service.close()
 
     def close(self) -> None:
-        self._service_reaper.stop()
         self._rpc_server.close()
         self._service.close()

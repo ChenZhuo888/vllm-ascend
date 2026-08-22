@@ -189,7 +189,7 @@ def test_missing_service_during_renewal_reregisters_the_same_session() -> None:
         rpc_client.is_transport_connected = True
         rpc_client.request.side_effect = [
             [b"OK"],
-            MPRemoteError("ServiceNotRegisteredError: service was reaped"),
+            MPRemoteError("ServiceNotRegisteredError: service lease expired"),
             [b"OK"],
         ]
 
