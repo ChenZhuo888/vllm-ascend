@@ -10,13 +10,13 @@ from unittest.mock import patch
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheMethod, KVCacheServer
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache import WorkerLookupHandler
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import encode_registration
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
     SchedulerIdentity,
     SchedulerRegistration,
     WorkerIdentity,
+    WorkerLookupHandler,
     WorkerRegistration,
-    encode_registration,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPClient,
@@ -36,12 +36,12 @@ class _FakeWorker:
         self._matched_tokens = matched_tokens
 
     def lookup_scheduler(
-            self,
-            token_len: int,
-            block_hashes: list[str],
-            kv_cache_group_ids: list[int] | None = None,
-            use_layerwise: bool = False,
-            hbm_hit_tokens: int = 0,
+        self,
+        token_len: int,
+        block_hashes: list[str],
+        kv_cache_group_ids: list[int] | None = None,
+        use_layerwise: bool = False,
+        hbm_hit_tokens: int = 0,
     ) -> int:
         return min(token_len, self._matched_tokens)
 
@@ -77,10 +77,10 @@ class _BlockingScheduler:
 
 
 def _make_vllm_config(
-        engine_id: str = "engine-0",
-        rank: int = 0,
-        data_parallel_rank: int = 0,
-        marker: str = "",
+    engine_id: str = "engine-0",
+    rank: int = 0,
+    data_parallel_rank: int = 0,
+    marker: str = "",
 ):
     parallel_config = SimpleNamespace(rank=rank, data_parallel_rank=data_parallel_rank)
     kv_transfer_config = SimpleNamespace(engine_id=engine_id)
@@ -101,8 +101,8 @@ def _make_request(request_id: str = "request-0"):
 
 
 def _create_scheduler(
-        registration: SchedulerRegistration,
-        lookup_handler: WorkerLookupHandler,
+    registration: SchedulerRegistration,
+    lookup_handler: WorkerLookupHandler,
 ) -> _FakeScheduler:
     return _FakeScheduler(registration.identity, lookup_handler)
 
@@ -113,10 +113,10 @@ def _create_worker(registration: WorkerRegistration, worker_hits: dict[tuple[int
 
 
 def _create_blocking_scheduler(
-        _registration: SchedulerRegistration,
-        _lookup_handler: WorkerLookupHandler,
-        started_events,
-        release_events,
+    _registration: SchedulerRegistration,
+    _lookup_handler: WorkerLookupHandler,
+    started_events,
+    release_events,
 ) -> _BlockingScheduler:
     return _BlockingScheduler(started_events, release_events)
 
@@ -155,8 +155,8 @@ def _run_affinity_server(bind_url: str, conn, started_events, release_events) ->
 
 
 def _start_server(
-        bind_url: str = _DEFAULT_URL,
-        worker_hits: dict[tuple[int, int], int] | None = None,
+    bind_url: str = _DEFAULT_URL,
+    worker_hits: dict[tuple[int, int], int] | None = None,
 ) -> tuple[mp.Process, str]:
     context = mp.get_context("spawn")
     parent_conn, child_conn = context.Pipe()

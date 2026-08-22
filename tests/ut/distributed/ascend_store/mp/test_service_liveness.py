@@ -5,13 +5,13 @@ from unittest.mock import patch
 
 import pytest
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import encode_registration
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
     KVCacheServiceRegistry,
     RegistrationConflictError,
     SchedulerRegistration,
     StaleSessionError,
     WorkerRegistration,
-    encode_registration,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import MPServerBusyError
 
@@ -52,9 +52,7 @@ class _FakeWorker:
         self.bound_store = store
 
 
-def _make_vllm_config(
-        engine_id: str = "engine-0", rank: int = 0, data_parallel_rank: int = 0, marker: str = ""
-):
+def _make_vllm_config(engine_id: str = "engine-0", rank: int = 0, data_parallel_rank: int = 0, marker: str = ""):
     return SimpleNamespace(
         kv_transfer_config=SimpleNamespace(engine_id=engine_id),
         parallel_config=SimpleNamespace(rank=rank, data_parallel_rank=data_parallel_rank),

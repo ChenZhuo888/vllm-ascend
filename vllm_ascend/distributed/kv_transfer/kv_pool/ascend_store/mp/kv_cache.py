@@ -1,12 +1,10 @@
 """KV cache business facade for AscendStore multiprocessing mode."""
 
 import contextlib
-import enum
 import logging
 import threading
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from vllm.config import VllmConfig
@@ -14,6 +12,21 @@ from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 
+from .kv_cache_protocol import (
+    ACK_RESPONSE,
+    KVCacheMethod,
+    decode_lookup_request,
+    decode_lookup_response,
+    decode_registration,
+    decode_scheduler_session,
+    decode_worker_session,
+    encode_lookup_request,
+    encode_lookup_response,
+    encode_registration,
+    encode_scheduler_session,
+    encode_worker_session,
+    lookup_affinity_key,
+)
 from .registration import (
     KVCacheServiceRegistry,
     SchedulerFactory,
@@ -23,8 +36,6 @@ from .registration import (
     WorkerIdentity,
     WorkerLookupHandler,
     WorkerRegistration,
-    decode_registration,
-    encode_registration,
 )
 from .rpc import (
     ExecutionMode,
@@ -51,13 +62,6 @@ _HEARTBEAT_INTERVAL_MS = 1000
 _HEARTBEAT_TIMEOUT_MS = 1000
 _SERVICE_STALE_TIMEOUT_S = 60.0
 _SERVICE_REAP_INTERVAL_S = 5.0
-_INTEGER_BYTES = 8
-_BYTE_ORDER = "big"
-_LOOKUP_HEADER_PAYLOADS = 6
-_REGISTRATION_RESPONSE = b"OK"
-_UNREGISTRATION_RESPONSE = b"OK"
-_ASYNC_RESPONSE = b"\x01"
-_SYNC_RESPONSE = b"\x00"
 _SERVICE_NOT_REGISTERED_PREFIX = "ServiceNotRegisteredError:"
 _STALE_SESSION_PREFIX = "StaleSessionError:"
 
@@ -68,178 +72,6 @@ class ServiceNotRegisteredError(RuntimeError):
 
 class ServiceSessionExpiredError(RuntimeError):
     pass
-
-
-class KVCacheMethod(str, enum.Enum):
-    REGISTER_SCHEDULER = "REGISTER_SCHEDULER"
-    REGISTER_WORKER = "REGISTER_WORKER"
-    UNREGISTER_SCHEDULER = "UNREGISTER_SCHEDULER"
-    UNREGISTER_WORKER = "UNREGISTER_WORKER"
-    HEARTBEAT_SCHEDULER = "HEARTBEAT_SCHEDULER"
-    HEARTBEAT_WORKER = "HEARTBEAT_WORKER"
-    LOOKUP = "LOOKUP"
-
-
-@dataclass
-class _LookupRequestView:
-    request_id: str
-    prompt_token_ids: range
-    block_hashes: list[BlockHash]
-    num_tokens: int
-
-
-def _encode_non_negative_int(value: int, field_name: str) -> bytes:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise TypeError(f"{field_name} must be an integer, got {type(value).__name__}")
-    if value < 0:
-        raise ValueError(f"{field_name} must not be negative, got {value}")
-
-    try:
-        return value.to_bytes(_INTEGER_BYTES, byteorder=_BYTE_ORDER)
-    except OverflowError as exc:
-        raise ValueError(f"{field_name} is too large: {value}") from exc
-
-
-def _decode_non_negative_int(payload: bytes, field_name: str) -> int:
-    if not isinstance(payload, bytes):
-        raise MPProtocolError(f"{field_name} payload must be bytes, got {type(payload).__name__}")
-    if len(payload) != _INTEGER_BYTES:
-        raise MPProtocolError(f"{field_name} payload must contain {_INTEGER_BYTES} bytes, got {len(payload)}")
-    return int.from_bytes(payload, byteorder=_BYTE_ORDER)
-
-
-def _encode_text(value: str, field_name: str) -> bytes:
-    if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be a string, got {type(value).__name__}")
-    if not value:
-        raise ValueError(f"{field_name} must not be empty")
-    return value.encode()
-
-
-def _decode_text(payload: bytes, field_name: str) -> str:
-    try:
-        value = payload.decode()
-    except UnicodeDecodeError as exc:
-        raise MPProtocolError(f"{field_name} payload must be valid UTF-8") from exc
-
-    if not value:
-        raise MPProtocolError(f"{field_name} payload must not be empty")
-    return value
-
-
-def _encode_block_hash(block_hash: BlockHash) -> bytes:
-    if not isinstance(block_hash, bytes):
-        raise TypeError(f"block_hash must be bytes, got {type(block_hash).__name__}")
-    if not block_hash:
-        raise ValueError("block_hash must not be empty")
-    return block_hash
-
-
-def _decode_block_hash(payload: bytes) -> BlockHash:
-    if not isinstance(payload, bytes):
-        raise MPProtocolError(f"block_hash payload must be bytes, got {type(payload).__name__}")
-    if not payload:
-        raise MPProtocolError("block_hash payload must not be empty")
-    return payload
-
-
-def _encode_scheduler_session(identity: SchedulerIdentity, session_id: str) -> tuple[bytes, ...]:
-    return (
-        _encode_text(identity.engine_id, "engine_id"),
-        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
-        _encode_text(session_id, "session_id"),
-    )
-
-
-def _decode_scheduler_session(payloads: tuple[bytes, ...]) -> tuple[SchedulerIdentity, str]:
-    if len(payloads) != 3:
-        raise MPProtocolError(f"Scheduler session expects 3 payloads, got {len(payloads)}")
-    identity = SchedulerIdentity(
-        engine_id=_decode_text(payloads[0], "engine_id"),
-        data_parallel_rank=_decode_non_negative_int(payloads[1], "data_parallel_rank"),
-    )
-    return identity, _decode_text(payloads[2], "session_id")
-
-
-def _encode_worker_session(identity: WorkerIdentity, session_id: str) -> tuple[bytes, ...]:
-    return (
-        _encode_text(identity.engine_id, "engine_id"),
-        _encode_non_negative_int(identity.rank, "rank"),
-        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
-        _encode_text(session_id, "session_id"),
-    )
-
-
-def _decode_worker_session(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
-    if len(payloads) != 4:
-        raise MPProtocolError(f"Worker session expects 4 payloads, got {len(payloads)}")
-    identity = WorkerIdentity(
-        engine_id=_decode_text(payloads[0], "engine_id"),
-        rank=_decode_non_negative_int(payloads[1], "rank"),
-        data_parallel_rank=_decode_non_negative_int(payloads[2], "data_parallel_rank"),
-    )
-    return identity, _decode_text(payloads[3], "session_id")
-
-
-def _encode_lookup_request(
-    registration: SchedulerRegistration, request: Request, num_computed_tokens: int
-) -> tuple[bytes, ...]:
-    identity = registration.identity
-    prompt_token_count = len(request.prompt_token_ids)
-    payloads = [
-        _encode_text(identity.engine_id, "engine_id"),
-        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
-        _encode_text(request.request_id, "request_id"),
-        _encode_non_negative_int(prompt_token_count, "prompt_token_count"),
-        _encode_non_negative_int(request.num_tokens, "num_tokens"),
-        _encode_non_negative_int(num_computed_tokens, "num_computed_tokens"),
-    ]
-    payloads.extend(_encode_block_hash(block_hash) for block_hash in request.block_hashes)
-    payloads.append(_encode_text(registration.session_id, "session_id"))
-    return tuple(payloads)
-
-
-def _decode_lookup_identity(payloads: tuple[bytes, ...]) -> SchedulerIdentity:
-    if len(payloads) < _LOOKUP_HEADER_PAYLOADS:
-        raise MPProtocolError(f"LOOKUP expects at least {_LOOKUP_HEADER_PAYLOADS} payloads, got {len(payloads)}")
-
-    return SchedulerIdentity(
-        engine_id=_decode_text(payloads[0], "engine_id"),
-        data_parallel_rank=_decode_non_negative_int(payloads[1], "data_parallel_rank"),
-    )
-
-
-def _lookup_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
-    return _decode_lookup_identity(payloads)
-
-
-def _decode_lookup_request(payloads: tuple[bytes, ...]) -> tuple[SchedulerIdentity, str, _LookupRequestView, int]:
-    identity = _decode_lookup_identity(payloads)
-    if len(payloads) == _LOOKUP_HEADER_PAYLOADS:
-        raise MPProtocolError("LOOKUP expects a session_id payload")
-
-    request_id = _decode_text(payloads[2], "request_id")
-    prompt_token_count = _decode_non_negative_int(payloads[3], "prompt_token_count")
-    num_tokens = _decode_non_negative_int(payloads[4], "num_tokens")
-    num_computed_tokens = _decode_non_negative_int(payloads[5], "num_computed_tokens")
-    block_hashes = [_decode_block_hash(payload) for payload in payloads[_LOOKUP_HEADER_PAYLOADS:-1]]
-    session_id = _decode_text(payloads[-1], "session_id")
-
-    request = _LookupRequestView(
-        request_id=request_id,
-        prompt_token_ids=range(prompt_token_count),
-        block_hashes=block_hashes,
-        num_tokens=num_tokens,
-    )
-    return identity, session_id, request, num_computed_tokens
-
-
-def _decode_async_response(payload: bytes) -> bool:
-    if payload == _ASYNC_RESPONSE:
-        return True
-    if payload == _SYNC_RESPONSE:
-        return False
-    raise MPProtocolError(f"Invalid LOOKUP async response: {payload!r}")
 
 
 class KVCacheClient:
@@ -325,10 +157,10 @@ class KVCacheClient:
 
         if isinstance(registration, SchedulerRegistration):
             method = KVCacheMethod.HEARTBEAT_SCHEDULER
-            payloads = _encode_scheduler_session(registration.identity, registration.session_id)
+            payloads = encode_scheduler_session(registration.identity, registration.session_id)
         else:
             method = KVCacheMethod.HEARTBEAT_WORKER
-            payloads = _encode_worker_session(registration.identity, registration.session_id)
+            payloads = encode_worker_session(registration.identity, registration.session_id)
 
         try:
             responses = self._rpc_client.request(method, payloads, timeout_ms=_HEARTBEAT_TIMEOUT_MS)
@@ -345,7 +177,7 @@ class KVCacheClient:
                 return
             raise
 
-        if responses != [_REGISTRATION_RESPONSE]:
+        if responses != [ACK_RESPONSE]:
             raise MPProtocolError(f"{method.value} expects an OK response, got {responses!r}")
 
     def _try_register(self) -> bool:
@@ -384,7 +216,7 @@ class KVCacheClient:
                 raise ServiceSessionExpiredError(str(exc)) from exc
             raise
 
-        if responses != [_REGISTRATION_RESPONSE]:
+        if responses != [ACK_RESPONSE]:
             raise MPProtocolError(f"{method.value} expects an OK response, got {responses!r}")
 
         with self._registration_lock:
@@ -420,7 +252,7 @@ class KVCacheClient:
     ) -> tuple[int, bool]:
         self._raise_if_superseded()
         registration = self._get_scheduler_registration()
-        payloads = _encode_lookup_request(registration, request, num_computed_tokens)
+        payloads = encode_lookup_request(registration, request, num_computed_tokens)
 
         if not self.is_registered and not self._try_register():
             return 0, False
@@ -441,11 +273,7 @@ class KVCacheClient:
                 raise ServiceSessionExpiredError(str(exc)) from exc
             raise
 
-        if len(responses) != 2:
-            raise MPProtocolError(f"LOOKUP expects 2 response payloads, got {len(responses)}")
-
-        matched_tokens = _decode_non_negative_int(responses[0], "matched_tokens")
-        return matched_tokens, _decode_async_response(responses[1])
+        return decode_lookup_response(responses)
 
     def _unregister(self) -> None:
         with self._registration_lock:
@@ -459,14 +287,14 @@ class KVCacheClient:
         registration = configured_registration[0]
         if isinstance(registration, SchedulerRegistration):
             method = KVCacheMethod.UNREGISTER_SCHEDULER
-            payloads = _encode_scheduler_session(registration.identity, registration.session_id)
+            payloads = encode_scheduler_session(registration.identity, registration.session_id)
         else:
             method = KVCacheMethod.UNREGISTER_WORKER
-            payloads = _encode_worker_session(registration.identity, registration.session_id)
+            payloads = encode_worker_session(registration.identity, registration.session_id)
 
         try:
             responses = self._rpc_client.request(method, payloads, timeout_ms=_REGISTRATION_TIMEOUT_MS)
-            if responses != [_UNREGISTRATION_RESPONSE]:
+            if responses != [ACK_RESPONSE]:
                 raise MPProtocolError(f"{method.value} expects an OK response, got {responses!r}")
         except Exception:
             # close() is best-effort cleanup; transport recovery is no longer useful once the client is closing.
@@ -508,7 +336,7 @@ class KVCacheServer:
                 KVCacheMethod.UNREGISTER_WORKER: self._handle_unregister_worker,
                 KVCacheMethod.HEARTBEAT_SCHEDULER: HandlerSpec(self._handle_scheduler_heartbeat, ExecutionMode.INLINE),
                 KVCacheMethod.HEARTBEAT_WORKER: HandlerSpec(self._handle_worker_heartbeat, ExecutionMode.INLINE),
-                KVCacheMethod.LOOKUP: HandlerSpec(self._handle_lookup, ExecutionMode.AFFINITY, _lookup_affinity_key),
+                KVCacheMethod.LOOKUP: HandlerSpec(self._handle_lookup, ExecutionMode.AFFINITY, lookup_affinity_key),
             },
         )
         self._service_reaper = ServiceReaper(
@@ -555,34 +383,34 @@ class KVCacheServer:
     def _handle_register_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         registration = decode_registration(payloads, SchedulerRegistration)
         self._registry.register_scheduler(registration, payloads[0])
-        return (_REGISTRATION_RESPONSE,)
+        return (ACK_RESPONSE,)
 
     def _handle_register_worker(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         registration = decode_registration(payloads, WorkerRegistration)
         self._registry.register_worker(registration, payloads[0])
-        return (_REGISTRATION_RESPONSE,)
+        return (ACK_RESPONSE,)
 
     def _handle_unregister_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id = _decode_scheduler_session(payloads)
+        identity, session_id = decode_scheduler_session(payloads)
         self._registry.unregister_scheduler(identity, session_id)
-        return (_UNREGISTRATION_RESPONSE,)
+        return (ACK_RESPONSE,)
 
     def _handle_unregister_worker(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id = _decode_worker_session(payloads)
+        identity, session_id = decode_worker_session(payloads)
         self._registry.unregister_worker(identity, session_id)
-        return (_UNREGISTRATION_RESPONSE,)
+        return (ACK_RESPONSE,)
 
     def _handle_scheduler_heartbeat(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id = _decode_scheduler_session(payloads)
+        identity, session_id = decode_scheduler_session(payloads)
         if not self._registry.touch_scheduler(identity, session_id):
             raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
-        return (_REGISTRATION_RESPONSE,)
+        return (ACK_RESPONSE,)
 
     def _handle_worker_heartbeat(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id = _decode_worker_session(payloads)
+        identity, session_id = decode_worker_session(payloads)
         if not self._registry.touch_worker(identity, session_id):
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
-        return (_REGISTRATION_RESPONSE,)
+        return (ACK_RESPONSE,)
 
     def _lookup_worker(
         self,
@@ -604,16 +432,13 @@ class KVCacheServer:
         return worker.lookup_scheduler(token_len, hash_strings, kv_cache_group_ids, use_layerwise, hbm_hit_tokens)
 
     def _handle_lookup(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id, request, num_computed_tokens = _decode_lookup_request(payloads)
+        identity, session_id, request, num_computed_tokens = decode_lookup_request(payloads)
         scheduler = self._registry.get_scheduler(identity, session_id)
         if scheduler is None:
             raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
 
         matched_tokens, is_async = scheduler.get_num_new_matched_tokens(cast(Request, request), num_computed_tokens)
-        return (
-            _encode_non_negative_int(matched_tokens, "matched_tokens"),
-            _ASYNC_RESPONSE if is_async else _SYNC_RESPONSE,
-        )
+        return encode_lookup_response(matched_tokens, is_async)
 
     def run(self) -> None:
         self._service_reaper.start()

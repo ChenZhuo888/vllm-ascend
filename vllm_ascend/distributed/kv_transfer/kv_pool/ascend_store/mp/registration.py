@@ -10,14 +10,13 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING
 
-import cloudpickle
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from .rpc import MPProtocolError, MPServerBusyError
+from .rpc import MPServerBusyError
 from .service import RegistrationConflictError as RegistrationConflictError
 from .service import ServiceBusyError, ServiceRegistry
 from .service import StaleSessionError as StaleSessionError
@@ -28,7 +27,6 @@ if TYPE_CHECKING:
 
 _LEGACY_SESSION_ID = "legacy"
 
-RegistrationT = TypeVar("RegistrationT", bound="SchedulerRegistration | WorkerRegistration")
 WorkerLookupHandler = Callable[["SchedulerIdentity", int, Sequence[BlockHash], list[int] | None, bool, int], int]
 SchedulerFactory = Callable[["SchedulerRegistration", WorkerLookupHandler], "KVPoolScheduler"]
 WorkerFactory = Callable[["WorkerRegistration"], "KVPoolWorker"]
@@ -154,27 +152,6 @@ class WorkerRegistration:
             kv_cache_config=kv_cache_config,
             session_id=session_id,
         )
-
-
-def encode_registration(registration: SchedulerRegistration | WorkerRegistration) -> bytes:
-    try:
-        return cloudpickle.dumps(registration)
-    except Exception as exc:
-        raise MPProtocolError(f"Failed to encode {type(registration).__name__}") from exc
-
-
-def decode_registration(payloads: tuple[bytes, ...], expected_type: type[RegistrationT]) -> RegistrationT:
-    if len(payloads) != 1:
-        raise MPProtocolError(f"{expected_type.__name__} expects 1 payload, got {len(payloads)}")
-
-    try:
-        registration = cloudpickle.loads(payloads[0])
-    except Exception as exc:
-        raise MPProtocolError(f"Failed to decode {expected_type.__name__}") from exc
-
-    if not isinstance(registration, expected_type):
-        raise MPProtocolError(f"Expected {expected_type.__name__}, got {type(registration).__name__}")
-    return registration
 
 
 class KVCacheServiceRegistry:
