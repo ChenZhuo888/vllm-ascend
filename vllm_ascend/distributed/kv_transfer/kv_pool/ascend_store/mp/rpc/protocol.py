@@ -74,17 +74,17 @@ def decode_request(frames: Sequence[bytes]) -> tuple[bytes, str, tuple[bytes, ..
 
 
 def encode_response(
-        request_id: bytes,
-        method: str,
-        status: ResponseStatus,
-        payloads: Iterable[bytes] = (),
+    request_id: bytes,
+    method: str,
+    status: ResponseStatus,
+    payloads: Iterable[bytes] = (),
 ) -> MultipartMessage:
     _validate_frame(request_id, "request ID")
     return request_id, encode_method(method), encode_response_status(status), *_normalize_payloads(payloads)
 
 
 def decode_response(
-        frames: Sequence[bytes],
+    frames: Sequence[bytes],
 ) -> tuple[bytes, str, ResponseStatus, tuple[bytes, ...]]:
     if len(frames) < 3:
         raise MPProtocolError(f"Expected [request_id, method, status, *payloads], got {len(frames)} frames")

@@ -6,8 +6,7 @@ import threading
 from collections.abc import Callable, Hashable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from functools import partial
-from typing import Any, Generic, TypeVar
+from typing import Generic, Protocol, TypeVar
 
 from .error import MPServerBusyError
 
@@ -23,11 +22,47 @@ class ExecutionMode(str, enum.Enum):
     AFFINITY = "affinity"
 
 
+@dataclass(frozen=True)
+class ExecutionTask(Generic[_ResultT]):
+    """A callable task and its optional executor-specific affinity key."""
+
+    callback: Callable[[], _ResultT]
+    affinity_key: Hashable | None = None
+
+
+class TaskExecutor(Protocol):
+    """Common task execution contract used by the RPC server."""
+
+    def submit(self, task: ExecutionTask[_ResultT]) -> Future[_ResultT]: ...
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None: ...
+
+
 def _validate_limits(max_workers: int, max_pending_tasks: int) -> None:
     if max_workers <= 0:
         raise ValueError("max_workers must be greater than 0")
     if max_pending_tasks < 0:
         raise ValueError("max_pending_tasks must not be negative")
+
+
+class InlineExecutor:
+    """Execute tasks immediately in the submitting thread."""
+
+    def submit(self, task: ExecutionTask[_ResultT]) -> Future[_ResultT]:
+        future: Future[_ResultT] = Future()
+        if not future.set_running_or_notify_cancel():
+            return future
+
+        try:
+            result = task.callback()
+        except BaseException as exc:
+            future.set_exception(exc)
+        else:
+            future.set_result(result)
+        return future
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        pass
 
 
 class BoundedThreadPoolExecutor:
@@ -38,12 +73,12 @@ class BoundedThreadPoolExecutor:
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
         self._capacity = threading.BoundedSemaphore(max_workers + max_pending_tasks)
 
-    def submit(self, fn: Callable[..., _ResultT], *args: Any, **kwargs: Any) -> Future[_ResultT]:
+    def submit(self, task: ExecutionTask[_ResultT]) -> Future[_ResultT]:
         if not self._capacity.acquire(blocking=False):
             raise MPServerBusyError("Parallel executor is at capacity")
 
         try:
-            future = self._executor.submit(fn, *args, **kwargs)
+            future = self._executor.submit(task.callback)
         except BaseException:
             self._capacity.release()
             raise
@@ -61,7 +96,7 @@ class BoundedThreadPoolExecutor:
 @dataclass(frozen=True)
 class _AffinityTask(Generic[_ResultT]):
     future: Future[_ResultT]
-    callback: Callable[[], _ResultT]
+    task: ExecutionTask[_ResultT]
 
 
 class AffinityExecutor:
@@ -91,13 +126,10 @@ class AffinityExecutor:
         for thread in self._threads:
             thread.start()
 
-    def submit(
-            self,
-            affinity_key: Hashable,
-            fn: Callable[..., _ResultT],
-            *args: Any,
-            **kwargs: Any,
-    ) -> Future[_ResultT]:
+    def submit(self, task: ExecutionTask[_ResultT]) -> Future[_ResultT]:
+        if task.affinity_key is None:
+            raise ValueError("Affinity task must define an affinity key")
+
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("Affinity executor is closed")
@@ -105,14 +137,14 @@ class AffinityExecutor:
                 raise MPServerBusyError("Affinity executor is at capacity")
 
             try:
-                worker_index = self._get_worker_index(affinity_key)
+                worker_index = self._get_worker_index(task.affinity_key)
             except BaseException:
                 self._capacity.release()
                 raise
 
             future: Future[_ResultT] = Future()
             future.add_done_callback(self._release_capacity)
-            self._queues[worker_index].put_nowait(_AffinityTask(future, partial(fn, *args, **kwargs)))
+            self._queues[worker_index].put_nowait(_AffinityTask(future, task))
             return future
 
     def _get_worker_index(self, affinity_key: Hashable) -> int:
@@ -157,7 +189,7 @@ class AffinityExecutor:
                     continue
 
                 try:
-                    result = affinity_task.callback()
+                    result = affinity_task.task.callback()
                 except BaseException as exc:
                     affinity_task.future.set_exception(exc)
                 else:

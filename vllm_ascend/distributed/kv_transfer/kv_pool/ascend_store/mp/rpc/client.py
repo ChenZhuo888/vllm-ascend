@@ -158,10 +158,10 @@ class MPClient:
             self._notify_writer.send(b"\x01")
 
     def submit_request(
-            self,
-            method: str,
-            payloads: Sequence[bytes] | None = None,
-            timeout_ms: int | None = None,
+        self,
+        method: str,
+        payloads: Sequence[bytes] | None = None,
+        timeout_ms: int | None = None,
     ) -> Future[list[bytes]]:
         method_name = normalize_method(method)
 
@@ -182,10 +182,10 @@ class MPClient:
         return future
 
     def request(
-            self,
-            method: str,
-            payloads: Sequence[bytes] | None = None,
-            timeout_ms: int = 5000,
+        self,
+        method: str,
+        payloads: Sequence[bytes] | None = None,
+        timeout_ms: int = 5000,
     ) -> list[bytes]:
         return self.submit_request(method, payloads, timeout_ms=timeout_ms).result()
 
@@ -362,11 +362,11 @@ class MPClient:
         self._pending_requests.clear()
 
     def start_heartbeat(
-            self,
-            interval_ms: int = 10000,
-            timeout_ms: int | None = None,
-            recovery_callback: Callable[[], bool] | None = None,
-            heartbeat_callback: Callable[[], None] | None = None,
+        self,
+        interval_ms: int = 10000,
+        timeout_ms: int | None = None,
+        recovery_callback: Callable[[], bool] | None = None,
+        heartbeat_callback: Callable[[], None] | None = None,
     ) -> None:
         if interval_ms <= 0:
             raise ValueError(f"interval_ms must be greater than 0, got {interval_ms}")

@@ -12,6 +12,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.executor im
     AffinityExecutor,
     BoundedThreadPoolExecutor,
     ExecutionMode,
+    ExecutionTask,
+    InlineExecutor,
+    TaskExecutor,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.protocol import SystemMethod
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.server import HandlerSpec, MPServer, RequestHandler
@@ -20,7 +23,9 @@ __all__ = [
     "AffinityExecutor",
     "BoundedThreadPoolExecutor",
     "ExecutionMode",
+    "ExecutionTask",
     "HandlerSpec",
+    "InlineExecutor",
     "MPClient",
     "MPClientClosedError",
     "MPError",
@@ -32,4 +37,5 @@ __all__ = [
     "MPServerUnavailableError",
     "RequestHandler",
     "SystemMethod",
+    "TaskExecutor",
 ]

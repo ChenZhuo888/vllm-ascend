@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import threading
+from functools import partial
 
 import pytest
 import zmq
@@ -8,7 +9,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     AffinityExecutor,
     BoundedThreadPoolExecutor,
     ExecutionMode,
+    ExecutionTask,
     HandlerSpec,
+    InlineExecutor,
     MPClient,
     MPClientClosedError,
     MPRemoteError,
@@ -28,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.protocol im
 UPPERCASE_METHOD = "TEST_UPPERCASE"
 INVALID_RESPONSE_METHOD = "TEST_INVALID_RESPONSE"
 AFFINITY_METHOD = "TEST_AFFINITY"
+DEFAULT_AFFINITY_METHOD = "TEST_DEFAULT_AFFINITY"
 BLOCKING_METHOD = "TEST_BLOCKING"
 
 _WORKER_COUNT = 4
@@ -66,9 +70,9 @@ def _cleanup(client: MPClient | None, conn, process) -> None:
 
 
 def _send_ok_response(
-        router: zmq.Socket,
-        request: list[bytes],
-        responses: tuple[bytes, ...] | None = None,
+    router: zmq.Socket,
+    request: list[bytes],
+    responses: tuple[bytes, ...] | None = None,
 ) -> None:
     identity, *request_frames = request
     request_id, method, payloads = decode_request(request_frames)
@@ -134,6 +138,7 @@ def _run_server_with_injected_handlers(conn) -> None:
         UPPERCASE_METHOD: _uppercase_handler,
         INVALID_RESPONSE_METHOD: _invalid_response_handler,
         AFFINITY_METHOD: HandlerSpec(_affinity_handler, ExecutionMode.AFFINITY, _integer_affinity_key),
+        DEFAULT_AFFINITY_METHOD: HandlerSpec(_affinity_handler, ExecutionMode.AFFINITY),
     }
     server = MPServer("tcp://127.0.0.1:*", handlers=handlers, affinity_workers=2)
 
@@ -342,6 +347,9 @@ def test_server_uses_injected_handlers():
         assert client.request(AFFINITY_METHOD, [b"0"]) == first_worker
         assert client.request(AFFINITY_METHOD, [b"1"]) != first_worker
 
+        default_worker = client.request(DEFAULT_AFFINITY_METHOD, [b"0"])
+        assert client.request(DEFAULT_AFFINITY_METHOD, [b"1"]) == default_worker
+
         assert process.is_alive()
         assert client.ping() == "OK"
     finally:
@@ -475,11 +483,12 @@ def test_bounded_thread_pool_rejects_excess_work():
             raise TimeoutError("Timed out waiting to release the executor")
 
     try:
-        first_future = executor.submit(wait_for_release)
+        task = ExecutionTask(wait_for_release)
+        first_future = executor.submit(task)
         assert started.wait(5)
 
         with pytest.raises(MPServerBusyError, match="Parallel executor is at capacity"):
-            executor.submit(wait_for_release)
+            executor.submit(task)
 
         release.set()
         first_future.result(timeout=5)
@@ -505,9 +514,9 @@ def test_affinity_executor_serializes_same_key_on_same_thread():
         return index
 
     try:
-        futures = [executor.submit("engine-0", record_execution, 0)]
+        futures = [executor.submit(ExecutionTask(partial(record_execution, 0), "engine-0"))]
         assert started.wait(5)
-        futures.extend(executor.submit("engine-0", record_execution, index) for index in (1, 2))
+        futures.extend(executor.submit(ExecutionTask(partial(record_execution, index), "engine-0")) for index in (1, 2))
 
         release.set()
         assert [future.result(timeout=5) for future in futures] == [0, 1, 2]
@@ -527,9 +536,40 @@ def test_affinity_executor_runs_different_keys_in_parallel():
         return threading.get_ident()
 
     try:
-        first_future = executor.submit(0, wait_for_peer)
-        second_future = executor.submit(1, wait_for_peer)
+        first_future = executor.submit(ExecutionTask(wait_for_peer, 0))
+        second_future = executor.submit(ExecutionTask(wait_for_peer, 1))
         assert first_future.result(timeout=5) != second_future.result(timeout=5)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_inline_executor_runs_task_in_submitting_thread() -> None:
+    executor = InlineExecutor()
+    submitting_thread = threading.get_ident()
+
+    future = executor.submit(ExecutionTask(threading.get_ident))
+
+    assert future.result() == submitting_thread
+
+
+def test_inline_executor_captures_task_failure() -> None:
+    executor = InlineExecutor()
+
+    def fail() -> None:
+        raise RuntimeError("inline task failed")
+
+    future = executor.submit(ExecutionTask(fail))
+
+    with pytest.raises(RuntimeError, match="inline task failed"):
+        future.result()
+
+
+def test_affinity_executor_requires_affinity_key() -> None:
+    executor = AffinityExecutor(1, 0, "test-affinity")
+
+    try:
+        with pytest.raises(ValueError, match="must define an affinity key"):
+            executor.submit(ExecutionTask(lambda: None))
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 

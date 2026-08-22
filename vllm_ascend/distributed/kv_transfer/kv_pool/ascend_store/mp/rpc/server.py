@@ -11,11 +11,19 @@ import threading
 from collections.abc import Callable, Hashable, Iterable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
+from functools import partial
 
 import zmq
 
 from .error import MPServerBusyError
-from .executor import AffinityExecutor, BoundedThreadPoolExecutor, ExecutionMode
+from .executor import (
+    AffinityExecutor,
+    BoundedThreadPoolExecutor,
+    ExecutionMode,
+    ExecutionTask,
+    InlineExecutor,
+    TaskExecutor,
+)
 from .protocol import (
     MultipartMessage,
     ResponseStatus,
@@ -31,7 +39,16 @@ DEFAULT_MAX_PENDING_REQUESTS = 64
 
 RequestHandler = Callable[[tuple[bytes, ...]], Iterable[bytes]]
 AffinityKeyFactory = Callable[[bytes, tuple[bytes, ...]], Hashable]
+ExecutionKeyFactory = Callable[[bytes, tuple[bytes, ...]], Hashable | None]
 ServerResponse = MultipartMessage
+
+
+def _no_affinity_key(_identity: bytes, _payloads: tuple[bytes, ...]) -> None:
+    return None
+
+
+def _client_identity_affinity_key(identity: bytes, _payloads: tuple[bytes, ...]) -> bytes:
+    return identity
 
 
 @dataclass(frozen=True)
@@ -58,22 +75,41 @@ class HandlerSpec:
             raise ValueError("affinity_key is only valid for AFFINITY handlers")
 
 
+@dataclass(frozen=True)
+class _HandlerRoute:
+    handler: RequestHandler
+    executor: TaskExecutor
+    execution_key: ExecutionKeyFactory
+
+    def submit(
+        self,
+        identity: bytes,
+        payloads: tuple[bytes, ...],
+        callback: Callable[[], ServerResponse],
+    ) -> Future[ServerResponse]:
+        return self.executor.submit(ExecutionTask(callback, self.execution_key(identity, payloads)))
+
+
 class MPServer:
     """Route requests to inline, parallel, or keyed-affinity handlers."""
 
     def __init__(
-            self,
-            bind_url: str,
-            max_workers: int = 4,
-            handlers: Mapping[str, RequestHandler | HandlerSpec] | None = None,
-            *,
-            max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS,
-            affinity_workers: int | None = None,
+        self,
+        bind_url: str,
+        max_workers: int = 4,
+        handlers: Mapping[str, RequestHandler | HandlerSpec] | None = None,
+        *,
+        max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS,
+        affinity_workers: int | None = None,
     ):
-        self._handlers = self._build_handlers(handlers)
+        handler_specs = self._build_handler_specs(handlers)
+        self._inline_executor = InlineExecutor()
         self._parallel_executor = BoundedThreadPoolExecutor(max_workers, max_pending_requests, "ascend-store-mp-server")
         affinity_worker_count = max_workers if affinity_workers is None else affinity_workers
-        self._affinity_executor = self._create_affinity_executor(affinity_worker_count, max_pending_requests)
+        self._affinity_executor = self._create_affinity_executor(
+            handler_specs, affinity_worker_count, max_pending_requests
+        )
+        self._routes = self._build_routes(handler_specs)
 
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.ROUTER)
@@ -100,7 +136,7 @@ class MPServer:
         self.close()
 
     @staticmethod
-    def _build_handlers(handlers: Mapping[str, RequestHandler | HandlerSpec] | None) -> dict[str, HandlerSpec]:
+    def _build_handler_specs(handlers: Mapping[str, RequestHandler | HandlerSpec] | None) -> dict[str, HandlerSpec]:
         handler_specs = {
             SystemMethod.PING.value: HandlerSpec(MPServer._handle_ping, ExecutionMode.INLINE),
             SystemMethod.ECHO.value: HandlerSpec(MPServer._handle_echo, ExecutionMode.INLINE),
@@ -114,10 +150,34 @@ class MPServer:
             )
         return handler_specs
 
-    def _create_affinity_executor(self, max_workers: int, max_pending_requests: int) -> AffinityExecutor | None:
-        if not any(spec.execution_mode is ExecutionMode.AFFINITY for spec in self._handlers.values()):
+    @staticmethod
+    def _create_affinity_executor(
+        handler_specs: Mapping[str, HandlerSpec], max_workers: int, max_pending_requests: int
+    ) -> AffinityExecutor | None:
+        if not any(spec.execution_mode is ExecutionMode.AFFINITY for spec in handler_specs.values()):
             return None
         return AffinityExecutor(max_workers, max_pending_requests, "ascend-store-mp-affinity")
+
+    def _build_routes(self, handler_specs: Mapping[str, HandlerSpec]) -> dict[str, _HandlerRoute]:
+        executors: dict[ExecutionMode, TaskExecutor] = {
+            ExecutionMode.INLINE: self._inline_executor,
+            ExecutionMode.PARALLEL: self._parallel_executor,
+        }
+        if self._affinity_executor is not None:
+            executors[ExecutionMode.AFFINITY] = self._affinity_executor
+
+        default_key_factories: dict[ExecutionMode, ExecutionKeyFactory] = {
+            ExecutionMode.INLINE: _no_affinity_key,
+            ExecutionMode.PARALLEL: _no_affinity_key,
+            ExecutionMode.AFFINITY: _client_identity_affinity_key,
+        }
+        routes = {}
+        for method, spec in handler_specs.items():
+            execution_key = default_key_factories[spec.execution_mode]
+            if spec.affinity_key is not None:
+                execution_key = spec.affinity_key
+            routes[method] = _HandlerRoute(spec.handler, executors[spec.execution_mode], execution_key)
+        return routes
 
     def _bind(self, bind_url: str) -> str:
         if bind_url.endswith(":*"):
@@ -152,12 +212,12 @@ class MPServer:
         return identity, *response_frames
 
     def _execute_handler(
-            self,
-            identity: bytes,
-            request_id: bytes,
-            method: str,
-            payloads: tuple[bytes, ...],
-            handler: RequestHandler,
+        self,
+        identity: bytes,
+        request_id: bytes,
+        method: str,
+        payloads: tuple[bytes, ...],
+        handler: RequestHandler,
     ) -> ServerResponse:
         try:
             response_frames = encode_response(request_id, method, ResponseStatus.OK, handler(payloads))
@@ -192,42 +252,16 @@ class MPServer:
         self._publish_response(response)
 
     def _dispatch_request(self, identity: bytes, request_id: bytes, method: str, payloads: tuple[bytes, ...]) -> None:
-        handler_spec = self._handlers.get(method)
-        if handler_spec is None:
+        route = self._routes.get(method)
+        if route is None:
             self._publish_response(
                 self._encode_error_response(identity, request_id, method, ValueError(f"Unsupported method: {method}"))
             )
             return
 
-        if handler_spec.execution_mode is ExecutionMode.INLINE:
-            self._publish_response(self._execute_handler(identity, request_id, method, payloads, handler_spec.handler))
-            return
-
         try:
-            if handler_spec.execution_mode is ExecutionMode.AFFINITY:
-                affinity_key = (
-                    identity if handler_spec.affinity_key is None else handler_spec.affinity_key(identity, payloads)
-                )
-                if self._affinity_executor is None:
-                    raise RuntimeError("Affinity executor is not configured")
-                future = self._affinity_executor.submit(
-                    affinity_key,
-                    self._execute_handler,
-                    identity,
-                    request_id,
-                    method,
-                    payloads,
-                    handler_spec.handler,
-                )
-            else:
-                future = self._parallel_executor.submit(
-                    self._execute_handler,
-                    identity,
-                    request_id,
-                    method,
-                    payloads,
-                    handler_spec.handler,
-                )
+            callback = partial(self._execute_handler, identity, request_id, method, payloads, route.handler)
+            future = route.submit(identity, payloads, callback)
         except Exception as exc:
             self._publish_response(self._encode_error_response(identity, request_id, method, exc))
             return
