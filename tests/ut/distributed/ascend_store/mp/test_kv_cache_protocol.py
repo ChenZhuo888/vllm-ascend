@@ -6,14 +6,18 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protoc
     decode_lookup_request,
     decode_lookup_response,
     decode_registration,
+    decode_registration_request,
     decode_scheduler_session,
     decode_worker_session,
     encode_lookup_request,
     encode_lookup_response,
     encode_registration,
+    encode_registration_request,
     encode_scheduler_session,
     encode_worker_session,
     lookup_affinity_key,
+    scheduler_affinity_key,
+    worker_affinity_key,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
     SchedulerIdentity,
@@ -32,31 +36,57 @@ def _make_vllm_config():
 
 
 def test_registration_round_trip_and_type_validation() -> None:
-    registration = SchedulerRegistration.create(
+    scheduler_registration = SchedulerRegistration.create(
         _make_vllm_config(),
         kv_cache_config=None,
         page_size_bytes=4096,
         session_id="scheduler-session",
     )
-    payload = encode_registration(registration)
+    worker_registration = WorkerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        session_id="worker-session",
+    )
+    payload = encode_registration(scheduler_registration)
 
-    assert decode_registration((payload,), SchedulerRegistration) == registration
+    assert decode_registration((payload,), SchedulerRegistration) == scheduler_registration
     with pytest.raises(MPProtocolError, match="Expected WorkerRegistration"):
         decode_registration((payload,), WorkerRegistration)
+
+    scheduler_payloads = encode_registration_request(scheduler_registration)
+    worker_payloads = encode_registration_request(worker_registration)
+    assert decode_registration_request(scheduler_payloads, SchedulerRegistration) == (
+        scheduler_registration,
+        scheduler_payloads[-1],
+    )
+    assert decode_registration_request(worker_payloads, WorkerRegistration) == (
+        worker_registration,
+        worker_payloads[-1],
+    )
+    assert scheduler_affinity_key(b"client", scheduler_payloads) == scheduler_registration.identity
+    assert worker_affinity_key(b"client", worker_payloads) == worker_registration.identity
+
+    mismatched_payloads = (b"other-engine", *scheduler_payloads[1:])
+    with pytest.raises(MPProtocolError, match="identity does not match request header"):
+        decode_registration_request(mismatched_payloads, SchedulerRegistration)
 
 
 def test_service_session_round_trip() -> None:
     scheduler_identity = SchedulerIdentity("engine-0", data_parallel_rank=1)
     worker_identity = WorkerIdentity("engine-0", rank=2, data_parallel_rank=1)
+    scheduler_payloads = encode_scheduler_session(scheduler_identity, "scheduler-session")
+    worker_payloads = encode_worker_session(worker_identity, "worker-session")
 
-    assert decode_scheduler_session(encode_scheduler_session(scheduler_identity, "scheduler-session")) == (
+    assert decode_scheduler_session(scheduler_payloads) == (
         scheduler_identity,
         "scheduler-session",
     )
-    assert decode_worker_session(encode_worker_session(worker_identity, "worker-session")) == (
+    assert decode_worker_session(worker_payloads) == (
         worker_identity,
         "worker-session",
     )
+    assert scheduler_affinity_key(b"client", scheduler_payloads) == scheduler_identity
+    assert worker_affinity_key(b"client", worker_payloads) == worker_identity
 
 
 def test_lookup_request_preserves_required_fields_and_response_round_trip() -> None:
@@ -90,5 +120,7 @@ def test_lookup_request_preserves_required_fields_and_response_round_trip() -> N
 def test_lookup_protocol_rejects_malformed_payloads() -> None:
     with pytest.raises(MPProtocolError, match="expects at least 6 payloads"):
         lookup_affinity_key(b"client", ())
+    with pytest.raises(MPProtocolError, match="expects at least 2 payloads"):
+        scheduler_affinity_key(b"client", ())
     with pytest.raises(MPProtocolError, match="expects 2 response payloads"):
         decode_lookup_response([])

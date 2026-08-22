@@ -46,6 +46,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         check_interval_s: float,
         clock: Callable[[], float] = time.monotonic,
         thread_name: str | None = None,
+        expiration_handler: Callable[[IdentityT, ServiceT], None] | None = None,
     ):
         if not service_name:
             raise ValueError("service_name must not be empty")
@@ -60,6 +61,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         self._check_interval_s = check_interval_s
         self._clock = clock
         self._thread_name = thread_name or f"{service_name.lower()}-service-lifecycle"
+        self._expiration_handler = expiration_handler
 
         self._lock = threading.RLock()
         self._services: dict[IdentityT, _ServiceEntry[ServiceT]] = {}
@@ -100,6 +102,9 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
                     target=self._maintenance_loop, daemon=True, name=self._thread_name
                 )
                 self._maintenance_thread.start()
+
+    def stop(self) -> None:
+        self._stop_maintenance()
 
     def register(
         self,
@@ -223,7 +228,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
                     self._expiring[identity] = entry
 
             for identity, entry in expired_services:
-                self._close_service_safely(entry.service)
+                self._expire_service_safely(identity, entry.service)
                 self._finish_expiration(identity, entry)
             return len(expired_services)
 
@@ -373,6 +378,16 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
             self._close_service(service)
         except Exception:
             logger.exception("Failed to close %s service %r", self._service_name, service)
+
+    def _expire_service_safely(self, identity: IdentityT, service: ServiceT) -> None:
+        if self._expiration_handler is None:
+            self._close_service_safely(service)
+            return
+
+        try:
+            self._expiration_handler(identity, service)
+        except Exception:
+            logger.exception("Failed to expire %s service %r", self._service_name, service)
 
     @staticmethod
     def _validate_session_id(session_id: str) -> None:

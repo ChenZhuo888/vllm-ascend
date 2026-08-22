@@ -25,7 +25,8 @@ _LOOKUP_HEADER_PAYLOADS = 6
 _ASYNC_RESPONSE = b"\x01"
 _SYNC_RESPONSE = b"\x00"
 
-RegistrationT = TypeVar("RegistrationT", bound="SchedulerRegistration | WorkerRegistration")
+_Registration = SchedulerRegistration | WorkerRegistration
+RegistrationT = TypeVar("RegistrationT", bound=_Registration)
 
 
 class KVCacheMethod(str, enum.Enum):
@@ -48,11 +49,21 @@ class LookupRequestView:
     num_tokens: int
 
 
-def encode_registration(registration: SchedulerRegistration | WorkerRegistration) -> bytes:
+def encode_registration(registration: _Registration) -> bytes:
     try:
         return cloudpickle.dumps(registration)
     except Exception as exc:
         raise MPProtocolError(f"Failed to encode {type(registration).__name__}") from exc
+
+
+def encode_registration_request(registration: _Registration) -> tuple[bytes, ...]:
+    if isinstance(registration, SchedulerRegistration):
+        identity_payloads = _encode_scheduler_identity(registration.identity)
+    elif isinstance(registration, WorkerRegistration):
+        identity_payloads = _encode_worker_identity(registration.identity)
+    else:
+        raise TypeError(f"Unsupported registration type: {type(registration).__name__}")
+    return *identity_payloads, encode_registration(registration)
 
 
 def decode_registration(payloads: tuple[bytes, ...], expected_type: type[RegistrationT]) -> RegistrationT:
@@ -69,42 +80,50 @@ def decode_registration(payloads: tuple[bytes, ...], expected_type: type[Registr
     return registration
 
 
+def decode_registration_request(
+    payloads: tuple[bytes, ...], expected_type: type[RegistrationT]
+) -> tuple[RegistrationT, bytes]:
+    if expected_type is SchedulerRegistration:
+        expected_payloads = 3
+        decode_identity = _decode_scheduler_identity
+    elif expected_type is WorkerRegistration:
+        expected_payloads = 4
+        decode_identity = _decode_worker_identity
+    else:
+        raise TypeError(f"Unsupported registration type: {expected_type.__name__}")
+
+    if len(payloads) != expected_payloads:
+        raise MPProtocolError(f"{expected_type.__name__} expects {expected_payloads} payloads, got {len(payloads)}")
+
+    identity = decode_identity(payloads)
+    serialized_registration = payloads[-1]
+    registration = decode_registration((serialized_registration,), expected_type)
+    if registration.identity != identity:
+        raise MPProtocolError(
+            f"{expected_type.__name__} identity does not match request header: "
+            f"{registration.identity!r} != {identity!r}"
+        )
+    return registration, serialized_registration
+
+
 def encode_scheduler_session(identity: SchedulerIdentity, session_id: str) -> tuple[bytes, ...]:
-    return (
-        _encode_text(identity.engine_id, "engine_id"),
-        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
-        _encode_text(session_id, "session_id"),
-    )
+    return *_encode_scheduler_identity(identity), _encode_text(session_id, "session_id")
 
 
 def decode_scheduler_session(payloads: tuple[bytes, ...]) -> tuple[SchedulerIdentity, str]:
     if len(payloads) != 3:
         raise MPProtocolError(f"Scheduler session expects 3 payloads, got {len(payloads)}")
-    identity = SchedulerIdentity(
-        engine_id=_decode_text(payloads[0], "engine_id"),
-        data_parallel_rank=_decode_non_negative_int(payloads[1], "data_parallel_rank"),
-    )
-    return identity, _decode_text(payloads[2], "session_id")
+    return _decode_scheduler_identity(payloads), _decode_text(payloads[2], "session_id")
 
 
 def encode_worker_session(identity: WorkerIdentity, session_id: str) -> tuple[bytes, ...]:
-    return (
-        _encode_text(identity.engine_id, "engine_id"),
-        _encode_non_negative_int(identity.rank, "rank"),
-        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
-        _encode_text(session_id, "session_id"),
-    )
+    return *_encode_worker_identity(identity), _encode_text(session_id, "session_id")
 
 
 def decode_worker_session(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
     if len(payloads) != 4:
         raise MPProtocolError(f"Worker session expects 4 payloads, got {len(payloads)}")
-    identity = WorkerIdentity(
-        engine_id=_decode_text(payloads[0], "engine_id"),
-        rank=_decode_non_negative_int(payloads[1], "rank"),
-        data_parallel_rank=_decode_non_negative_int(payloads[2], "data_parallel_rank"),
-    )
-    return identity, _decode_text(payloads[3], "session_id")
+    return _decode_worker_identity(payloads), _decode_text(payloads[3], "session_id")
 
 
 def encode_lookup_request(
@@ -142,8 +161,16 @@ def decode_lookup_request(payloads: tuple[bytes, ...]) -> tuple[SchedulerIdentit
     return identity, session_id, request, num_computed_tokens
 
 
+def scheduler_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
+    return _decode_scheduler_identity(payloads)
+
+
 def lookup_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
     return _decode_lookup_identity(payloads)
+
+
+def worker_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> WorkerIdentity:
+    return _decode_worker_identity(payloads)
 
 
 def encode_lookup_response(matched_tokens: int, is_async: bool) -> tuple[bytes, ...]:
@@ -162,9 +189,40 @@ def decode_lookup_response(payloads: Sequence[bytes]) -> tuple[int, bool]:
 def _decode_lookup_identity(payloads: tuple[bytes, ...]) -> SchedulerIdentity:
     if len(payloads) < _LOOKUP_HEADER_PAYLOADS:
         raise MPProtocolError(f"LOOKUP expects at least {_LOOKUP_HEADER_PAYLOADS} payloads, got {len(payloads)}")
+    return _decode_scheduler_identity(payloads)
+
+
+def _encode_scheduler_identity(identity: SchedulerIdentity) -> tuple[bytes, ...]:
+    return (
+        _encode_text(identity.engine_id, "engine_id"),
+        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
+    )
+
+
+def _decode_scheduler_identity(payloads: tuple[bytes, ...]) -> SchedulerIdentity:
+    if len(payloads) < 2:
+        raise MPProtocolError(f"Scheduler identity expects at least 2 payloads, got {len(payloads)}")
     return SchedulerIdentity(
         engine_id=_decode_text(payloads[0], "engine_id"),
         data_parallel_rank=_decode_non_negative_int(payloads[1], "data_parallel_rank"),
+    )
+
+
+def _encode_worker_identity(identity: WorkerIdentity) -> tuple[bytes, ...]:
+    return (
+        _encode_text(identity.engine_id, "engine_id"),
+        _encode_non_negative_int(identity.rank, "rank"),
+        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
+    )
+
+
+def _decode_worker_identity(payloads: tuple[bytes, ...]) -> WorkerIdentity:
+    if len(payloads) < 3:
+        raise MPProtocolError(f"Worker identity expects at least 3 payloads, got {len(payloads)}")
+    return WorkerIdentity(
+        engine_id=_decode_text(payloads[0], "engine_id"),
+        rank=_decode_non_negative_int(payloads[1], "rank"),
+        data_parallel_rank=_decode_non_negative_int(payloads[2], "data_parallel_rank"),
     )
 
 

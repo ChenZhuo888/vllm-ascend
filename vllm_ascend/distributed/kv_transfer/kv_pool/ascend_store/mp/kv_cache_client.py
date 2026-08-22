@@ -15,7 +15,7 @@ from .kv_cache_protocol import (
     KVCacheMethod,
     decode_lookup_response,
     encode_lookup_request,
-    encode_registration,
+    encode_registration_request,
     encode_scheduler_session,
     encode_worker_session,
 )
@@ -35,6 +35,7 @@ _DEFAULT_TIMEOUT_MS = 5000
 _REGISTRATION_TIMEOUT_MS = 500
 _LEASE_RENEW_INTERVAL_MS = 1000
 _LEASE_REQUEST_TIMEOUT_MS = 1000
+_RegistrationState = tuple[SchedulerRegistration | WorkerRegistration, tuple[bytes, ...]]
 
 
 class KVCacheClient:
@@ -46,7 +47,7 @@ class KVCacheClient:
         self._lease_lock = threading.Lock()
         self._lease_stop = threading.Event()
         self._lease_thread: threading.Thread | None = None
-        self._registration: tuple[SchedulerRegistration | WorkerRegistration, bytes] | None = None
+        self._registration: _RegistrationState | None = None
         self._session_id = uuid.uuid4().hex
         self._registered = False
         self._superseded = False
@@ -88,7 +89,7 @@ class KVCacheClient:
             if self._registration is not None and type(self._registration[0]) is not type(registration):
                 raise RuntimeError("A KVCacheClient cannot register both Scheduler and Worker services")
 
-            self._registration = (registration, encode_registration(registration))
+            self._registration = (registration, encode_registration_request(registration))
             self._registered = False
 
         registered = self._try_register()
@@ -183,7 +184,7 @@ class KVCacheClient:
             if self._registered:
                 return True
 
-        registration, payload = configured_registration
+        registration, payloads = configured_registration
         method = (
             KVCacheMethod.REGISTER_SCHEDULER
             if isinstance(registration, SchedulerRegistration)
@@ -194,7 +195,7 @@ class KVCacheClient:
             return False
 
         try:
-            responses = self._rpc_client.request(method, (payload,), timeout_ms=_REGISTRATION_TIMEOUT_MS)
+            responses = self._rpc_client.request(method, payloads, timeout_ms=_REGISTRATION_TIMEOUT_MS)
         except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError):
             self._mark_unregistered()
             return False

@@ -10,7 +10,9 @@ from unittest.mock import patch
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheMethod, KVCacheServer
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import encode_registration
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import (
+    encode_registration_request,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
     SchedulerIdentity,
     SchedulerRegistration,
@@ -401,21 +403,21 @@ def test_registration_is_idempotent_and_rejects_conflicts(kv_cache_server_url: s
         kv_cache_config=None,
         page_size_bytes=0,
     )
-    payload = encode_registration(registration)
+    payloads = encode_registration_request(registration)
     conflicting_registration = SchedulerRegistration.create(
         _make_vllm_config(marker="second"),
         kv_cache_config=None,
         page_size_bytes=0,
     )
-    conflicting_payload = encode_registration(conflicting_registration)
+    conflicting_payloads = encode_registration_request(conflicting_registration)
 
     with MPClient(kv_cache_server_url) as client:
         client.wait_until_connected()
-        assert client.request(KVCacheMethod.REGISTER_SCHEDULER, (payload,)) == [b"OK"]
-        assert client.request(KVCacheMethod.REGISTER_SCHEDULER, (payload,)) == [b"OK"]
+        assert client.request(KVCacheMethod.REGISTER_SCHEDULER, payloads) == [b"OK"]
+        assert client.request(KVCacheMethod.REGISTER_SCHEDULER, payloads) == [b"OK"]
 
         with pytest.raises(MPRemoteError, match="different configuration"):
-            client.request(KVCacheMethod.REGISTER_SCHEDULER, (conflicting_payload,))
+            client.request(KVCacheMethod.REGISTER_SCHEDULER, conflicting_payloads)
 
 
 def test_lookup_serializes_requests_for_the_same_scheduler() -> None:

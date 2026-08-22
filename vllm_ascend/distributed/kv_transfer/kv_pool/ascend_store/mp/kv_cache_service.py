@@ -1,9 +1,9 @@
 """KV cache service orchestration independent of the RPC transport."""
 
 import hashlib
-import threading
 import time
 from collections.abc import Callable, Sequence
+from functools import partial
 from typing import TYPE_CHECKING
 
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -19,6 +19,7 @@ from .registration import (
     WorkerLookupHandler,
     WorkerRegistration,
 )
+from .rpc import TaskExecutor
 from .service import ServiceLifecycleManager
 
 if TYPE_CHECKING:
@@ -31,7 +32,7 @@ _LEASE_CHECK_INTERVAL_S = 5.0
 
 
 class KVCacheServiceManager:
-    """Own KV cache services and coordinate calls between them."""
+    """Own KV cache services and coordinate calls between optional owner lanes."""
 
     def __init__(
         self,
@@ -40,10 +41,12 @@ class KVCacheServiceManager:
         lease_timeout_s: float = _SERVICE_LEASE_TIMEOUT_S,
         lease_check_interval_s: float = _LEASE_CHECK_INTERVAL_S,
         clock: Callable[[], float] = time.monotonic,
+        scheduler_executor: TaskExecutor | None = None,
+        worker_executor: TaskExecutor | None = None,
     ):
         self._scheduler_factory = scheduler_factory or self._create_scheduler
         self._worker_factory = worker_factory or self._create_worker
-        self._binding_lock = threading.Lock()
+        self._worker_executor = worker_executor
         self._schedulers = ServiceLifecycleManager[SchedulerIdentity, "KVPoolScheduler"](
             "Scheduler",
             self._close_service,
@@ -51,6 +54,7 @@ class KVCacheServiceManager:
             check_interval_s=lease_check_interval_s,
             clock=clock,
             thread_name="ascend-store-scheduler-lifecycle",
+            expiration_handler=partial(self._expire_service, scheduler_executor),
         )
         self._workers = ServiceLifecycleManager[WorkerIdentity, "KVPoolWorker"](
             "Worker",
@@ -59,6 +63,7 @@ class KVCacheServiceManager:
             check_interval_s=lease_check_interval_s,
             clock=clock,
             thread_name="ascend-store-worker-lifecycle",
+            expiration_handler=partial(self._expire_service, worker_executor),
         )
 
     @property
@@ -94,6 +99,10 @@ class KVCacheServiceManager:
         self._schedulers.start()
         self._workers.start()
 
+    def stop(self) -> None:
+        self._workers.stop()
+        self._schedulers.stop()
+
     def register_scheduler(self, registration: SchedulerRegistration, payload: bytes) -> "KVPoolScheduler":
         self._validate_scheduler_registration(registration)
         scheduler = self._schedulers.register(
@@ -102,7 +111,7 @@ class KVCacheServiceManager:
             hashlib.sha256(payload).digest(),
             lambda: self._build_scheduler(registration),
         )
-        self._bind_lookup_store(registration.identity)
+        self._schedule_lookup_store_binding(registration.identity)
         return scheduler
 
     def register_worker(self, registration: WorkerRegistration, payload: bytes) -> "KVPoolWorker":
@@ -114,7 +123,8 @@ class KVCacheServiceManager:
             lambda: self._worker_factory(registration),
         )
         self._bind_lookup_store(
-            SchedulerIdentity(registration.identity.engine_id, registration.identity.data_parallel_rank)
+            SchedulerIdentity(registration.identity.engine_id, registration.identity.data_parallel_rank),
+            registration.identity,
         )
         return worker
 
@@ -158,6 +168,28 @@ class KVCacheServiceManager:
         hbm_hit_tokens: int,
     ) -> int:
         worker_identity = self._get_lookup_worker_identity(scheduler_identity)
+        callback = partial(
+            self._execute_worker_lookup,
+            worker_identity,
+            token_len,
+            block_hashes,
+            kv_cache_group_ids,
+            use_layerwise,
+            hbm_hit_tokens,
+        )
+        if self._worker_executor is None:
+            return callback()
+        return self._worker_executor.submit(callback, worker_identity).result()
+
+    def _execute_worker_lookup(
+        self,
+        worker_identity: WorkerIdentity,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        kv_cache_group_ids: list[int] | None,
+        use_layerwise: bool,
+        hbm_hit_tokens: int,
+    ) -> int:
         worker = self._workers.get(worker_identity)
         if worker is None:
             return 0
@@ -165,20 +197,40 @@ class KVCacheServiceManager:
         hash_strings = [block_hash.hex() for block_hash in block_hashes]
         return worker.lookup_scheduler(token_len, hash_strings, kv_cache_group_ids, use_layerwise, hbm_hit_tokens)
 
-    def _bind_lookup_store(self, scheduler_identity: SchedulerIdentity) -> None:
-        with self._binding_lock:
-            scheduler = self._schedulers.get(scheduler_identity)
-            worker = self._workers.get(self._get_lookup_worker_identity(scheduler_identity))
-            if scheduler is None or worker is None:
-                return
+    def _expire_service(
+        self,
+        executor: TaskExecutor | None,
+        identity: SchedulerIdentity | WorkerIdentity,
+        service: object,
+    ) -> None:
+        callback = partial(self._close_service, service)
+        if executor is None:
+            callback()
+            return
+        executor.submit(callback, identity, block=True).result()
 
-            store = getattr(scheduler, "store_scheduler", None)
-            if store is None:
-                return
+    def _schedule_lookup_store_binding(self, scheduler_identity: SchedulerIdentity) -> None:
+        worker_identity = self._get_lookup_worker_identity(scheduler_identity)
+        callback = partial(self._bind_lookup_store, scheduler_identity, worker_identity)
+        if self._worker_executor is None:
+            callback()
+            return
+        self._worker_executor.submit(callback, worker_identity).result()
 
-            bind_lookup_store = getattr(worker, "bind_lookup_store", None)
-            if callable(bind_lookup_store):
-                bind_lookup_store(store)
+    def _bind_lookup_store(
+        self,
+        scheduler_identity: SchedulerIdentity,
+        worker_identity: WorkerIdentity,
+    ) -> None:
+        scheduler = self._schedulers.get(scheduler_identity)
+        worker = self._workers.get(worker_identity)
+        if scheduler is None or worker is None:
+            return
+
+        store = getattr(scheduler, "store_scheduler", None)
+        bind_lookup_store = getattr(worker, "bind_lookup_store", None)
+        if store is not None and callable(bind_lookup_store):
+            bind_lookup_store(store)
 
     @staticmethod
     def _get_lookup_worker_identity(scheduler_identity: SchedulerIdentity) -> WorkerIdentity:

@@ -57,8 +57,8 @@ def test_recovery_reuses_the_same_session_after_initial_registration_failure() -
                 for request_call in rpc_client.request.call_args_list
                 if request_call.args[0] == KVCacheMethod.REGISTER_SCHEDULER
             ]
-            first_registration = cloudpickle.loads(register_calls[0].args[1][0])
-            second_registration = cloudpickle.loads(register_calls[1].args[1][0])
+            first_registration = cloudpickle.loads(register_calls[0].args[1][-1])
+            second_registration = cloudpickle.loads(register_calls[1].args[1][-1])
 
             assert first_registration.session_id == second_registration.session_id
             assert first_registration.identity == second_registration.identity
@@ -129,7 +129,7 @@ def test_close_stops_lease_loop_then_unregisters_the_same_session() -> None:
         assert client.register_scheduler(_make_vllm_config(), None, 0)
 
         register_call = rpc_client.request.call_args_list[0]
-        registration = cloudpickle.loads(register_call.args[1][0])
+        registration = cloudpickle.loads(register_call.args[1][-1])
         lease_stopped = False
 
         def stop_lease_loop() -> None:
@@ -170,7 +170,7 @@ def test_service_renewal_uses_the_registered_session(service_type: str, renew_me
                 assert client.register_scheduler(_make_vllm_config(), None, 0)
             else:
                 assert client.register_worker(_make_vllm_config(), None)
-            registration = cloudpickle.loads(rpc_client.request.call_args_list[0].args[1][0])
+            registration = cloudpickle.loads(rpc_client.request.call_args_list[0].args[1][-1])
             client._maintain_lease()
 
             renew_call = rpc_client.request.call_args_list[1]
@@ -204,8 +204,8 @@ def test_missing_service_during_renewal_reregisters_the_same_session() -> None:
                 if request_call.args[0] == KVCacheMethod.REGISTER_SCHEDULER
             ]
             assert len(register_calls) == 2
-            first_registration = cloudpickle.loads(register_calls[0].args[1][0])
-            second_registration = cloudpickle.loads(register_calls[1].args[1][0])
+            first_registration = cloudpickle.loads(register_calls[0].args[1][-1])
+            second_registration = cloudpickle.loads(register_calls[1].args[1][-1])
             assert first_registration.session_id == second_registration.session_id
             assert client.is_registered
         finally:

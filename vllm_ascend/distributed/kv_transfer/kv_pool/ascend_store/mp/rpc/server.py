@@ -136,7 +136,7 @@ class MPServer:
         return tuple(executors.values())
 
     def _shutdown_executors(self) -> None:
-        for executor in reversed(self._executors):
+        for executor in self._executors:
             try:
                 executor.shutdown(wait=True, cancel_futures=True)
             except Exception:

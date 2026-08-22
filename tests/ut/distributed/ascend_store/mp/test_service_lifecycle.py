@@ -1,4 +1,5 @@
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
@@ -42,6 +43,7 @@ def _create_manager(
     clock=lambda: 0.0,
     lease_timeout_s: float = 10.0,
     check_interval_s: float = 0.01,
+    expiration_handler: Callable[[str, _FakeService], None] | None = None,
 ) -> ServiceLifecycleManager[str, _FakeService]:
     return ServiceLifecycleManager(
         "Test",
@@ -49,6 +51,7 @@ def _create_manager(
         lease_timeout_s=lease_timeout_s,
         check_interval_s=check_interval_s,
         clock=clock,
+        expiration_handler=expiration_handler,
     )
 
 
@@ -123,6 +126,23 @@ def test_expired_session_recovers_only_with_the_same_fingerprint() -> None:
 
     second_service = manager.register("service-0", "session-0", b"config", _FakeService)
     assert second_service is not first_service
+
+
+def test_expiration_uses_the_configured_handler() -> None:
+    now = [0.0]
+    expired = []
+
+    def expire_service(identity: str, service: _FakeService) -> None:
+        expired.append(identity)
+        service.close()
+
+    manager = _create_manager(lambda: now[0], expiration_handler=expire_service)
+    service = manager.register("service-0", "session-0", b"config", _FakeService)
+    now[0] = 11.0
+
+    assert manager.expire_leases() == 1
+    assert expired == ["service-0"]
+    assert service.close_count == 1
 
 
 def test_new_session_after_expiration_retires_the_old_session() -> None:

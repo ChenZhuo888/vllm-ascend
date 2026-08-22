@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import pytest
@@ -539,6 +540,36 @@ def test_affinity_executor_runs_different_keys_in_parallel():
         second_future = executor.submit(wait_for_peer, 1)
         assert first_future.result(timeout=5) != second_future.result(timeout=5)
     finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_affinity_executor_can_wait_for_capacity() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    submit_started = threading.Event()
+    executor = AffinityExecutor(1, 0, "test-affinity")
+
+    def wait_for_release() -> None:
+        started.set()
+        assert release.wait(5), "Timed out waiting to release the affinity executor"
+
+    def submit_waiting_task():
+        submit_started.set()
+        return executor.submit(lambda: None, "engine-0", block=True)
+
+    try:
+        first_future = executor.submit(wait_for_release, "engine-0")
+        assert started.wait(5)
+        with ThreadPoolExecutor(max_workers=1) as submitter:
+            waiting_submission = submitter.submit(submit_waiting_task)
+            assert submit_started.wait(5)
+            with pytest.raises(TimeoutError):
+                waiting_submission.result(timeout=0.1)
+            release.set()
+            waiting_submission.result(timeout=5).result(timeout=5)
+        first_future.result(timeout=5)
+    finally:
+        release.set()
         executor.shutdown(wait=True, cancel_futures=True)
 
 

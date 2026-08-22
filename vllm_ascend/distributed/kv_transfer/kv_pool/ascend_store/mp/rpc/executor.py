@@ -14,9 +14,11 @@ _STOP = object()
 
 
 class TaskExecutor(Protocol):
-    """Common task execution contract used by the RPC server."""
+    """Submit work with optional affinity and blocking admission."""
 
-    def submit(self, callback: Callable[[], _ResultT], key: Hashable | None = None) -> Future[_ResultT]: ...
+    def submit(
+        self, fn: Callable[[], _ResultT], key: Hashable | None = None, block: bool = False
+    ) -> Future[_ResultT]: ...
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None: ...
 
@@ -31,7 +33,7 @@ def _validate_limits(max_workers: int, max_pending_tasks: int) -> None:
 class InlineExecutor:
     """Execute tasks immediately in the submitting thread."""
 
-    def submit(self, callback: Callable[[], _ResultT], key: Hashable | None = None) -> Future[_ResultT]:
+    def submit(self, fn: Callable[[], _ResultT], key: Hashable | None = None, block: bool = False) -> Future[_ResultT]:
         if key is not None:
             raise ValueError("Inline executor does not accept an execution key")
 
@@ -40,7 +42,7 @@ class InlineExecutor:
             return future
 
         try:
-            result = callback()
+            result = fn()
         except BaseException as exc:
             future.set_exception(exc)
         else:
@@ -59,14 +61,14 @@ class BoundedThreadPoolExecutor:
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
         self._capacity = threading.BoundedSemaphore(max_workers + max_pending_tasks)
 
-    def submit(self, callback: Callable[[], _ResultT], key: Hashable | None = None) -> Future[_ResultT]:
+    def submit(self, fn: Callable[[], _ResultT], key: Hashable | None = None, block: bool = False) -> Future[_ResultT]:
         if key is not None:
             raise ValueError("Parallel executor does not accept an execution key")
-        if not self._capacity.acquire(blocking=False):
+        if not self._capacity.acquire(blocking=block):
             raise MPServerBusyError("Parallel executor is at capacity")
 
         try:
-            future = self._executor.submit(callback)
+            future = self._executor.submit(fn)
         except BaseException:
             self._capacity.release()
             raise
@@ -111,14 +113,14 @@ class AffinityExecutor:
         for thread in self._threads:
             thread.start()
 
-    def submit(self, callback: Callable[[], _ResultT], key: Hashable | None = None) -> Future[_ResultT]:
+    def submit(self, fn: Callable[[], _ResultT], key: Hashable | None = None, block: bool = False) -> Future[_ResultT]:
         if key is None:
             raise ValueError("Affinity task must define an affinity key")
 
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("Affinity executor is closed")
-            if not self._capacity.acquire(blocking=False):
+            if not self._capacity.acquire(blocking=block):
                 raise MPServerBusyError("Affinity executor is at capacity")
 
             try:
@@ -129,7 +131,7 @@ class AffinityExecutor:
 
             future: Future[_ResultT] = Future()
             future.add_done_callback(self._release_capacity)
-            self._queues[worker_index].put_nowait(_AffinityTask(future, callback))
+            self._queues[worker_index].put_nowait(_AffinityTask(future, fn))
             return future
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:

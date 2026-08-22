@@ -9,6 +9,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration im
     SchedulerRegistration,
     WorkerRegistration,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import AffinityExecutor
 
 _BLOCK_HASHES = [bytes.fromhex("01" * 32), bytes.fromhex("02" * 32)]
 
@@ -40,7 +41,9 @@ class _FakeWorker:
         self._matched_tokens = matched_tokens
         self._closed = closed
         self.bound_store = None
+        self.binding_threads = []
         self.lookup_hashes = None
+        self.lookup_threads = []
         self.close_count = 0
 
     def close(self) -> None:
@@ -50,6 +53,7 @@ class _FakeWorker:
 
     def bind_lookup_store(self, store) -> None:
         self.bound_store = store
+        self.binding_threads.append(threading.get_ident())
 
     def lookup_scheduler(
         self,
@@ -60,6 +64,7 @@ class _FakeWorker:
         hbm_hit_tokens: int = 0,
     ) -> int:
         self.lookup_hashes = block_hashes
+        self.lookup_threads.append(threading.get_ident())
         return min(token_len, self._matched_tokens)
 
 
@@ -171,6 +176,37 @@ def test_lookup_routes_to_rank_zero_worker_in_the_same_dp_group() -> None:
     assert workers[(0, 0)].bound_store is not None
     assert workers[(0, 1)].bound_store is None
     assert workers[(1, 0)].bound_store is None
+
+
+def test_scheduler_binding_and_lookup_run_on_the_worker_lane() -> None:
+    worker = _FakeWorker(16)
+    worker_executor = AffinityExecutor(1, 4, "test-worker-lane")
+    service_manager = KVCacheServiceManager(
+        _create_scheduler,
+        lambda registration: worker,
+        worker_executor=worker_executor,
+    )
+    scheduler_registration = _scheduler_registration("scheduler-session")
+    worker_registration = _worker_registration("worker-session")
+    request = SimpleNamespace(
+        request_id="request-0",
+        prompt_token_ids=list(range(16)),
+        block_hashes=_BLOCK_HASHES,
+        num_tokens=16,
+    )
+
+    try:
+        service_manager.register_worker(worker_registration, encode_registration(worker_registration))
+        service_manager.register_scheduler(scheduler_registration, encode_registration(scheduler_registration))
+        result = service_manager.lookup(scheduler_registration.identity, scheduler_registration.session_id, request, 0)
+
+        assert result == (16, False)
+        assert len(worker.lookup_threads) == 1
+        assert worker.binding_threads == worker.lookup_threads
+        assert worker.lookup_threads != [threading.get_ident()]
+    finally:
+        worker_executor.shutdown(wait=True, cancel_futures=True)
+        service_manager.close()
 
 
 def test_lookup_does_not_fall_back_to_a_non_coordinator_worker() -> None:
