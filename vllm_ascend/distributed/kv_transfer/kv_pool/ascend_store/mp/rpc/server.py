@@ -8,7 +8,7 @@ import logging
 import queue
 import socket
 import threading
-from collections.abc import Callable, Hashable, Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from functools import partial
@@ -16,14 +16,7 @@ from functools import partial
 import zmq
 
 from .error import MPServerBusyError
-from .executor import (
-    AffinityExecutor,
-    BoundedThreadPoolExecutor,
-    ExecutionMode,
-    ExecutionTask,
-    InlineExecutor,
-    TaskExecutor,
-)
+from .executor import InlineExecutor, TaskExecutor
 from .protocol import (
     MultipartMessage,
     ResponseStatus,
@@ -35,51 +28,34 @@ from .protocol import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_PENDING_REQUESTS = 64
-
 RequestHandler = Callable[[tuple[bytes, ...]], Iterable[bytes]]
-AffinityKeyFactory = Callable[[bytes, tuple[bytes, ...]], Hashable]
-ExecutionKeyFactory = Callable[[bytes, tuple[bytes, ...]], Hashable | None]
+ExecutionKeyFactory = Callable[[bytes, tuple[bytes, ...]], Hashable]
 ServerResponse = MultipartMessage
 
 
-def _no_affinity_key(_identity: bytes, _payloads: tuple[bytes, ...]) -> None:
-    return None
-
-
-def _client_identity_affinity_key(identity: bytes, _payloads: tuple[bytes, ...]) -> bytes:
-    return identity
-
-
 @dataclass(frozen=True)
-class HandlerSpec:
-    """Describe an RPC handler and its execution policy.
+class Route:
+    """Bind one RPC method to its handler and executor.
 
-    ``INLINE`` is intended only for short, non-blocking control handlers. An
-    affinity key factory also runs in the I/O thread and must remain lightweight.
-    ``AFFINITY`` uses the client identity unless a key factory is provided.
+    The optional key factory runs in the server I/O thread and must remain
+    lightweight. It is intended for executors that require keyed execution.
     """
 
-    handler: RequestHandler
-    execution_mode: ExecutionMode = ExecutionMode.PARALLEL
-    affinity_key: AffinityKeyFactory | None = None
-
-    def __post_init__(self) -> None:
-        if not callable(self.handler):
-            raise TypeError("handler must be callable")
-        if not isinstance(self.execution_mode, ExecutionMode):
-            raise TypeError("execution_mode must be an ExecutionMode")
-        if self.affinity_key is not None and not callable(self.affinity_key):
-            raise TypeError("affinity_key must be callable")
-        if self.affinity_key is not None and self.execution_mode is not ExecutionMode.AFFINITY:
-            raise ValueError("affinity_key is only valid for AFFINITY handlers")
-
-
-@dataclass(frozen=True)
-class _HandlerRoute:
+    method: str
     handler: RequestHandler
     executor: TaskExecutor
-    execution_key: ExecutionKeyFactory
+    key_factory: ExecutionKeyFactory | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "method", normalize_method(self.method))
+        if not callable(self.handler):
+            raise TypeError("handler must be callable")
+        if not callable(getattr(self.executor, "submit", None)):
+            raise TypeError("executor must define submit")
+        if not callable(getattr(self.executor, "shutdown", None)):
+            raise TypeError("executor must define shutdown")
+        if self.key_factory is not None and not callable(self.key_factory):
+            raise TypeError("key_factory must be callable")
 
     def submit(
         self,
@@ -87,47 +63,53 @@ class _HandlerRoute:
         payloads: tuple[bytes, ...],
         callback: Callable[[], ServerResponse],
     ) -> Future[ServerResponse]:
-        return self.executor.submit(ExecutionTask(callback, self.execution_key(identity, payloads)))
+        key = None if self.key_factory is None else self.key_factory(identity, payloads)
+        return self.executor.submit(callback, key)
 
 
 class MPServer:
-    """Route requests to inline, parallel, or keyed-affinity handlers."""
+    """Serve RPC routes and own their executors until the server is closed."""
 
-    def __init__(
-        self,
-        bind_url: str,
-        max_workers: int = 4,
-        handlers: Mapping[str, RequestHandler | HandlerSpec] | None = None,
-        *,
-        max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS,
-        affinity_workers: int | None = None,
-    ):
-        handler_specs = self._build_handler_specs(handlers)
-        self._inline_executor = InlineExecutor()
-        self._parallel_executor = BoundedThreadPoolExecutor(max_workers, max_pending_requests, "ascend-store-mp-server")
-        affinity_worker_count = max_workers if affinity_workers is None else affinity_workers
-        self._affinity_executor = self._create_affinity_executor(
-            handler_specs, affinity_worker_count, max_pending_requests
+    def __init__(self, bind_url: str, routes: Iterable[Route] = ()):
+        system_executor = InlineExecutor()
+        all_routes = (
+            Route(SystemMethod.PING, self._handle_ping, system_executor),
+            Route(SystemMethod.ECHO, self._handle_echo, system_executor),
+            *routes,
         )
-        self._routes = self._build_routes(handler_specs)
-
-        self._context = zmq.Context()
-        self._socket = self._context.socket(zmq.ROUTER)
+        self._routes = self._index_routes(all_routes)
+        self._executors = self._collect_executors(all_routes)
         try:
-            self.endpoint = self._bind(bind_url)
+            self._notify_reader, self._notify_writer = socket.socketpair()
         except BaseException:
-            self._socket.close(linger=0)
-            self._context.term()
-            if self._affinity_executor is not None:
-                self._affinity_executor.shutdown(wait=True, cancel_futures=True)
-            self._parallel_executor.shutdown(wait=True, cancel_futures=True)
+            self._shutdown_executors()
             raise
+
         self._output_queue: queue.Queue[ServerResponse] = queue.Queue()
-        self._notify_reader, self._notify_writer = socket.socketpair()
         self._notify_writer.setblocking(False)
         self._notify_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._closed = False
+
+        context = None
+        zmq_socket = None
+        try:
+            context = zmq.Context()
+            zmq_socket = context.socket(zmq.ROUTER)
+            self.endpoint = self._bind(zmq_socket, bind_url)
+        except BaseException:
+            if zmq_socket is not None:
+                zmq_socket.close(linger=0)
+            if context is not None:
+                context.term()
+            self._notify_reader.close()
+            self._notify_writer.close()
+            self._shutdown_executors()
+            self._closed = True
+            raise
+
+        self._context = context
+        self._socket = zmq_socket
 
     def __enter__(self) -> "MPServer":
         return self
@@ -136,56 +118,38 @@ class MPServer:
         self.close()
 
     @staticmethod
-    def _build_handler_specs(handlers: Mapping[str, RequestHandler | HandlerSpec] | None) -> dict[str, HandlerSpec]:
-        handler_specs = {
-            SystemMethod.PING.value: HandlerSpec(MPServer._handle_ping, ExecutionMode.INLINE),
-            SystemMethod.ECHO.value: HandlerSpec(MPServer._handle_echo, ExecutionMode.INLINE),
-        }
-        if handlers is None:
-            return handler_specs
-
-        for method, handler in handlers.items():
-            handler_specs[normalize_method(method)] = (
-                handler if isinstance(handler, HandlerSpec) else HandlerSpec(handler)
-            )
-        return handler_specs
+    def _index_routes(route_definitions: Iterable[Route]) -> dict[str, Route]:
+        indexed_routes = {}
+        for route in route_definitions:
+            if not isinstance(route, Route):
+                raise TypeError(f"routes must contain Route instances, got {type(route).__name__}")
+            if route.method in indexed_routes:
+                raise ValueError(f"Duplicate RPC method: {route.method}")
+            indexed_routes[route.method] = route
+        return indexed_routes
 
     @staticmethod
-    def _create_affinity_executor(
-        handler_specs: Mapping[str, HandlerSpec], max_workers: int, max_pending_requests: int
-    ) -> AffinityExecutor | None:
-        if not any(spec.execution_mode is ExecutionMode.AFFINITY for spec in handler_specs.values()):
-            return None
-        return AffinityExecutor(max_workers, max_pending_requests, "ascend-store-mp-affinity")
+    def _collect_executors(routes: Iterable[Route]) -> tuple[TaskExecutor, ...]:
+        executors = {}
+        for route in routes:
+            executors.setdefault(id(route.executor), route.executor)
+        return tuple(executors.values())
 
-    def _build_routes(self, handler_specs: Mapping[str, HandlerSpec]) -> dict[str, _HandlerRoute]:
-        executors: dict[ExecutionMode, TaskExecutor] = {
-            ExecutionMode.INLINE: self._inline_executor,
-            ExecutionMode.PARALLEL: self._parallel_executor,
-        }
-        if self._affinity_executor is not None:
-            executors[ExecutionMode.AFFINITY] = self._affinity_executor
+    def _shutdown_executors(self) -> None:
+        for executor in reversed(self._executors):
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                logger.exception("Failed to shut down MP server executor")
 
-        default_key_factories: dict[ExecutionMode, ExecutionKeyFactory] = {
-            ExecutionMode.INLINE: _no_affinity_key,
-            ExecutionMode.PARALLEL: _no_affinity_key,
-            ExecutionMode.AFFINITY: _client_identity_affinity_key,
-        }
-        routes = {}
-        for method, spec in handler_specs.items():
-            execution_key = default_key_factories[spec.execution_mode]
-            if spec.affinity_key is not None:
-                execution_key = spec.affinity_key
-            routes[method] = _HandlerRoute(spec.handler, executors[spec.execution_mode], execution_key)
-        return routes
-
-    def _bind(self, bind_url: str) -> str:
+    @staticmethod
+    def _bind(zmq_socket: zmq.Socket, bind_url: str) -> str:
         if bind_url.endswith(":*"):
             base_url = bind_url[:-2]
-            port = self._socket.bind_to_random_port(base_url)
+            port = zmq_socket.bind_to_random_port(base_url)
             return f"{base_url}:{port}"
 
-        self._socket.bind(bind_url)
+        zmq_socket.bind(bind_url)
         return bind_url
 
     @staticmethod
@@ -315,9 +279,7 @@ class MPServer:
                 return
 
             self._closed = True
-            if self._affinity_executor is not None:
-                self._affinity_executor.shutdown(wait=True, cancel_futures=True)
-            self._parallel_executor.shutdown(wait=True, cancel_futures=True)
+            self._shutdown_executors()
             self._socket.close(linger=0)
             self._notify_reader.close()
             self._notify_writer.close()

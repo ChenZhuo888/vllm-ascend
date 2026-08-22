@@ -21,8 +21,17 @@ from .registration import (
     WorkerFactory,
     WorkerRegistration,
 )
-from .rpc import ExecutionMode, HandlerSpec, MPServer, MPServerBusyError
+from .rpc import (
+    AffinityExecutor,
+    BoundedThreadPoolExecutor,
+    InlineExecutor,
+    MPServer,
+    MPServerBusyError,
+    Route,
+)
 from .service import ServiceBusyError
+
+_MAX_PENDING_REQUESTS = 64
 
 
 class KVCacheServer:
@@ -36,18 +45,20 @@ class KVCacheServer:
         worker_factory: WorkerFactory | None = None,
     ):
         self._service = KVCacheServiceManager(scheduler_factory, worker_factory)
+        inline_executor = InlineExecutor()
+        parallel_executor = BoundedThreadPoolExecutor(max_workers, _MAX_PENDING_REQUESTS, "ascend-store-kv-parallel")
+        affinity_executor = AffinityExecutor(max_workers, _MAX_PENDING_REQUESTS, "ascend-store-kv-affinity")
         self._rpc_server = MPServer(
             bind_url,
-            max_workers=max_workers,
-            handlers={
-                KVCacheMethod.REGISTER_SCHEDULER: self._handle_register_scheduler,
-                KVCacheMethod.REGISTER_WORKER: self._handle_register_worker,
-                KVCacheMethod.UNREGISTER_SCHEDULER: self._handle_unregister_scheduler,
-                KVCacheMethod.UNREGISTER_WORKER: self._handle_unregister_worker,
-                KVCacheMethod.RENEW_SCHEDULER: HandlerSpec(self._handle_renew_scheduler, ExecutionMode.INLINE),
-                KVCacheMethod.RENEW_WORKER: HandlerSpec(self._handle_renew_worker, ExecutionMode.INLINE),
-                KVCacheMethod.LOOKUP: HandlerSpec(self._handle_lookup, ExecutionMode.AFFINITY, lookup_affinity_key),
-            },
+            routes=(
+                Route(KVCacheMethod.REGISTER_SCHEDULER, self._handle_register_scheduler, parallel_executor),
+                Route(KVCacheMethod.REGISTER_WORKER, self._handle_register_worker, parallel_executor),
+                Route(KVCacheMethod.UNREGISTER_SCHEDULER, self._handle_unregister_scheduler, parallel_executor),
+                Route(KVCacheMethod.UNREGISTER_WORKER, self._handle_unregister_worker, parallel_executor),
+                Route(KVCacheMethod.RENEW_SCHEDULER, self._handle_renew_scheduler, inline_executor),
+                Route(KVCacheMethod.RENEW_WORKER, self._handle_renew_worker, inline_executor),
+                Route(KVCacheMethod.LOOKUP, self._handle_lookup, affinity_executor, lookup_affinity_key),
+            ),
         )
 
     def __enter__(self) -> "KVCacheServer":
