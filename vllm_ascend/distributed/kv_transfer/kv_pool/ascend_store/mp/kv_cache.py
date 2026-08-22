@@ -1,9 +1,9 @@
 """KV cache business facade for AscendStore multiprocessing mode."""
 
+import contextlib
 import enum
 import logging
 import threading
-import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -37,6 +37,7 @@ from .rpc import (
     MPServerBusyError,
     MPServerUnavailableError,
 )
+from .service import ServiceReaper
 
 if TYPE_CHECKING:
     from ..pool_scheduler import KVPoolScheduler
@@ -181,7 +182,7 @@ def _decode_worker_session(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity,
 
 
 def _encode_lookup_request(
-        registration: SchedulerRegistration, request: Request, num_computed_tokens: int
+    registration: SchedulerRegistration, request: Request, num_computed_tokens: int
 ) -> tuple[bytes, ...]:
     identity = registration.identity
     prompt_token_count = len(request.prompt_token_ids)
@@ -267,14 +268,11 @@ class KVCacheClient:
     def is_registered(self) -> bool:
         with self._registration_lock:
             return (
-                    not self._closed
-                    and not self._superseded
-                    and self._registered
-                    and self._rpc_client.is_server_responsive
+                not self._closed and not self._superseded and self._registered and self._rpc_client.is_server_responsive
             )
 
     def register_scheduler(
-            self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig | None, page_size_bytes: int
+        self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig | None, page_size_bytes: int
     ) -> bool:
         registration = SchedulerRegistration.create(
             vllm_config, kv_cache_config, page_size_bytes, session_id=self._session_id
@@ -321,10 +319,8 @@ class KVCacheClient:
             registered = self._registered
 
         if not registered:
-            try:
+            with contextlib.suppress(ServiceSessionExpiredError):
                 self._try_register()
-            except ServiceSessionExpiredError:
-                pass
             return
 
         if isinstance(registration, SchedulerRegistration):
@@ -341,10 +337,8 @@ class KVCacheClient:
         except MPRemoteError as exc:
             if str(exc).startswith(_SERVICE_NOT_REGISTERED_PREFIX):
                 self._mark_unregistered()
-                try:
+                with contextlib.suppress(ServiceSessionExpiredError):
                     self._try_register()
-                except ServiceSessionExpiredError:
-                    pass
                 return
             if str(exc).startswith(_STALE_SESSION_PREFIX):
                 self._mark_superseded()
@@ -422,7 +416,7 @@ class KVCacheClient:
         return configured_registration[0]
 
     def lookup(
-            self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS
+        self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS
     ) -> tuple[int, bool]:
         self._raise_if_superseded()
         registration = self._get_scheduler_registration()
@@ -493,11 +487,11 @@ class KVCacheServer:
     """Own Scheduler and Worker services and expose their operations through RPC."""
 
     def __init__(
-            self,
-            bind_url: str,
-            max_workers: int = 4,
-            scheduler_factory: SchedulerFactory | None = None,
-            worker_factory: WorkerFactory | None = None,
+        self,
+        bind_url: str,
+        max_workers: int = 4,
+        scheduler_factory: SchedulerFactory | None = None,
+        worker_factory: WorkerFactory | None = None,
     ):
         self._registry = KVCacheServiceRegistry(
             scheduler_factory or self._create_scheduler,
@@ -512,15 +506,17 @@ class KVCacheServer:
                 KVCacheMethod.REGISTER_WORKER: self._handle_register_worker,
                 KVCacheMethod.UNREGISTER_SCHEDULER: self._handle_unregister_scheduler,
                 KVCacheMethod.UNREGISTER_WORKER: self._handle_unregister_worker,
-                KVCacheMethod.HEARTBEAT_SCHEDULER: HandlerSpec(
-                    self._handle_scheduler_heartbeat, ExecutionMode.INLINE
-                ),
+                KVCacheMethod.HEARTBEAT_SCHEDULER: HandlerSpec(self._handle_scheduler_heartbeat, ExecutionMode.INLINE),
                 KVCacheMethod.HEARTBEAT_WORKER: HandlerSpec(self._handle_worker_heartbeat, ExecutionMode.INLINE),
                 KVCacheMethod.LOOKUP: HandlerSpec(self._handle_lookup, ExecutionMode.AFFINITY, _lookup_affinity_key),
             },
         )
-        self._reaper_stop = threading.Event()
-        self._reaper_thread: threading.Thread | None = None
+        self._service_reaper = ServiceReaper(
+            self._registry.reap_stale,
+            stale_timeout_s=_SERVICE_STALE_TIMEOUT_S,
+            interval_s=_SERVICE_REAP_INTERVAL_S,
+            thread_name="ascend-store-kv-reaper",
+        )
 
     def __enter__(self) -> "KVCacheServer":
         return self
@@ -542,7 +538,7 @@ class KVCacheServer:
 
     @staticmethod
     def _create_scheduler(
-            registration: SchedulerRegistration, lookup_handler: WorkerLookupHandler
+        registration: SchedulerRegistration, lookup_handler: WorkerLookupHandler
     ) -> "KVPoolScheduler":
         from .lookup_worker import MPKVPoolScheduler
 
@@ -589,13 +585,13 @@ class KVCacheServer:
         return (_REGISTRATION_RESPONSE,)
 
     def _lookup_worker(
-            self,
-            scheduler_identity: SchedulerIdentity,
-            token_len: int,
-            block_hashes: Sequence[BlockHash],
-            kv_cache_group_ids: list[int] | None,
-            use_layerwise: bool,
-            hbm_hit_tokens: int,
+        self,
+        scheduler_identity: SchedulerIdentity,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        kv_cache_group_ids: list[int] | None,
+        use_layerwise: bool,
+        hbm_hit_tokens: int,
     ) -> int:
         worker_identity = WorkerIdentity(
             scheduler_identity.engine_id, rank=0, data_parallel_rank=scheduler_identity.data_parallel_rank
@@ -619,39 +615,14 @@ class KVCacheServer:
             _ASYNC_RESPONSE if is_async else _SYNC_RESPONSE,
         )
 
-    def _reaper_loop(self) -> None:
-        while not self._reaper_stop.wait(_SERVICE_REAP_INTERVAL_S):
-            try:
-                stale_before = time.monotonic() - _SERVICE_STALE_TIMEOUT_S
-                self._registry.reap_stale(stale_before)
-            except Exception:
-                logger.exception("KV cache service reaper failed")
-
-    def _start_reaper(self) -> None:
-        if self._reaper_thread is not None and self._reaper_thread.is_alive():
-            return
-        self._reaper_stop.clear()
-        self._reaper_thread = threading.Thread(target=self._reaper_loop, daemon=True, name="ascend-store-kv-reaper")
-        self._reaper_thread.start()
-
-    def _stop_reaper(self) -> None:
-        reaper_thread = self._reaper_thread
-        if reaper_thread is None:
-            return
-        self._reaper_stop.set()
-        if reaper_thread is not threading.current_thread():
-            reaper_thread.join()
-        if self._reaper_thread is reaper_thread:
-            self._reaper_thread = None
-
     def run(self) -> None:
-        self._start_reaper()
+        self._service_reaper.start()
         try:
             self._rpc_server.run()
         finally:
-            self._stop_reaper()
+            self._service_reaper.stop()
 
     def close(self) -> None:
-        self._stop_reaper()
+        self._service_reaper.stop()
         self._rpc_server.close()
         self._registry.close()
