@@ -80,7 +80,7 @@ class _AcceptedRequest:
 class _ResponseEnvelope:
     frames: ServerResponse
     request_key: _RequestKey | None = None
-    is_abort: bool = False
+    is_abort_response: bool = False
 
 
 class _ServerState(Enum):
@@ -164,6 +164,7 @@ class MPServer:
         with self._state_condition:
             if self._state in {_ServerState.ABORTED, _ServerState.CLOSED}:
                 raise RuntimeError("MPServer is closed")
+            # request_stop() may win the race with a newly started run thread.
             if self._run_thread is not None or self._state not in {_ServerState.READY, _ServerState.DRAINING}:
                 raise RuntimeError("MPServer.run() can only be called once")
             if self._state is _ServerState.READY:
@@ -177,6 +178,8 @@ class MPServer:
             socket_events = zmq.POLLIN
 
             while not self._should_stop_run():
+                # Backpressure must drain queued responses before more requests
+                # are accepted, otherwise memory use can grow without bound.
                 expected_socket_events = zmq.POLLOUT if self._response_backlog else zmq.POLLIN
                 if socket_events != expected_socket_events:
                     socket_events = expected_socket_events
@@ -199,6 +202,7 @@ class MPServer:
         finally:
             with self._state_condition:
                 controlled_stop = self._state in {_ServerState.DRAINING, _ServerState.ABORTING}
+            # A stopped run loop must never leave its ROUTER socket doing I/O.
             with self._close_lock:
                 self._close_transport(_RESPONSE_LINGER_MS if controlled_stop else 0)
 
@@ -207,6 +211,7 @@ class MPServer:
                 if self._state is _ServerState.DRAINING:
                     self._state = _ServerState.DRAINED
                 aborting = self._state is _ServerState.ABORTING
+                # wait_until_stopped() waits for this exact predicate.
                 self._state_condition.notify_all()
             if aborting:
                 self._release_resources(
@@ -234,10 +239,11 @@ class MPServer:
                 return False
 
             deadlines_ns = [request.deadline_ns for request in requests if request.deadline_ns is not None]
+            # Reuse client deadlines instead of inventing a shorter server-side
+            # shutdown timeout that could terminate otherwise valid requests.
             self._graceful_deadline_ns = max(deadlines_ns, default=None)
             self._state = _ServerState.DRAINING
             run_active = self._run_thread is not None
-            self._state_condition.notify_all()
         if run_active:
             self._notify_response_ready()
         return True
@@ -248,6 +254,7 @@ class MPServer:
             if self._run_thread is None:
                 return True
             if self._run_thread is threading.current_thread():
+                # The run thread cannot wait for its own finally block.
                 return False
             return self._state_condition.wait_for(lambda: self._run_thread is None, timeout)
 
@@ -259,17 +266,20 @@ class MPServer:
             if self._state is not _ServerState.DRAINING:
                 return False
             if self._run_thread is None:
+                # Without an I/O thread, accepted responses can never be sent.
                 if self._accepted_requests:
                     return False
                 self._state = _ServerState.DRAINED
-                self._state_condition.notify_all()
                 return True
             deadline_ns = self._graceful_deadline_ns
 
+        # request_stop() guarantees that every accepted request contributing to
+        # this upper bound has a finite deadline.
         timeout = None if deadline_ns is None else max(0.0, (deadline_ns - time.monotonic_ns()) / 1_000_000_000)
         if not self.wait_until_stopped(timeout):
             return False
         with self._state_condition:
+            # A run loop stopped by abort is not a successful drain.
             return self._state in {_ServerState.DRAINED, _ServerState.CLOSED} and not self._accepted_requests
 
     def abort(self) -> None:
@@ -285,10 +295,9 @@ class MPServer:
             requests = tuple(self._accepted_requests.values())
             for request in requests:
                 self._output_queue.put(
-                    _ResponseEnvelope(self._encode_abort_response(request), request.key, is_abort=True)
+                    _ResponseEnvelope(self._encode_abort_response(request), request.key, is_abort_response=True)
                 )
             run_active = self._run_thread is not None
-            self._state_condition.notify_all()
 
         self._shutdown_executors(wait=False, cancel_futures=True)
         self._notify_response_ready()
@@ -413,6 +422,7 @@ class MPServer:
             try:
                 self._notify_writer.send(b"\x01")
             except BlockingIOError:
+                # A full notification socket already guarantees a poll wakeup.
                 pass
             except OSError:
                 with self._state_condition:
@@ -551,8 +561,9 @@ class MPServer:
                 if response.request_key not in self._accepted_requests:
                     self._response_backlog.popleft()
                     continue
-                aborting = self._state is _ServerState.ABORTING or self._state is _ServerState.ABORTED
-                if aborting and not response.is_abort:
+                # Once abort owns a request, any normal response queued earlier
+                # must yield to the abort response without completing the request.
+                if self._state is _ServerState.ABORTING and not response.is_abort_response:
                     self._response_backlog.popleft()
                     continue
 
@@ -576,6 +587,8 @@ class MPServer:
     ) -> None:
         if final_state not in {_ServerState.ABORTED, _ServerState.CLOSED}:
             raise ValueError(f"Invalid terminal MP server state: {final_state}")
+        # Only a valid DRAINED -> CLOSED or ABORTING -> ABORTED transition
+        # may claim ownership of the shared cleanup sequence.
         expected_state = _ServerState.ABORTING if final_state is _ServerState.ABORTED else _ServerState.DRAINED
 
         with self._close_lock:
@@ -584,13 +597,16 @@ class MPServer:
                     return
                 if self._state is not expected_state:
                     return
+                # Publish the winner before slow cleanup. Concurrent close()
+                # calls wait on _close_lock before reporting success.
                 self._state = final_state
-                self._state_condition.notify_all()
 
             self._close_transport(linger_ms)
             if shutdown_executors:
                 aborted = final_state is _ServerState.ABORTED
                 self._shutdown_executors(wait=not aborted, cancel_futures=aborted)
+            # Notification sockets outlive executor shutdown, and the ZMQ
+            # context outlives its ROUTER socket.
             self._notify_reader.close()
             self._notify_writer.close()
             self._context.term()
