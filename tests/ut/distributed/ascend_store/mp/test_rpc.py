@@ -300,8 +300,49 @@ def test_server_request_stop_wakes_run_loop() -> None:
 
         assert not server_thread.is_alive()
         assert server._socket.closed
+        with pytest.raises(RuntimeError, match="can only be called once"):
+            server.run()
     finally:
         server.close()
+
+
+def test_server_run_honors_stop_requested_before_start() -> None:
+    server = MPServer("tcp://127.0.0.1:*")
+    server_thread = threading.Thread(target=server.run)
+
+    try:
+        assert server.request_stop()
+        server_thread.start()
+        server_thread.join(timeout=5)
+
+        assert not server_thread.is_alive()
+    finally:
+        server.close()
+
+
+def test_server_close_before_run_is_idempotent() -> None:
+    server = MPServer("tcp://127.0.0.1:*")
+
+    assert server.close()
+    assert server.close()
+    assert server._socket.closed
+    with pytest.raises(RuntimeError, match="MPServer is closed"):
+        server.run()
+
+
+def test_server_abort_wins_after_drain_before_close() -> None:
+    server = MPServer("tcp://127.0.0.1:*")
+    wait_for_drain = server.wait_for_drain
+
+    def abort_after_drain() -> bool:
+        assert wait_for_drain()
+        server.abort()
+        return True
+
+    server.wait_for_drain = abort_after_drain
+
+    assert not server.close()
+    assert server._socket.closed
 
 
 def test_server_constructor_closes_executor_after_route_validation_failure() -> None:
@@ -478,7 +519,7 @@ def test_server_abort_cancels_queued_requests_without_waiting_for_running_handle
         assert queued_request_submitted.wait(5), "Queued request was not submitted in time"
 
         assert not server.request_stop()
-        assert not server._stop_requested.is_set()
+        assert client.ping(timeout_ms=2000) == "OK"
         server.abort()
         server_thread.join(timeout=5)
 
@@ -553,7 +594,7 @@ def test_server_close_rejects_request_without_deadline() -> None:
         assert handler_started.wait(5), "Handler did not start in time"
 
         assert not server.close()
-        assert not server._stop_requested.is_set()
+        assert client.ping(timeout_ms=2000) == "OK"
         assert not request_future.done()
     finally:
         server.abort()
@@ -583,7 +624,8 @@ def test_server_close_returns_false_after_request_deadline() -> None:
         assert handler_started.wait(5), "Handler did not start in time"
 
         assert not server.close()
-        assert server._stop_requested.is_set()
+        with pytest.raises(MPServerBusyError, match="MP server is stopping"):
+            client.ping(timeout_ms=2000)
         with pytest.raises(MPRequestTimeoutError):
             request_future.result(timeout=5)
     finally:
