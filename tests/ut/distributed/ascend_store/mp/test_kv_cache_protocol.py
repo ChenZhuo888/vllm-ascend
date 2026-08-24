@@ -9,7 +9,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protoc
     decode_lookup_response,
     decode_registration,
     decode_registration_request,
+    decode_request_finished,
+    decode_request_finished_response,
     decode_scheduler_session,
+    decode_update_connector_output,
+    decode_update_connector_output_response,
     decode_update_state_after_alloc,
     decode_worker_session,
     encode_build_connector_meta_request,
@@ -18,7 +22,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protoc
     encode_lookup_response,
     encode_registration,
     encode_registration_request,
+    encode_request_finished,
+    encode_request_finished_response,
     encode_scheduler_session,
+    encode_update_connector_output,
+    encode_update_connector_output_response,
     encode_update_state_after_alloc,
     encode_worker_session,
     lookup_affinity_key,
@@ -234,3 +242,43 @@ def test_build_connector_meta_response_round_trip() -> None:
 
     assert metadata == marker
     assert touch_block_ids == [5, 8]
+
+
+def test_request_finished_round_trip() -> None:
+    registration = SchedulerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        page_size_bytes=0,
+        session_id="scheduler-session",
+    )
+    for all_groups, block_ids in ((False, [7, 8]), (True, ([7], [8]))):
+        payloads = encode_request_finished(registration, "request-0", block_ids, all_groups)
+        identity, session_id, request_id, decoded_block_ids, decoded_all_groups = decode_request_finished(payloads)
+
+        assert scheduler_affinity_key(b"client", payloads) == registration.identity
+        assert identity == registration.identity
+        assert session_id == registration.session_id
+        assert request_id == "request-0"
+        assert decoded_block_ids == block_ids
+        assert decoded_all_groups is all_groups
+
+    response = encode_request_finished_response(True, None)
+    assert decode_request_finished_response(response) == (True, None)
+
+
+def test_update_connector_output_round_trip() -> None:
+    registration = SchedulerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        page_size_bytes=0,
+        session_id="scheduler-session",
+    )
+
+    payloads = encode_update_connector_output(registration, {7: 1, 9: 1})
+    identity, session_id, completed_events = decode_update_connector_output(payloads)
+
+    assert scheduler_affinity_key(b"client", payloads) == registration.identity
+    assert (identity, session_id) == (registration.identity, registration.session_id)
+    assert completed_events == {7: 1, 9: 1}
+
+    assert decode_update_connector_output_response(encode_update_connector_output_response([5, 8])) == [5, 8]

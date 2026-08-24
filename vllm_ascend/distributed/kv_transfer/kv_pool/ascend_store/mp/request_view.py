@@ -1,8 +1,12 @@
 """Serializable stand-ins for vLLM objects consumed inside the KVCacheServer process."""
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from vllm.v1.core.kv_cache_utils import BlockHash
+
+if TYPE_CHECKING:
+    from ..metadata import AscendStoreKVConnectorWorkerMetadata
 
 
 @dataclass
@@ -38,6 +42,21 @@ class BlocksView:
 
     def get_block_ids(self) -> tuple[list[int], ...]:
         return tuple(self.block_ids_by_group)
+
+
+@dataclass
+class RequestIdView:
+    """Minimal request stand-in for callbacks that read only the id."""
+
+    request_id: str
+
+
+@dataclass
+class ConnectorOutputView:
+    """Stand-in for KVConnectorOutput: worker-side completion counts for the
+    in-flight sending events, consumed by the inherited event accounting."""
+
+    kv_connector_worker_meta: "AscendStoreKVConnectorWorkerMetadata"
 
 
 @dataclass

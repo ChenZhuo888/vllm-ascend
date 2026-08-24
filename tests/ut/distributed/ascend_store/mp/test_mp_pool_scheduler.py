@@ -4,7 +4,11 @@ import pytest
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import ReqMeta
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendStoreKVConnectorWorkerMetadata,
+    ReqMeta,
+    RequestTracker,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.mp_pool_scheduler import MPKVPoolScheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
     SchedulerIdentity,
@@ -13,6 +17,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration im
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import (
     BlocksView,
     CachedReqsView,
+    ConnectorOutputView,
+    RequestIdView,
     RequestView,
     ScheduledNewReqPayload,
     SchedulerOutputView,
@@ -345,3 +351,70 @@ def test_mp_scheduler_records_block_pool_touch_commands() -> None:
     assert scheduler.take_block_pool_commands() == [5, 8]
     assert scheduler.take_block_pool_commands() == []
     assert scheduler.sending_blocks[req_meta.event_id] == [5, 8]
+
+
+def test_mp_scheduler_request_finished_consumer_no_put() -> None:
+    scheduler, _ = _make_scheduler(kv_role="kv_consumer")
+    scheduler._delayed_free_req_ids.add("r1")
+
+    assert scheduler.request_finished(RequestIdView("r1"), [7]) == (False, None)
+    assert "r1" not in scheduler._delayed_free_req_ids
+
+
+def test_mp_scheduler_request_finished_without_saved_tokens() -> None:
+    scheduler, _ = _make_scheduler()
+    tracker = RequestTracker(req_id="r1", token_len=64, allocated_block_ids_by_group=[[7]])
+    scheduler._request_trackers["r1"] = tracker
+
+    assert scheduler.request_finished(RequestIdView("r1"), [7]) == (False, None)
+    assert "r1" not in scheduler._delayed_free_req_ids
+
+
+def test_mp_scheduler_request_finished_with_saved_tokens_delays_free() -> None:
+    scheduler, _ = _make_scheduler()
+    tracker = RequestTracker(req_id="r1", token_len=64, allocated_block_ids_by_group=[[7]])
+    tracker.num_saved_tokens = 64
+    scheduler._request_trackers["r1"] = tracker
+
+    assert scheduler.request_finished(RequestIdView("r1"), [7]) == (True, None)
+    assert "r1" in scheduler._delayed_free_req_ids
+
+
+def _make_connector_output(completed_events: dict[int, int]) -> ConnectorOutputView:
+    return ConnectorOutputView(kv_connector_worker_meta=AscendStoreKVConnectorWorkerMetadata(completed_events))
+
+
+def test_mp_scheduler_update_connector_output_completes_event_and_frees_blocks() -> None:
+    scheduler, _ = _make_scheduler()
+    # world_size is 1 in the test config, so a single worker report completes the event.
+    scheduler.sending_events[7] = 0
+    scheduler.sending_blocks[7] = [5, 8]
+
+    scheduler.update_connector_output(_make_connector_output({7: 1}))
+
+    assert scheduler.take_free_block_commands() == [5, 8]
+    assert scheduler.take_free_block_commands() == []
+    assert 7 not in scheduler.sending_events
+    assert 7 not in scheduler.sending_blocks
+
+
+def test_mp_scheduler_update_connector_output_accumulates_partial_counts() -> None:
+    scheduler, _ = _make_scheduler()
+    scheduler._expected_worker_count = 2
+    scheduler.sending_events[7] = 0
+    scheduler.sending_blocks[7] = [5, 8]
+
+    scheduler.update_connector_output(_make_connector_output({7: 1}))
+
+    assert scheduler.take_free_block_commands() == []
+    assert scheduler.sending_events[7] == 1
+    assert scheduler.sending_blocks[7] == [5, 8]
+
+
+def test_mp_scheduler_update_connector_output_ignores_unknown_event() -> None:
+    scheduler, _ = _make_scheduler()
+
+    scheduler.update_connector_output(_make_connector_output({999: 1}))
+
+    assert scheduler.take_free_block_commands() == []
+    assert scheduler.sending_events == {}

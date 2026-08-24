@@ -19,7 +19,7 @@ from .registration import (
     WorkerLookupHandler,
     WorkerRegistration,
 )
-from .request_view import BlocksView, RequestView, SchedulerOutputView
+from .request_view import BlocksView, ConnectorOutputView, RequestIdView, RequestView, SchedulerOutputView
 from .rpc import TaskExecutor
 from .service import ServiceLifecycleManager
 
@@ -175,6 +175,35 @@ class KVCacheServiceManager:
         take_commands = getattr(scheduler, "take_block_pool_commands", None)
         touch_block_ids = take_commands() if callable(take_commands) else []
         return metadata, touch_block_ids
+
+    def request_finished(
+        self,
+        identity: SchedulerIdentity,
+        session_id: str,
+        req_id: str,
+        block_ids,
+        all_groups: bool,
+    ) -> tuple:
+        scheduler = self._schedulers.get_for_session(identity, session_id)
+        if scheduler is None:
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        request = RequestIdView(request_id=req_id)
+        if all_groups:
+            return scheduler.request_finished_all_groups(request, block_ids)
+        return scheduler.request_finished(request, block_ids)
+
+    def update_connector_output(
+        self,
+        identity: SchedulerIdentity,
+        session_id: str,
+        output: ConnectorOutputView,
+    ) -> list[int]:
+        scheduler = self._schedulers.get_for_session(identity, session_id)
+        if scheduler is None:
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        scheduler.update_connector_output(output)
+        take_free = getattr(scheduler, "take_free_block_commands", None)
+        return take_free() if callable(take_free) else []
 
     def start_lease_maintenance(self) -> None:
         self._schedulers.start_maintenance()

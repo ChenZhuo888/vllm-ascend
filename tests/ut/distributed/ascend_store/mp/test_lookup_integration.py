@@ -311,6 +311,11 @@ def test_build_connector_meta_round_trip_after_lookup_and_alloc() -> None:
         assert len(metadata.requests) == 1
         assert metadata.requests[0].req_id == "request-0"
         assert metadata.requests[0].load_spec is not None
+
+        # The build step saved tokens, so closing the request delays the block
+        # free; an empty worker output round-trips without disturbing the session.
+        assert scheduler_client.request_finished("request-0", [7, 8]) == (True, None)
+        assert scheduler_client.update_connector_output({}) == []
     finally:
         worker_client.close()
         scheduler_client.close()

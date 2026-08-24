@@ -64,6 +64,11 @@ class MPKVPoolScheduler(KVPoolScheduler):
         on the real BlockPool and clears the list."""
         return self._block_pool.take_touch_ids()
 
+    def take_free_block_commands(self) -> list[int]:
+        """Block ids whose sending events completed across all workers; the
+        connector replays the frees on the real BlockPool."""
+        return self._block_pool.take_free_ids()
+
     def _sync_request_views(self, output: SchedulerOutputView) -> None:
         """Refresh the dynamic fields on registered views from the projection.
 

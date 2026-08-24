@@ -48,6 +48,8 @@ class KVCacheMethod(str, enum.Enum):
     LOOKUP = "LOOKUP"
     UPDATE_STATE_AFTER_ALLOC = "UPDATE_STATE_AFTER_ALLOC"
     BUILD_CONNECTOR_META = "BUILD_CONNECTOR_META"
+    REQUEST_FINISHED = "REQUEST_FINISHED"
+    UPDATE_CONNECTOR_OUTPUT = "UPDATE_CONNECTOR_OUTPUT"
 
 
 @dataclass
@@ -357,6 +359,98 @@ def encode_build_connector_meta_response(metadata, touch_block_ids: list[int]) -
 def decode_build_connector_meta_response(payload: bytes) -> tuple:
     body = _decode_body(payload, f"{KVCacheMethod.BUILD_CONNECTOR_META.value} response")
     return body["metadata"], body["touch_block_ids"]
+
+
+_REQUEST_FINISHED_PAYLOADS = 6
+_SINGLE_GROUP_VARIANT = b"\x00"
+_ALL_GROUPS_VARIANT = b"\x01"
+
+
+def encode_request_finished(
+    registration: SchedulerRegistration,
+    request_id: str,
+    block_ids,
+    all_groups: bool,
+) -> tuple[bytes, ...]:
+    identity = registration.identity
+    return (
+        _encode_text(identity.engine_id, "engine_id"),
+        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
+        _encode_text(request_id, "request_id"),
+        _ALL_GROUPS_VARIANT if all_groups else _SINGLE_GROUP_VARIANT,
+        _encode_text(registration.session_id, "session_id"),
+        _encode_body({"block_ids": block_ids}, KVCacheMethod.REQUEST_FINISHED.value),
+    )
+
+
+def decode_request_finished(payloads: tuple[bytes, ...]) -> tuple[SchedulerIdentity, str, str, object, bool]:
+    if len(payloads) != _REQUEST_FINISHED_PAYLOADS:
+        raise MPProtocolError(
+            f"{KVCacheMethod.REQUEST_FINISHED.value} expects "
+            f"{_REQUEST_FINISHED_PAYLOADS} payloads, got {len(payloads)}"
+        )
+    identity = _decode_scheduler_identity(payloads)
+    request_id = _decode_text(payloads[2], "request_id")
+    all_groups = payloads[3] == _ALL_GROUPS_VARIANT
+    if payloads[3] not in (_SINGLE_GROUP_VARIANT, _ALL_GROUPS_VARIANT):
+        raise MPProtocolError(f"Invalid REQUEST_FINISHED variant: {payloads[3]!r}")
+    session_id = _decode_text(payloads[4], "session_id")
+    block_ids = _decode_body(payloads[5], KVCacheMethod.REQUEST_FINISHED.value)["block_ids"]
+    return identity, session_id, request_id, block_ids, all_groups
+
+
+def encode_request_finished_response(delay_free: bool, extra: dict | None) -> bytes:
+    return _encode_body(
+        {"delay_free": delay_free, "extra": extra},
+        f"{KVCacheMethod.REQUEST_FINISHED.value} response",
+    )
+
+
+def decode_request_finished_response(payload: bytes) -> tuple[bool, dict | None]:
+    body = _decode_body(payload, f"{KVCacheMethod.REQUEST_FINISHED.value} response")
+    return body["delay_free"], body["extra"]
+
+
+_UPDATE_CONNECTOR_OUTPUT_PAYLOADS = 4
+
+
+def encode_update_connector_output(
+    registration: SchedulerRegistration,
+    completed_events: dict[int, int],
+) -> tuple[bytes, ...]:
+    identity = registration.identity
+    return (
+        _encode_text(identity.engine_id, "engine_id"),
+        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
+        _encode_text(registration.session_id, "session_id"),
+        _encode_body(
+            {"completed_events": dict(completed_events)},
+            KVCacheMethod.UPDATE_CONNECTOR_OUTPUT.value,
+        ),
+    )
+
+
+def decode_update_connector_output(payloads: tuple[bytes, ...]) -> tuple[SchedulerIdentity, str, dict[int, int]]:
+    if len(payloads) != _UPDATE_CONNECTOR_OUTPUT_PAYLOADS:
+        raise MPProtocolError(
+            f"{KVCacheMethod.UPDATE_CONNECTOR_OUTPUT.value} expects "
+            f"{_UPDATE_CONNECTOR_OUTPUT_PAYLOADS} payloads, got {len(payloads)}"
+        )
+    identity = _decode_scheduler_identity(payloads)
+    session_id = _decode_text(payloads[2], "session_id")
+    completed_events = _decode_body(payloads[3], KVCacheMethod.UPDATE_CONNECTOR_OUTPUT.value)["completed_events"]
+    return identity, session_id, completed_events
+
+
+def encode_update_connector_output_response(free_block_ids: list[int]) -> bytes:
+    return _encode_body(
+        {"free_block_ids": list(free_block_ids)},
+        f"{KVCacheMethod.UPDATE_CONNECTOR_OUTPUT.value} response",
+    )
+
+
+def decode_update_connector_output_response(payload: bytes) -> list[int]:
+    return _decode_body(payload, f"{KVCacheMethod.UPDATE_CONNECTOR_OUTPUT.value} response")["free_block_ids"]
 
 
 def _decode_lookup_identity(payloads: tuple[bytes, ...]) -> SchedulerIdentity:

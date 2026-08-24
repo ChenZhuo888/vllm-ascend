@@ -1,7 +1,9 @@
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -12,8 +14,11 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreKVEvents
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendStoreKVConnectorWorkerMetadata
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
 
 if TYPE_CHECKING:
@@ -52,11 +57,13 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         )
         self._kv_cache_client = KVCacheClient(_get_kv_cache_server_url(vllm_config))
         # Scheduler-process-local state: the live Request references feeding
-        # the all_token_ids increments, and the real BlockPool the server's
-        # touch/free commands are replayed on.
+        # the all_token_ids increments, the real BlockPool the server's
+        # touch/free commands are replayed on, and the KV event aggregation
+        # fed from worker outputs.
         self._local_requests: dict[str, Request] = {}
         self._synced_token_len: dict[str, int] = {}
         self._gpu_block_pool = None
+        self._kv_cache_events: AscendStoreKVEvents | None = None
 
         try:
             if role == KVConnectorRole.SCHEDULER:
@@ -130,6 +137,54 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         # The BlockPool never crosses the process border; the server's mamba
         # bookkeeping returns block-id commands that are replayed on it here.
         self._gpu_block_pool = gpu_block_pool
+
+    def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
+        if self.role != KVConnectorRole.SCHEDULER:
+            raise RuntimeError("request_finished is only available on the scheduler connector")
+        delay_free, extra = self._kv_cache_client.request_finished(request.request_id, block_ids)
+        self._local_requests.pop(request.request_id, None)
+        self._synced_token_len.pop(request.request_id, None)
+        return delay_free, extra
+
+    def request_finished_all_groups(
+        self, request: Request, block_ids: tuple[list[int], ...]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        if self.role != KVConnectorRole.SCHEDULER:
+            raise RuntimeError("request_finished_all_groups is only available on the scheduler connector")
+        delay_free, extra = self._kv_cache_client.request_finished(request.request_id, block_ids, all_groups=True)
+        self._local_requests.pop(request.request_id, None)
+        self._synced_token_len.pop(request.request_id, None)
+        return delay_free, extra
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        if self.role != KVConnectorRole.SCHEDULER:
+            raise RuntimeError("update_connector_output is only available on the scheduler connector")
+        worker_meta = connector_output.kv_connector_worker_meta
+        completed_events = (
+            worker_meta.completed_events if isinstance(worker_meta, AscendStoreKVConnectorWorkerMetadata) else {}
+        )
+        free_block_ids = self._kv_cache_client.update_connector_output(completed_events)
+        if free_block_ids and self._gpu_block_pool is not None:
+            pool = self._gpu_block_pool
+            pool.free_blocks([pool.blocks[block_id] for block_id in free_block_ids])
+
+        # KV events are a pure data stream: aggregate locally instead of
+        # round-tripping them through the server.
+        kv_cache_events = connector_output.kv_cache_events
+        if not kv_cache_events or not isinstance(kv_cache_events, AscendStoreKVEvents):
+            return
+        if self._kv_cache_events is None:
+            self._kv_cache_events = kv_cache_events
+        else:
+            self._kv_cache_events.add_events(kv_cache_events.get_all_events())
+            self._kv_cache_events.increment_workers(kv_cache_events.get_number_of_workers())
+
+    def take_events(self) -> Iterable[KVCacheEvent]:
+        if self._kv_cache_events is not None:
+            self._kv_cache_events.aggregate()
+            kv_cache_events = self._kv_cache_events.get_all_events()
+            yield from kv_cache_events
+            self._kv_cache_events = None
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         return None
