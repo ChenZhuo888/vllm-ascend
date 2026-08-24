@@ -8,6 +8,7 @@ from typing import TypeVar
 import cloudpickle
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
 
 from .registration import (
@@ -16,7 +17,13 @@ from .registration import (
     WorkerIdentity,
     WorkerRegistration,
 )
-from .request_view import BlocksView, RequestView
+from .request_view import (
+    BlocksView,
+    CachedReqsView,
+    RequestView,
+    ScheduledNewReqPayload,
+    SchedulerOutputView,
+)
 from .rpc import MPProtocolError
 
 ACK_RESPONSE = b"OK"
@@ -40,6 +47,7 @@ class KVCacheMethod(str, enum.Enum):
     RENEW_WORKER = "RENEW_WORKER"
     LOOKUP = "LOOKUP"
     UPDATE_STATE_AFTER_ALLOC = "UPDATE_STATE_AFTER_ALLOC"
+    BUILD_CONNECTOR_META = "BUILD_CONNECTOR_META"
 
 
 @dataclass
@@ -256,6 +264,7 @@ def decode_update_state_after_alloc(
             block_hashes=list(body["block_hashes"]),
             num_prompt_tokens=len(body["prompt_token_ids"]),
             num_tokens=body["num_tokens"],
+            all_token_ids=list(body["prompt_token_ids"]),
         )
         blocks = BlocksView(block_ids_by_group=[list(group) for group in body["block_ids_by_group"]])
         num_external_tokens = _decode_non_negative_int(payloads[3], "num_external_tokens")
@@ -263,6 +272,91 @@ def decode_update_state_after_alloc(
         raise MPProtocolError(f"UPDATE_STATE_AFTER_ALLOC body is missing key: {exc}") from exc
     session_id = _decode_text(payloads[4], "session_id")
     return identity, session_id, view, blocks, num_external_tokens
+
+
+_BUILD_CONNECTOR_META_PAYLOADS = 4
+
+
+def encode_build_connector_meta_request(
+    registration: SchedulerRegistration,
+    scheduler_output: SchedulerOutput,
+    new_token_ids: dict[str, list[int]],
+) -> tuple[bytes, ...]:
+    """Project the SchedulerOutput fields the scheduler-side business needs.
+
+    Identity stays hand-encoded for affinity routing; the projection body
+    (per-step dynamic fields plus token increments) travels as one blob.
+    new_token_ids carries the all_token_ids increments the connector collects
+    from its local Request references.
+    """
+    identity = registration.identity
+    cached = scheduler_output.scheduled_cached_reqs
+    body = {
+        "finished_req_ids": set(scheduler_output.finished_req_ids or ()),
+        "preempted_req_ids": set(scheduler_output.preempted_req_ids or ()),
+        "num_scheduled_tokens": dict(scheduler_output.num_scheduled_tokens),
+        "new_reqs": [
+            (req.req_id, req.num_computed_tokens, [list(group) for group in (req.block_ids or ())])
+            for req in scheduler_output.scheduled_new_reqs
+        ],
+        "cached_req_ids": list(cached.req_ids),
+        "cached_new_block_ids": [
+            None if blocks is None else [list(group) for group in blocks] for blocks in cached.new_block_ids
+        ],
+        "cached_num_computed_tokens": list(cached.num_computed_tokens),
+        "cached_new_token_ids": {req_id: list(tokens) for req_id, tokens in new_token_ids.items()},
+    }
+    return (
+        _encode_text(identity.engine_id, "engine_id"),
+        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
+        _encode_text(registration.session_id, "session_id"),
+        _encode_body(body, KVCacheMethod.BUILD_CONNECTOR_META.value),
+    )
+
+
+def decode_build_connector_meta_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[SchedulerIdentity, str, SchedulerOutputView]:
+    if len(payloads) != _BUILD_CONNECTOR_META_PAYLOADS:
+        raise MPProtocolError(
+            f"{KVCacheMethod.BUILD_CONNECTOR_META.value} expects "
+            f"{_BUILD_CONNECTOR_META_PAYLOADS} payloads, got {len(payloads)}"
+        )
+    identity = _decode_scheduler_identity(payloads)
+    session_id = _decode_text(payloads[2], "session_id")
+    body = _decode_body(payloads[3], KVCacheMethod.BUILD_CONNECTOR_META.value)
+    view = SchedulerOutputView(
+        finished_req_ids=body["finished_req_ids"],
+        preempted_req_ids=body["preempted_req_ids"],
+        num_scheduled_tokens=body["num_scheduled_tokens"],
+        scheduled_new_reqs=[
+            ScheduledNewReqPayload(
+                req_id=req_id,
+                num_computed_tokens=num_computed_tokens,
+                block_ids_by_group=block_ids_by_group,
+            )
+            for req_id, num_computed_tokens, block_ids_by_group in body["new_reqs"]
+        ],
+        scheduled_cached_reqs=CachedReqsView(
+            req_ids=body["cached_req_ids"],
+            new_block_ids=body["cached_new_block_ids"],
+            num_computed_tokens=body["cached_num_computed_tokens"],
+            new_token_ids=body["cached_new_token_ids"],
+        ),
+    )
+    return identity, session_id, view
+
+
+def encode_build_connector_meta_response(metadata, touch_block_ids: list[int]) -> bytes:
+    return _encode_body(
+        {"metadata": metadata, "touch_block_ids": list(touch_block_ids)},
+        f"{KVCacheMethod.BUILD_CONNECTOR_META.value} response",
+    )
+
+
+def decode_build_connector_meta_response(payload: bytes) -> tuple:
+    body = _decode_body(payload, f"{KVCacheMethod.BUILD_CONNECTOR_META.value} response")
+    return body["metadata"], body["touch_block_ids"]
 
 
 def _decode_lookup_identity(payloads: tuple[bytes, ...]) -> SchedulerIdentity:

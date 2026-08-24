@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import (
+    decode_build_connector_meta_request,
+    decode_build_connector_meta_response,
     decode_lookup_request,
     decode_lookup_response,
     decode_registration,
@@ -10,6 +12,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protoc
     decode_scheduler_session,
     decode_update_state_after_alloc,
     decode_worker_session,
+    encode_build_connector_meta_request,
+    encode_build_connector_meta_response,
     encode_lookup_request,
     encode_lookup_response,
     encode_registration,
@@ -180,3 +184,53 @@ def test_update_state_after_alloc_zero_external_carries_no_block_ids() -> None:
 
     with pytest.raises(MPProtocolError, match="expects 6 payloads"):
         decode_update_state_after_alloc(payloads[:5])
+
+
+def test_build_connector_meta_request_round_trip() -> None:
+    registration = SchedulerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        page_size_bytes=0,
+        session_id="scheduler-session",
+    )
+    scheduler_output = SimpleNamespace(
+        finished_req_ids={"done-0"},
+        preempted_req_ids=set(),
+        num_scheduled_tokens={"request-0": 48},
+        scheduled_new_reqs=[SimpleNamespace(req_id="request-0", num_computed_tokens=16, block_ids=([7, 8], [9]))],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["request-1"],
+            new_block_ids=[([10],)],
+            num_computed_tokens=[64],
+        ),
+    )
+    new_token_ids = {"request-1": [101, 102]}
+
+    payloads = encode_build_connector_meta_request(registration, scheduler_output, new_token_ids)
+    identity, session_id, view = decode_build_connector_meta_request(payloads)
+
+    assert scheduler_affinity_key(b"client", payloads) == registration.identity
+    assert (identity, session_id) == (registration.identity, registration.session_id)
+    assert view.finished_req_ids == {"done-0"}
+    assert view.preempted_req_ids == set()
+    assert view.num_scheduled_tokens == {"request-0": 48}
+    new_req = view.scheduled_new_reqs[0]
+    assert (new_req.req_id, new_req.num_computed_tokens) == ("request-0", 16)
+    assert new_req.block_ids_by_group == [[7, 8], [9]]
+    cached = view.scheduled_cached_reqs
+    assert cached.req_ids == ["request-1"]
+    assert cached.new_block_ids == [[[10]]]
+    assert cached.num_computed_tokens == [64]
+    assert cached.new_token_ids == {"request-1": [101, 102]}
+
+    with pytest.raises(MPProtocolError, match="expects 4 payloads"):
+        decode_build_connector_meta_request(payloads[:3])
+
+
+def test_build_connector_meta_response_round_trip() -> None:
+    marker = SimpleNamespace(name="metadata-marker")
+    payload = encode_build_connector_meta_response(marker, [5, 8])
+    metadata, touch_block_ids = decode_build_connector_meta_response(payload)
+
+    assert metadata == marker
+    assert touch_block_ids == [5, 8]

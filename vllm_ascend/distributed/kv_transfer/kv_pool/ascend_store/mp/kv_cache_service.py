@@ -19,7 +19,7 @@ from .registration import (
     WorkerLookupHandler,
     WorkerRegistration,
 )
-from .request_view import BlocksView, RequestView
+from .request_view import BlocksView, RequestView, SchedulerOutputView
 from .rpc import TaskExecutor
 from .service import ServiceLifecycleManager
 
@@ -161,6 +161,20 @@ class KVCacheServiceManager:
         # The inherited method stores the view in _unfinished_requests, which
         # doubles as the request registry for later business methods.
         scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+
+    def build_connector_meta(
+        self,
+        identity: SchedulerIdentity,
+        session_id: str,
+        output: SchedulerOutputView,
+    ) -> tuple:
+        scheduler = self._schedulers.get_for_session(identity, session_id)
+        if scheduler is None:
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        metadata = scheduler.build_connector_meta(output)
+        take_commands = getattr(scheduler, "take_block_pool_commands", None)
+        touch_block_ids = take_commands() if callable(take_commands) else []
+        return metadata, touch_block_ids
 
     def start_lease_maintenance(self) -> None:
         self._schedulers.start_maintenance()

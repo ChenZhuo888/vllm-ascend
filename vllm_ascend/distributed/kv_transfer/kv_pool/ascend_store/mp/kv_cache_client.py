@@ -7,6 +7,7 @@ import uuid
 
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 
@@ -14,7 +15,9 @@ from .kv_cache_error import SERVICE_NOT_REGISTERED_PREFIX, STALE_SESSION_PREFIX,
 from .kv_cache_protocol import (
     ACK_RESPONSE,
     KVCacheMethod,
+    decode_build_connector_meta_response,
     decode_lookup_response,
+    encode_build_connector_meta_request,
     encode_lookup_request,
     encode_registration_request,
     encode_scheduler_session,
@@ -299,6 +302,42 @@ class KVCacheClient:
 
         if responses != [ACK_RESPONSE]:
             raise MPProtocolError(f"{KVCacheMethod.UPDATE_STATE_AFTER_ALLOC.value} expects an OK response")
+
+    def build_connector_meta(
+        self,
+        scheduler_output: SchedulerOutput,
+        new_token_ids: dict[str, list[int]],
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> tuple | None:
+        """Return (metadata, touch_block_ids) or None when degraded."""
+        self._raise_if_superseded()
+        registration = self._get_scheduler_registration()
+        payloads = encode_build_connector_meta_request(registration, scheduler_output, new_token_ids)
+
+        if not self.is_registered and not self._try_register():
+            return None
+
+        try:
+            responses = self._rpc_client.request(KVCacheMethod.BUILD_CONNECTOR_META, payloads, timeout_ms=timeout_ms)
+        except MPServerBusyError:
+            return None
+        except (MPRequestTimeoutError, MPServerUnavailableError):
+            self._mark_unregistered()
+            return None
+        except MPRemoteError as exc:
+            if str(exc).startswith(SERVICE_NOT_REGISTERED_PREFIX):
+                self._mark_unregistered()
+                return None
+            if str(exc).startswith(STALE_SESSION_PREFIX):
+                self._mark_superseded()
+                raise ServiceSessionExpiredError(str(exc)) from exc
+            raise
+
+        if len(responses) != 1:
+            raise MPProtocolError(
+                f"{KVCacheMethod.BUILD_CONNECTOR_META.value} expects 1 response payload, got {len(responses)}"
+            )
+        return decode_build_connector_meta_response(responses[0])
 
     def _unregister(self) -> None:
         with self._registration_lock:

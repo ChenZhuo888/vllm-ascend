@@ -81,10 +81,11 @@ def test_worker_cannot_call_scheduler_lookup() -> None:
         client_class.return_value.lookup.assert_not_called()
 
 
-def test_build_connector_meta_returns_empty_metadata() -> None:
+def test_build_connector_meta_returns_empty_metadata_when_degraded() -> None:
     config = _make_vllm_config()
 
-    with patch(f"{CONNECTOR_MODULE}.KVCacheClient"):
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.build_connector_meta.return_value = None
         connector = AscendStoreMPConnector(config, KVConnectorRole.SCHEDULER, _make_kv_cache_config())
         metadata = connector.build_connector_meta(MagicMock())
 

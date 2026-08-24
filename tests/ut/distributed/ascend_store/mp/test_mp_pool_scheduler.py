@@ -4,12 +4,19 @@ import pytest
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import ReqMeta
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.mp_pool_scheduler import MPKVPoolScheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
     SchedulerIdentity,
     SchedulerRegistration,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import BlocksView, RequestView
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import (
+    BlocksView,
+    CachedReqsView,
+    RequestView,
+    ScheduledNewReqPayload,
+    SchedulerOutputView,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import KVPoolScheduler
 
 # isort: on
@@ -182,6 +189,7 @@ def _make_view(request: MagicMock) -> RequestView:
         block_hashes=list(request.block_hashes),
         num_prompt_tokens=len(request.prompt_token_ids),
         num_tokens=request.num_tokens,
+        all_token_ids=list(request.prompt_token_ids),
     )
 
 
@@ -232,3 +240,108 @@ def test_mp_scheduler_update_state_after_alloc_rejects_mismatched_allocation() -
 
     with pytest.raises(AssertionError, match="Mismatch in number of tokens"):
         scheduler.update_state_after_alloc(_make_view(request), BlocksView(block_ids_by_group=[[7]]), 31)
+
+
+def _make_output_view(
+    new_reqs: list[ScheduledNewReqPayload] | None = None,
+    cached: CachedReqsView | None = None,
+    num_scheduled_tokens: dict | None = None,
+    finished: set[str] | None = None,
+    preempted: set[str] | None = None,
+) -> SchedulerOutputView:
+    empty_cached = CachedReqsView(req_ids=[], new_block_ids=[], num_computed_tokens=[], new_token_ids={})
+    return SchedulerOutputView(
+        finished_req_ids=finished or set(),
+        preempted_req_ids=preempted or set(),
+        num_scheduled_tokens=num_scheduled_tokens or {},
+        scheduled_new_reqs=new_reqs or [],
+        scheduled_cached_reqs=cached or empty_cached,
+    )
+
+
+def test_mp_scheduler_build_meta_new_request_produces_req_meta() -> None:
+    scheduler, lookup_handler = _make_scheduler()
+    lookup_handler.return_value = 48
+    request = _make_request()
+    scheduler.get_num_new_matched_tokens(request, 16)
+    view = _make_view(request)
+    scheduler.update_state_after_alloc(view, BlocksView(block_ids_by_group=[[7, 8]]), 32)
+
+    output = _make_output_view(
+        new_reqs=[ScheduledNewReqPayload(req_id="r1", num_computed_tokens=16, block_ids_by_group=[[7, 8]])],
+        num_scheduled_tokens={"r1": 48},
+    )
+    metadata = scheduler.build_connector_meta(output)
+
+    assert len(metadata.requests) == 1
+    req_meta = metadata.requests[0]
+    assert req_meta.req_id == "r1"
+    assert req_meta.target_token_len == 64
+    assert req_meta.block_ids_by_group == [[7, 8]]
+    assert req_meta.load_spec is not None and req_meta.load_spec.can_load
+    assert "r1" in scheduler._request_trackers
+
+
+def test_mp_scheduler_build_meta_refreshes_dynamic_fields_for_decode() -> None:
+    scheduler, lookup_handler = _make_scheduler()
+    lookup_handler.return_value = 48
+    request = _make_request()
+    scheduler.get_num_new_matched_tokens(request, 16)
+    scheduler.update_state_after_alloc(_make_view(request), BlocksView(block_ids_by_group=[[7, 8]]), 32)
+    scheduler.build_connector_meta(
+        _make_output_view(
+            new_reqs=[ScheduledNewReqPayload(req_id="r1", num_computed_tokens=16, block_ids_by_group=[[7, 8]])],
+            num_scheduled_tokens={"r1": 48},
+        )
+    )
+
+    # Second step: the request is fully computed (decode phase) with one new
+    # generated token; without save_decode_cache the inherited logic skips it.
+    output = _make_output_view(
+        cached=CachedReqsView(
+            req_ids=["r1"],
+            new_block_ids=[[[10]]],
+            num_computed_tokens=[64],
+            new_token_ids={"r1": [101]},
+        ),
+        num_scheduled_tokens={"r1": 1},
+    )
+    metadata = scheduler.build_connector_meta(output)
+
+    assert metadata.requests == []
+    view = scheduler._unfinished_requests["r1"][0]
+    assert view.num_computed_tokens == 64
+    assert view.all_token_ids[-1] == 101
+    assert len(view.all_token_ids) == 65
+
+
+def test_mp_scheduler_build_meta_async_load_uses_registered_view() -> None:
+    scheduler, lookup_handler = _make_scheduler(extra_config={"backend": "mooncake", "load_async": True})
+    lookup_handler.return_value = 48
+    request = _make_request()
+    scheduler.get_num_new_matched_tokens(request, 0)
+    scheduler.update_state_after_alloc(_make_view(request), BlocksView(block_ids_by_group=[[7, 8, 9]]), 48)
+
+    # The request is not part of this scheduling step; the async path must
+    # still produce a load ReqMeta from the registered view.
+    metadata = scheduler.build_connector_meta(_make_output_view())
+
+    assert len(metadata.requests) == 1
+    req_meta = metadata.requests[0]
+    assert req_meta.req_id == "r1"
+    assert req_meta.load_spec is not None and req_meta.load_spec.can_load
+    assert "r1" in scheduler._loading_req_ids
+
+
+def test_mp_scheduler_records_block_pool_touch_commands() -> None:
+    scheduler, _ = _make_scheduler()
+    scheduler.use_hybrid = True
+    scheduler.mamba_group_ids = [0]
+    req_meta = ReqMeta(req_id="r1", token_len_chunk=32, block_ids_by_group=[[5, 8]], block_hashes=[], can_save=True)
+
+    scheduler.touch_sending_mamba_blocks(req_meta)
+
+    assert req_meta.event_id is not None
+    assert scheduler.take_block_pool_commands() == [5, 8]
+    assert scheduler.take_block_pool_commands() == []
+    assert scheduler.sending_blocks[req_meta.event_id] == [5, 8]
