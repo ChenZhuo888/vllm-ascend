@@ -9,6 +9,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration im
     SchedulerIdentity,
     SchedulerRegistration,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import BlocksView, RequestView
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import KVPoolScheduler
 
 # isort: on
@@ -172,3 +173,62 @@ def test_mp_scheduler_layerwise_partial_layer_miss_stops_at_last_full_block() ->
     need, _ = scheduler.get_num_new_matched_tokens(request, 0)
 
     assert need == 48
+
+
+def _make_view(request: MagicMock) -> RequestView:
+    return RequestView(
+        request_id=request.request_id,
+        prompt_token_ids=list(request.prompt_token_ids),
+        block_hashes=list(request.block_hashes),
+        num_prompt_tokens=len(request.prompt_token_ids),
+        num_tokens=request.num_tokens,
+    )
+
+
+def test_mp_scheduler_update_state_after_alloc_flips_can_load_and_registers_view() -> None:
+    scheduler, lookup_handler = _make_scheduler()
+    lookup_handler.return_value = 48
+    request = _make_request()
+    scheduler.get_num_new_matched_tokens(request, 16)
+
+    view = _make_view(request)
+    scheduler.update_state_after_alloc(view, BlocksView(block_ids_by_group=[[7, 8]]), 32)
+
+    assert scheduler.load_specs["r1"].can_load is True
+    stored_request, stored_blocks = scheduler._unfinished_requests["r1"]
+    assert stored_request is view
+    assert stored_blocks == [[7, 8]]
+
+
+def test_mp_scheduler_update_state_after_alloc_without_load_spec_only_registers() -> None:
+    scheduler, _ = _make_scheduler()
+    request = _make_request()
+
+    view = _make_view(request)
+    scheduler.update_state_after_alloc(view, BlocksView(block_ids_by_group=[[7]]), 16)
+
+    assert "r1" not in scheduler.load_specs
+    assert scheduler._unfinished_requests["r1"] == (view, [[7]])
+
+
+def test_mp_scheduler_update_state_after_alloc_zero_external_keeps_load_unloadable() -> None:
+    scheduler, lookup_handler = _make_scheduler()
+    lookup_handler.return_value = 48
+    request = _make_request()
+    scheduler.get_num_new_matched_tokens(request, 16)
+
+    scheduler.update_state_after_alloc(_make_view(request), BlocksView(block_ids_by_group=[]), 0)
+
+    # Non-layerwise requests with zero allocated blocks cannot load.
+    assert scheduler.load_specs["r1"].can_load is False
+    assert scheduler._unfinished_requests["r1"][1] == [[]]
+
+
+def test_mp_scheduler_update_state_after_alloc_rejects_mismatched_allocation() -> None:
+    scheduler, lookup_handler = _make_scheduler()
+    lookup_handler.return_value = 48
+    request = _make_request()
+    scheduler.get_num_new_matched_tokens(request, 16)
+
+    with pytest.raises(AssertionError, match="Mismatch in number of tokens"):
+        scheduler.update_state_after_alloc(_make_view(request), BlocksView(block_ids_by_group=[[7]]), 31)

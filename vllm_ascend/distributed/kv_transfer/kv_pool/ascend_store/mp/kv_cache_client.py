@@ -6,6 +6,7 @@ import threading
 import uuid
 
 from vllm.config import VllmConfig
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 
@@ -17,6 +18,7 @@ from .kv_cache_protocol import (
     encode_lookup_request,
     encode_registration_request,
     encode_scheduler_session,
+    encode_update_state_after_alloc,
     encode_worker_session,
 )
 from .registration import SchedulerRegistration, WorkerRegistration
@@ -263,6 +265,40 @@ class KVCacheClient:
             raise
 
         return decode_lookup_response(responses)
+
+    def update_state_after_alloc(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        num_external_tokens: int,
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> None:
+        self._raise_if_superseded()
+        registration = self._get_scheduler_registration()
+        payloads = encode_update_state_after_alloc(registration, request, blocks, num_external_tokens)
+
+        if not self.is_registered and not self._try_register():
+            return
+
+        try:
+            responses = self._rpc_client.request(
+                KVCacheMethod.UPDATE_STATE_AFTER_ALLOC, payloads, timeout_ms=timeout_ms
+            )
+        except MPServerBusyError:
+            return
+        except (MPRequestTimeoutError, MPServerUnavailableError):
+            self._mark_unregistered()
+        except MPRemoteError as exc:
+            if str(exc).startswith(SERVICE_NOT_REGISTERED_PREFIX):
+                self._mark_unregistered()
+            elif str(exc).startswith(STALE_SESSION_PREFIX):
+                self._mark_superseded()
+                raise ServiceSessionExpiredError(str(exc)) from exc
+            else:
+                raise
+
+        if responses != [ACK_RESPONSE]:
+            raise MPProtocolError(f"{KVCacheMethod.UPDATE_STATE_AFTER_ALLOC.value} expects an OK response")
 
     def _unregister(self) -> None:
         with self._registration_lock:

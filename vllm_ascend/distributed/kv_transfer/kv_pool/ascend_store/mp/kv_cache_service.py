@@ -19,6 +19,7 @@ from .registration import (
     WorkerLookupHandler,
     WorkerRegistration,
 )
+from .request_view import BlocksView, RequestView
 from .rpc import TaskExecutor
 from .service import ServiceLifecycleManager
 
@@ -145,6 +146,21 @@ class KVCacheServiceManager:
         if scheduler is None:
             raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
         return scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+
+    def update_state_after_alloc(
+        self,
+        identity: SchedulerIdentity,
+        session_id: str,
+        request: RequestView,
+        blocks: BlocksView,
+        num_external_tokens: int,
+    ) -> None:
+        scheduler = self._schedulers.get_for_session(identity, session_id)
+        if scheduler is None:
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        # The inherited method stores the view in _unfinished_requests, which
+        # doubles as the request registry for later business methods.
+        scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
 
     def start_lease_maintenance(self) -> None:
         self._schedulers.start_maintenance()

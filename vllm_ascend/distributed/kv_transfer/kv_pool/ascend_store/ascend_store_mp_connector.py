@@ -79,7 +79,9 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         return self._kv_cache_client.lookup(request, num_computed_tokens)
 
     def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int) -> None:
-        return None
+        if self.role != KVConnectorRole.SCHEDULER:
+            raise RuntimeError("update_state_after_alloc is only available on the scheduler connector")
+        self._kv_cache_client.update_state_after_alloc(request, blocks, num_external_tokens)
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         return AscendStoreMPConnectorMetadata()

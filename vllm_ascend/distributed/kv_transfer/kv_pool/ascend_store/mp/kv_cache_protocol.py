@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 import cloudpickle
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.request import Request
 
@@ -15,6 +16,7 @@ from .registration import (
     WorkerIdentity,
     WorkerRegistration,
 )
+from .request_view import BlocksView, RequestView
 from .rpc import MPProtocolError
 
 ACK_RESPONSE = b"OK"
@@ -37,6 +39,7 @@ class KVCacheMethod(str, enum.Enum):
     RENEW_SCHEDULER = "RENEW_SCHEDULER"
     RENEW_WORKER = "RENEW_WORKER"
     LOOKUP = "LOOKUP"
+    UPDATE_STATE_AFTER_ALLOC = "UPDATE_STATE_AFTER_ALLOC"
 
 
 @dataclass
@@ -78,6 +81,24 @@ def decode_registration(payloads: tuple[bytes, ...], expected_type: type[Registr
     if not isinstance(registration, expected_type):
         raise MPProtocolError(f"Expected {expected_type.__name__}, got {type(registration).__name__}")
     return registration
+
+
+def _encode_body(value: dict, method: str) -> bytes:
+    try:
+        return cloudpickle.dumps(value)
+    except Exception as exc:
+        raise MPProtocolError(f"Failed to encode {method} body") from exc
+
+
+def _decode_body(payload: bytes, method: str) -> dict:
+    try:
+        value = cloudpickle.loads(payload)
+    except Exception as exc:
+        raise MPProtocolError(f"Failed to decode {method} body") from exc
+
+    if not isinstance(value, dict):
+        raise MPProtocolError(f"{method} body must be a dict, got {type(value).__name__}")
+    return value
 
 
 def decode_registration_request(
@@ -184,6 +205,64 @@ def decode_lookup_response(payloads: Sequence[bytes]) -> tuple[int, bool]:
     if len(payloads) != 2:
         raise MPProtocolError(f"LOOKUP expects 2 response payloads, got {len(payloads)}")
     return _decode_non_negative_int(payloads[0], "matched_tokens"), _decode_async_response(payloads[1])
+
+
+_UPDATE_STATE_AFTER_ALLOC_PAYLOADS = 6
+
+
+def encode_update_state_after_alloc(
+    registration: SchedulerRegistration,
+    request: Request,
+    blocks: KVCacheBlocks,
+    num_external_tokens: int,
+) -> tuple[bytes, ...]:
+    """Register the request's static fields and report the allocation result.
+
+    The identity header stays hand-encoded so affinity routing never depends
+    on the pickled body; the heavy lists travel in one cloudpickle blob.
+    """
+    identity = registration.identity
+    block_ids_by_group = [list(group) for group in blocks.get_block_ids()] if num_external_tokens > 0 else []
+    body = {
+        "prompt_token_ids": list(request.prompt_token_ids),
+        "block_hashes": list(request.block_hashes),
+        "num_tokens": request.num_tokens,
+        "block_ids_by_group": block_ids_by_group,
+    }
+    return (
+        _encode_text(identity.engine_id, "engine_id"),
+        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
+        _encode_text(request.request_id, "request_id"),
+        _encode_non_negative_int(num_external_tokens, "num_external_tokens"),
+        _encode_text(registration.session_id, "session_id"),
+        _encode_body(body, KVCacheMethod.UPDATE_STATE_AFTER_ALLOC.value),
+    )
+
+
+def decode_update_state_after_alloc(
+    payloads: tuple[bytes, ...],
+) -> tuple[SchedulerIdentity, str, RequestView, BlocksView, int]:
+    if len(payloads) != _UPDATE_STATE_AFTER_ALLOC_PAYLOADS:
+        raise MPProtocolError(
+            f"{KVCacheMethod.UPDATE_STATE_AFTER_ALLOC.value} expects "
+            f"{_UPDATE_STATE_AFTER_ALLOC_PAYLOADS} payloads, got {len(payloads)}"
+        )
+    identity = _decode_scheduler_identity(payloads)
+    body = _decode_body(payloads[5], KVCacheMethod.UPDATE_STATE_AFTER_ALLOC.value)
+    try:
+        view = RequestView(
+            request_id=_decode_text(payloads[2], "request_id"),
+            prompt_token_ids=list(body["prompt_token_ids"]),
+            block_hashes=list(body["block_hashes"]),
+            num_prompt_tokens=len(body["prompt_token_ids"]),
+            num_tokens=body["num_tokens"],
+        )
+        blocks = BlocksView(block_ids_by_group=[list(group) for group in body["block_ids_by_group"]])
+        num_external_tokens = _decode_non_negative_int(payloads[3], "num_external_tokens")
+    except KeyError as exc:
+        raise MPProtocolError(f"UPDATE_STATE_AFTER_ALLOC body is missing key: {exc}") from exc
+    session_id = _decode_text(payloads[4], "session_id")
+    return identity, session_id, view, blocks, num_external_tokens
 
 
 def _decode_lookup_identity(payloads: tuple[bytes, ...]) -> SchedulerIdentity:

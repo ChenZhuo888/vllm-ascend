@@ -1,6 +1,7 @@
 import multiprocessing as mp
 import time
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # isort: off
@@ -243,6 +244,32 @@ def test_lookup_returns_miss_after_coordinator_unregisters() -> None:
         worker_client.close()
 
         assert scheduler_client.lookup(_make_request("request-1"), num_computed_tokens=0) == (0, False)
+    finally:
+        worker_client.close()
+        scheduler_client.close()
+        _stop_lookup_server(process)
+
+
+def test_update_state_after_alloc_round_trip_after_lookup() -> None:
+    worker_results = {("engine-0", 0, 0): [1, 1]}
+    process, endpoint = _start_lookup_server(worker_results)
+    worker_client = _create_client(endpoint)
+    scheduler_client = _create_client(endpoint)
+
+    try:
+        assert worker_client.register_worker(_make_vllm_config(), kv_cache_config=None)
+        assert scheduler_client.register_scheduler(
+            _make_vllm_config(),
+            kv_cache_config=None,
+            page_size_bytes=0,
+        )
+        assert scheduler_client.lookup(_make_request(), num_computed_tokens=0) == (31, False)
+
+        blocks = SimpleNamespace(get_block_ids=lambda: ([7],))
+        scheduler_client.update_state_after_alloc(_make_request(), blocks, num_external_tokens=31)
+
+        # The server keeps serving the same scheduler session afterwards.
+        assert scheduler_client.lookup(_make_request("request-1"), num_computed_tokens=0) == (31, False)
     finally:
         worker_client.close()
         scheduler_client.close()

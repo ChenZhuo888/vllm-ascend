@@ -12,6 +12,7 @@ from .kv_cache_protocol import (
     decode_lookup_request,
     decode_registration_request,
     decode_scheduler_session,
+    decode_update_state_after_alloc,
     decode_worker_session,
     encode_lookup_response,
     lookup_affinity_key,
@@ -71,6 +72,7 @@ class KVCacheServer:
                 scheduler_route(KVCacheMethod.UNREGISTER_SCHEDULER, self._handle_unregister_scheduler),
                 lease_route(KVCacheMethod.RENEW_SCHEDULER, self._handle_renew_scheduler),
                 lookup_route(KVCacheMethod.LOOKUP, self._handle_lookup),
+                scheduler_route(KVCacheMethod.UPDATE_STATE_AFTER_ALLOC, self._handle_update_state_after_alloc),
                 worker_route(KVCacheMethod.REGISTER_WORKER, self._handle_register_worker),
                 worker_route(KVCacheMethod.UNREGISTER_WORKER, self._handle_unregister_worker),
                 lease_route(KVCacheMethod.RENEW_WORKER, self._handle_renew_worker),
@@ -140,6 +142,11 @@ class KVCacheServer:
             num_computed_tokens,
         )
         return encode_lookup_response(matched_tokens, is_async)
+
+    def _handle_update_state_after_alloc(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, request, blocks, num_external_tokens = decode_update_state_after_alloc(payloads)
+        self._service.update_state_after_alloc(identity, session_id, request, blocks, num_external_tokens)
+        return (ACK_RESPONSE,)
 
     def run(self) -> None:
         try:

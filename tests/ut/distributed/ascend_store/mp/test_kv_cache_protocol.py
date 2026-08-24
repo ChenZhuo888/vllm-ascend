@@ -8,12 +8,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protoc
     decode_registration,
     decode_registration_request,
     decode_scheduler_session,
+    decode_update_state_after_alloc,
     decode_worker_session,
     encode_lookup_request,
     encode_lookup_response,
     encode_registration,
     encode_registration_request,
     encode_scheduler_session,
+    encode_update_state_after_alloc,
     encode_worker_session,
     lookup_affinity_key,
     scheduler_affinity_key,
@@ -124,3 +126,57 @@ def test_lookup_protocol_rejects_malformed_payloads() -> None:
         scheduler_affinity_key(b"client", ())
     with pytest.raises(MPProtocolError, match="expects 2 response payloads"):
         decode_lookup_response([])
+
+
+def test_update_state_after_alloc_round_trip() -> None:
+    registration = SchedulerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        page_size_bytes=0,
+        session_id="scheduler-session",
+    )
+    request = SimpleNamespace(
+        request_id="request-0",
+        prompt_token_ids=list(range(64)),
+        block_hashes=[bytes([idx]) * 32 for idx in range(4)],
+        num_tokens=64,
+    )
+    blocks = SimpleNamespace(get_block_ids=lambda: ([7, 8], [9]))
+
+    payloads = encode_update_state_after_alloc(registration, request, blocks, num_external_tokens=48)
+    identity, session_id, view, decoded_blocks, num_external_tokens = decode_update_state_after_alloc(payloads)
+
+    assert scheduler_affinity_key(b"client", payloads) == registration.identity
+    assert (identity, session_id) == (registration.identity, registration.session_id)
+    assert num_external_tokens == 48
+    assert view.request_id == request.request_id
+    assert view.prompt_token_ids == request.prompt_token_ids
+    assert view.block_hashes == request.block_hashes
+    assert view.num_prompt_tokens == 64
+    assert view.num_tokens == 64
+    assert decoded_blocks.get_block_ids() == ([7, 8], [9])
+
+
+def test_update_state_after_alloc_zero_external_carries_no_block_ids() -> None:
+    registration = SchedulerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        page_size_bytes=0,
+        session_id="scheduler-session",
+    )
+    request = SimpleNamespace(
+        request_id="request-0",
+        prompt_token_ids=[1, 2, 3],
+        block_hashes=[b"hash-0", b"hash-1"],
+        num_tokens=3,
+    )
+    blocks = SimpleNamespace(get_block_ids=lambda: ([7],))
+
+    payloads = encode_update_state_after_alloc(registration, request, blocks, num_external_tokens=0)
+    _, _, _, decoded_blocks, num_external_tokens = decode_update_state_after_alloc(payloads)
+
+    assert num_external_tokens == 0
+    assert decoded_blocks.get_block_ids() == ()
+
+    with pytest.raises(MPProtocolError, match="expects 6 payloads"):
+        decode_update_state_after_alloc(payloads[:5])
