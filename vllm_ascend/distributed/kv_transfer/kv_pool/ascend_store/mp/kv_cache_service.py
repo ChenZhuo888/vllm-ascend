@@ -78,15 +78,15 @@ class KVCacheServiceManager:
     def _create_scheduler(
         registration: SchedulerRegistration, lookup_handler: WorkerLookupHandler
     ) -> "KVPoolScheduler":
-        from .lookup_worker import MPKVPoolScheduler
+        from .mp_pool_scheduler import MPKVPoolScheduler
 
         return MPKVPoolScheduler(registration, lookup_handler)
 
     @staticmethod
     def _create_worker(registration: WorkerRegistration) -> "KVPoolWorker":
-        from .lookup_worker import LookupKVPoolWorker
+        from .mp_pool_worker import MPKVPoolWorker
 
-        return LookupKVPoolWorker(
+        return MPKVPoolWorker(
             registration.vllm_config,
             kv_cache_config=registration.kv_cache_config,
             rank=registration.identity.rank,

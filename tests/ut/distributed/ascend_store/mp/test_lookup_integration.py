@@ -9,10 +9,8 @@ import zmq.asyncio  # noqa: F401
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheServer
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.lookup_worker import (
-    LookupKVPoolWorker,
-    MPKVPoolScheduler,
-)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.mp_pool_scheduler import MPKVPoolScheduler
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.mp_pool_worker import MPKVPoolWorker
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
     SchedulerRegistration,
     WorkerLookupHandler,
@@ -85,10 +83,10 @@ def _create_scheduler(
 def _create_worker(
     registration: WorkerRegistration,
     worker_results: dict[tuple[str, int, int], list[int]],
-) -> LookupKVPoolWorker:
+) -> MPKVPoolWorker:
     identity = registration.identity
     worker_key = (identity.engine_id, identity.data_parallel_rank, identity.rank)
-    return LookupKVPoolWorker(
+    return MPKVPoolWorker(
         registration.vllm_config,
         store=_FakeStore(worker_results[worker_key]),
         kv_cache_config=registration.kv_cache_config,
