@@ -230,7 +230,7 @@ def test_worker_cache_spec_is_configured_on_its_owner_lane() -> None:
 
     service_manager = KVCacheServiceManager(worker_factory=worker_factory, worker_executor=worker_executor)
     registrations = [_worker_registration(f"worker-{rank}", rank=rank) for rank in workers]
-    specs = {rank: WorkerKVCacheSpec({f"layer.{rank}": ()}) for rank in workers}
+    specs = {rank: WorkerKVCacheSpec(generation=1, caches={f"layer.{rank}": ()}, storages=()) for rank in workers}
 
     try:
         for registration in registrations:

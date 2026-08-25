@@ -5,6 +5,7 @@ import logging
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum, auto
 
 from vllm.config import VllmConfig
@@ -55,6 +56,13 @@ _LEASE_REQUEST_TIMEOUT_MS = 1000
 _ConfiguredRegistration = tuple[SchedulerRegistration | WorkerRegistration, tuple[bytes, ...]]
 
 
+@dataclass(frozen=True)
+class _WorkerKVCacheRegistration:
+    spec: WorkerKVCacheSpec
+    payloads: tuple[bytes, ...]
+    on_registered: Callable[[WorkerKVCacheSpec], None] | None
+
+
 class _RegistrationState(Enum):
     """Client-local knowledge of the configured service registration."""
 
@@ -76,7 +84,7 @@ class KVCacheClient:
         self._lease_stop = threading.Event()
         self._lease_thread: threading.Thread | None = None
         self._registration: _ConfiguredRegistration | None = None
-        self._worker_kv_cache_payloads: tuple[bytes, ...] | None = None
+        self._worker_kv_cache_registration: _WorkerKVCacheRegistration | None = None
         self._session_id = uuid.uuid4().hex
         self._registration_state = _RegistrationState.UNCONFIGURED
         self._closed = False
@@ -205,7 +213,7 @@ class KVCacheClient:
                     raise ServiceSessionExpiredError("KV cache service session has been superseded")
 
                 configured_registration = self._registration
-                worker_kv_cache_payloads = self._worker_kv_cache_payloads
+                worker_kv_cache_registration = self._worker_kv_cache_registration
                 if configured_registration is None:
                     return False
                 if self._registration_state is _RegistrationState.REGISTERED:
@@ -226,13 +234,15 @@ class KVCacheClient:
             try:
                 responses = self._send_service_request(method, payloads, _REGISTRATION_TIMEOUT_MS)
                 decode_ack_response(responses, method)
-                if isinstance(registration, WorkerRegistration) and worker_kv_cache_payloads is not None:
+                if isinstance(registration, WorkerRegistration) and worker_kv_cache_registration is not None:
                     responses = self._send_service_request(
                         KVCacheMethod.REGISTER_KV_CACHES,
-                        worker_kv_cache_payloads,
+                        worker_kv_cache_registration.payloads,
                         _REGISTRATION_TIMEOUT_MS,
                     )
                     decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
+                    if worker_kv_cache_registration.on_registered is not None:
+                        worker_kv_cache_registration.on_registered(worker_kv_cache_registration.spec)
             except (
                 MPRequestTimeoutError,
                 MPServerBusyError,
@@ -252,6 +262,9 @@ class KVCacheClient:
                 if self._registration is not configured_registration:
                     return False
                 if self._registration_state is _RegistrationState.SUPERSEDED:
+                    return False
+                if self._worker_kv_cache_registration is not worker_kv_cache_registration:
+                    self._registration_state = _RegistrationState.UNREGISTERED
                     return False
                 self._registration_state = _RegistrationState.REGISTERED
                 return not self._closed
@@ -307,31 +320,42 @@ class KVCacheClient:
         self,
         spec: WorkerKVCacheSpec,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+        on_registered: Callable[[WorkerKVCacheSpec], None] | None = None,
     ) -> bool:
-        """Register process-neutral cache layouts for the configured Worker."""
+        """Register one cache generation and report when Server confirms it."""
         self._raise_if_superseded()
         registration = self._get_worker_registration()
         payloads = encode_register_kv_caches_request(registration, spec)
-        if not self.is_registered and not self._try_register():
-            with self._client_lifecycle_lock:
-                self._worker_kv_cache_payloads = payloads
-            return False
-
+        cache_registration = _WorkerKVCacheRegistration(spec, payloads, on_registered)
         with self._client_lifecycle_lock:
-            self._worker_kv_cache_payloads = payloads
+            previous_registration = self._worker_kv_cache_registration
+            self._worker_kv_cache_registration = cache_registration
 
-        responses = self._worker_rpc(
-            KVCacheMethod.REGISTER_KV_CACHES,
-            lambda _registration: payloads,
-            timeout_ms,
-        )
-        if responses is None:
-            # Cache layout is initialization state, so a busy response must be
-            # retried by the lease loop instead of becoming a permanent no-op.
-            self._mark_unregistered()
-            return False
-        decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
-        return True
+        confirmed = False
+        try:
+            if not self.is_registered:
+                return self._try_register()
+
+            responses = self._worker_rpc(
+                KVCacheMethod.REGISTER_KV_CACHES,
+                lambda _registration: payloads,
+                timeout_ms,
+            )
+            if responses is None:
+                # The lease loop retries the latest generation after recovery.
+                self._mark_unregistered()
+                return False
+            decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
+            confirmed = True
+            if on_registered is not None:
+                on_registered(spec)
+            return True
+        except BaseException:
+            if not confirmed:
+                with self._client_lifecycle_lock:
+                    if self._worker_kv_cache_registration is cache_registration:
+                        self._worker_kv_cache_registration = previous_registration
+            raise
 
     def lookup(
         self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS
@@ -444,7 +468,10 @@ class KVCacheClient:
     def _unregister(self) -> None:
         with self._client_lifecycle_lock:
             configured_registration = self._registration
-            should_unregister = self._registration_state is _RegistrationState.REGISTERED
+            should_unregister = self._registration_state not in {
+                _RegistrationState.UNCONFIGURED,
+                _RegistrationState.SUPERSEDED,
+            }
             if should_unregister:
                 self._registration_state = _RegistrationState.UNREGISTERED
 
@@ -478,3 +505,5 @@ class KVCacheClient:
         with self._registration_attempt_lock:
             self._unregister()
         self._rpc_client.close()
+        with self._client_lifecycle_lock:
+            self._worker_kv_cache_registration = None

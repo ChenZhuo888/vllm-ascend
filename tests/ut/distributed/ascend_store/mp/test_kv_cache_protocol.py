@@ -44,6 +44,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration im
     WorkerRegistration,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import (
+    KVCacheStorageSpec,
     KVCacheTensorSpec,
     WorkerKVCacheSpec,
 )
@@ -58,18 +59,26 @@ def _make_vllm_config():
 
 
 def _make_worker_kv_cache_spec() -> WorkerKVCacheSpec:
+    storage = KVCacheStorageSpec(
+        size_bytes=4096,
+        device_type="npu",
+        device_uuid="host-0",
+        handle_type="torch_npu_ipc",
+        handle_version=1,
+        handle=b"ipc-handle",
+    )
     tensor = KVCacheTensorSpec(
         storage_index=0,
-        storage_size_bytes=4096,
         storage_offset_bytes=0,
         shape=(16, 2, 8),
         stride=(16, 8, 1),
         dtype="torch.float16",
-        element_size_bytes=2,
-        device_type="npu",
-        device_index=0,
     )
-    return WorkerKVCacheSpec({"layer.0": (tensor,)})
+    return WorkerKVCacheSpec(
+        generation=1,
+        caches={"layer.0": (tensor,)},
+        storages=(storage,),
+    )
 
 
 def test_registration_round_trip_and_type_validation() -> None:

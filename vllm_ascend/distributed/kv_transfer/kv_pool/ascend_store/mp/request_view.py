@@ -63,27 +63,36 @@ class ConnectorOutputView:
 class KVCacheTensorSpec:
     """Process-neutral layout of one tensor in a worker KV cache.
 
-    ``storage_index`` only describes tensors sharing the same allocation. It
-    is not a process-local address and does not make that allocation remotely
-    accessible; the NPU IPC adapter will attach a memory handle later.
+    ``storage_index`` points to the corresponding opaque handle in
+    ``WorkerKVCacheSpec.storages``; no process-local address crosses the wire.
     """
 
     storage_index: int
-    storage_size_bytes: int
     storage_offset_bytes: int
     shape: tuple[int, ...]
     stride: tuple[int, ...]
     dtype: str
-    element_size_bytes: int
+
+
+@dataclass(frozen=True)
+class KVCacheStorageSpec:
+    """Opaque IPC handle and source-device identity for one allocation."""
+
+    size_bytes: int
     device_type: str
-    device_index: int | None
+    device_uuid: str
+    handle_type: str
+    handle_version: int
+    handle: bytes
 
 
 @dataclass(frozen=True)
 class WorkerKVCacheSpec:
-    """KV cache layouts registered by one vLLM Worker process."""
+    """One generation of storage handles and tensor layouts for a Worker."""
 
+    generation: int
     caches: dict[str, tuple[KVCacheTensorSpec, ...]]
+    storages: tuple[KVCacheStorageSpec, ...]
 
 
 @dataclass

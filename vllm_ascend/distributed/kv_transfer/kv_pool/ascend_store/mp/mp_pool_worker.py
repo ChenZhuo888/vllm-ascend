@@ -1,11 +1,13 @@
-"""Worker-side lookup logic reused inside the KVCacheServer process."""
+"""Worker-side KV cache logic reused inside the KVCacheServer process."""
 
+from collections.abc import Callable
 from typing import Protocol
 
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from ..pool_worker import KVPoolWorker
+from .kv_cache_memory import ImportedKVCache, import_worker_kv_caches
 from .request_view import WorkerKVCacheSpec
 
 
@@ -26,11 +28,9 @@ class _MissingLookupStore:
 class MPKVPoolWorker(KVPoolWorker):
     """Reuse KVPoolWorker's lookup inside the KVCacheServer process.
 
-    The real KVPoolWorker lives in the worker process next to the NPU caches
-    and the transfer backend. The server process has neither: no
-    torch.distributed group exists there, so the rank fields are derived from
-    the registered rank, and m_store is not a transfer backend but the
-    scheduler's backend metadata client, bound once the scheduler registers.
+    The server process has no torch.distributed group, so rank fields are
+    derived from registration. Its lookup store is bound by the Scheduler;
+    NPU cache mappings are attached later by the Worker registration path.
     """
 
     def __init__(
@@ -39,16 +39,18 @@ class MPKVPoolWorker(KVPoolWorker):
         store: LookupStore | None = None,
         kv_cache_config: KVCacheConfig | None = None,
         rank: int | None = None,
+        cache_importer: Callable[[WorkerKVCacheSpec], ImportedKVCache] = import_worker_kv_caches,
     ):
         self._registered_rank = vllm_config.parallel_config.rank if rank is None else rank
         self._store_is_external = store is not None
+        self._cache_importer = cache_importer
+        self._imported_kv_cache: ImportedKVCache | None = None
         self.kv_cache_spec: WorkerKVCacheSpec | None = None
         self.m_store: LookupStore = store if store is not None else _MissingLookupStore()
         use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
         super().__init__(vllm_config, use_layerwise, kv_cache_config=kv_cache_config)
 
-        # register_kv_caches never runs in the server process, but the lookup
-        # paths read the per-group cache families from the token database.
+        # Lookup needs these families before the later cache registration.
         self.token_database.group_cache_families["kv"] = {
             group_id: self._get_group_family(self.kv_cache_group_families, group_id)
             for group_id in range(self.num_kv_cache_groups)
@@ -73,8 +75,7 @@ class MPKVPoolWorker(KVPoolWorker):
         self.model_name = model_config.model.split("/")[-1]
 
     def _init_backend(self, _parallel_config, _extra_config) -> None:
-        """The transfer backend stays in the worker process; m_store is the
-        scheduler's metadata client, bound later by bind_lookup_store."""
+        """Backend activation follows cache mapping instead of construction."""
         pass
 
     def bind_lookup_store(self, store: LookupStore) -> None:
@@ -83,5 +84,30 @@ class MPKVPoolWorker(KVPoolWorker):
         self.m_store = store
 
     def configure_kv_caches(self, spec: WorkerKVCacheSpec) -> None:
-        """Record cache layout until the NPU IPC adapter can map its storage."""
+        """Install a newer cache generation, tolerating stale RPC replay."""
+        current_spec = self.kv_cache_spec
+        if current_spec is not None:
+            if spec.generation < current_spec.generation:
+                return
+            if spec.generation == current_spec.generation:
+                if spec == current_spec:
+                    return
+                raise RuntimeError(f"KV cache generation {spec.generation} has conflicting specifications")
+
+        imported = self._cache_importer(spec)
+        previous = self._imported_kv_cache
+        self._imported_kv_cache = imported
         self.kv_cache_spec = spec
+        self.kv_caches = imported.tensors
+        if imported.device_index is not None:
+            self.local_rank = imported.device_index
+        if previous is not None:
+            previous.close()
+
+    def close(self) -> None:
+        if self._imported_kv_cache is None:
+            return
+        self._imported_kv_cache.close()
+        self._imported_kv_cache = None
+        self.kv_cache_spec = None
+        self.kv_caches = {}

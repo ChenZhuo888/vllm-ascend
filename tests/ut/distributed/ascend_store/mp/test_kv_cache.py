@@ -349,7 +349,12 @@ def test_registration_checks_application_readiness() -> None:
 
         assert not registered
         rpc_client.ping.assert_not_called()
-        rpc_client.request.assert_called_once()
+        # A timed-out registration may have reached the Server. Closing sends
+        # a best-effort unregister so an uncertain request cannot retain resources.
+        assert [call.args[0] for call in rpc_client.request.call_args_list] == [
+            KVCacheMethod.REGISTER_SCHEDULER,
+            KVCacheMethod.UNREGISTER_SCHEDULER,
+        ]
 
 
 def test_lookup_retries_registration_after_server_busy() -> None:
@@ -426,7 +431,8 @@ def test_multiple_workers_are_registered_and_rank_zero_serves_lookup() -> None:
             clients.append(client)
             _wait_until_connected(client)
             assert client.register_worker(_make_vllm_config(rank=rank), kv_cache_config=None)
-            assert client.register_kv_caches(WorkerKVCacheSpec({f"layer.{rank}": ()}))
+            spec = WorkerKVCacheSpec(generation=1, caches={f"layer.{rank}": ()}, storages=())
+            assert client.register_kv_caches(spec)
 
         scheduler_client = KVCacheClient(endpoint)
         clients.append(scheduler_client)

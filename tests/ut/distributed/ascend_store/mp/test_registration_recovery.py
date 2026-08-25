@@ -280,15 +280,19 @@ def test_worker_cache_spec_is_replayed_after_registration_recovers() -> None:
             [b"OK"],
         ]
         client = KVCacheClient("tcp://127.0.0.1:12345")
+        confirmed = []
 
         try:
             assert client.register_worker(_make_vllm_config(), None)
-            assert not client.register_kv_caches(WorkerKVCacheSpec({"layer.0": ()}))
+            spec = WorkerKVCacheSpec(generation=1, caches={"layer.0": ()}, storages=())
+            assert not client.register_kv_caches(spec, on_registered=confirmed.append)
             assert not client.is_registered
+            assert confirmed == []
 
             client._maintain_lease()
 
             assert client.is_registered
+            assert confirmed == [spec]
             methods = [call.args[0] for call in rpc_client.request.call_args_list]
             assert methods == [
                 KVCacheMethod.REGISTER_WORKER,
