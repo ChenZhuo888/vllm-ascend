@@ -1,3 +1,5 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import cloudpickle
@@ -154,6 +156,82 @@ def test_close_stops_lease_loop_then_unregisters_the_same_session() -> None:
         unregister_call = rpc_client.request.call_args_list[-1]
         _, session_id = decode_scheduler_session(unregister_call.args[1])
         assert session_id == registration.session_id
+        rpc_client.close.assert_called_once_with()
+
+
+def test_concurrent_registration_attempts_share_one_request() -> None:
+    registration_started = threading.Event()
+    finish_registration = threading.Event()
+
+    def register(method, payloads, timeout_ms):
+        assert method == KVCacheMethod.REGISTER_SCHEDULER
+        registration_started.set()
+        assert finish_registration.wait(1)
+        return [b"OK"]
+
+    with (
+        patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class,
+        patch(f"{KV_CACHE_CLIENT_MODULE}.KVCacheClient._start_lease_loop"),
+    ):
+        rpc_client = rpc_client_class.return_value
+        rpc_client.is_transport_connected = True
+        rpc_client.request.side_effect = register
+        client = KVCacheClient("tcp://127.0.0.1:12345")
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(client.register_scheduler, _make_vllm_config(), None, 0)
+                assert registration_started.wait(1)
+                second = executor.submit(client._try_register)
+                finish_registration.set()
+
+                assert first.result()
+                assert second.result()
+
+            assert rpc_client.request.call_count == 1
+        finally:
+            finish_registration.set()
+            client.close()
+
+
+def test_close_waits_for_registration_before_unregistering() -> None:
+    registration_started = threading.Event()
+    finish_registration = threading.Event()
+    close_started = threading.Event()
+
+    def request(method, payloads, timeout_ms):
+        if method == KVCacheMethod.REGISTER_SCHEDULER:
+            registration_started.set()
+            assert finish_registration.wait(1)
+        return [b"OK"]
+
+    with (
+        patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class,
+        patch(f"{KV_CACHE_CLIENT_MODULE}.KVCacheClient._start_lease_loop"),
+    ):
+        rpc_client = rpc_client_class.return_value
+        rpc_client.is_transport_connected = True
+        rpc_client.request.side_effect = request
+        client = KVCacheClient("tcp://127.0.0.1:12345")
+
+        with (
+            patch.object(client, "_stop_lease_loop", side_effect=close_started.set),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            register_future = executor.submit(client.register_scheduler, _make_vllm_config(), None, 0)
+            assert registration_started.wait(1)
+            close_future = executor.submit(client.close)
+            try:
+                assert close_started.wait(1)
+                rpc_client.close.assert_not_called()
+            finally:
+                finish_registration.set()
+
+            assert not register_future.result()
+            close_future.result()
+
+        methods = [call.args[0] for call in rpc_client.request.call_args_list]
+        assert methods == [KVCacheMethod.REGISTER_SCHEDULER, KVCacheMethod.UNREGISTER_SCHEDULER]
         rpc_client.close.assert_called_once_with()
 
 

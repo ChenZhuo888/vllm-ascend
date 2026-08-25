@@ -6,6 +6,7 @@ import pytest
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_client import _RegistrationState
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_error import (
     SERVICE_NOT_REGISTERED_PREFIX,
     STALE_SESSION_PREFIX,
@@ -44,7 +45,7 @@ def _configure_mock_client(client_class, request_side_effect) -> KVCacheClient:
     client = KVCacheClient("ipc:///tmp/ascend-store-test")
     registration = SchedulerRegistration.create(_make_config(), None, 0, session_id="sess")
     client._registration = (registration, (b"engine-0", b"0", b"payload"))
-    client._registered = True
+    client._registration_state = _RegistrationState.REGISTERED
     return client
 
 
@@ -55,7 +56,7 @@ def _configure_mock_worker_client(client_class, request_side_effect) -> KVCacheC
     client = KVCacheClient("ipc:///tmp/ascend-store-test")
     registration = WorkerRegistration.create(_make_config(), None, session_id="sess")
     client._registration = (registration, (b"engine-0", b"0", b"0", b"sess", b"payload"))
-    client._registered = True
+    client._registration_state = _RegistrationState.REGISTERED
     return client
 
 
