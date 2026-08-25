@@ -8,6 +8,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache import
     KVCacheMethod,
     ServiceSessionExpiredError,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import (
+    decode_scheduler_session,
+    decode_worker_session,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPRemoteError,
     MPRequestTimeoutError,
@@ -147,7 +151,8 @@ def test_close_stops_lease_loop_then_unregisters_the_same_session() -> None:
 
         stop.assert_called_once_with()
         unregister_call = rpc_client.request.call_args_list[-1]
-        assert unregister_call.args[1][-1].decode() == registration.session_id
+        _, session_id = decode_scheduler_session(unregister_call.args[1])
+        assert session_id == registration.session_id
         rpc_client.close.assert_called_once_with()
 
 
@@ -175,7 +180,9 @@ def test_service_renewal_uses_the_registered_session(service_type: str, renew_me
 
             renew_call = rpc_client.request.call_args_list[1]
             assert renew_call.args[0] == renew_method
-            assert renew_call.args[1][-1].decode() == registration.session_id
+            decode_session = decode_scheduler_session if service_type == "scheduler" else decode_worker_session
+            _, session_id = decode_session(renew_call.args[1])
+            assert session_id == registration.session_id
         finally:
             client.close()
 

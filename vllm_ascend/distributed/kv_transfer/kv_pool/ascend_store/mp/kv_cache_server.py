@@ -22,7 +22,6 @@ from .kv_cache_protocol import (
     encode_lookup_response,
     encode_request_finished_response,
     encode_update_connector_output_response,
-    lookup_affinity_key,
     scheduler_affinity_key,
     worker_affinity_key,
 )
@@ -69,7 +68,6 @@ class KVCacheServer:
             worker_executor=worker_executor,
         )
         scheduler_route = partial(Route, executor=scheduler_executor, key_factory=scheduler_affinity_key)
-        lookup_route = partial(Route, executor=scheduler_executor, key_factory=lookup_affinity_key)
         worker_route = partial(Route, executor=worker_executor, key_factory=worker_affinity_key)
         # Renewal only updates lifecycle metadata and must not wait behind business work.
         lease_route = partial(Route, executor=lease_executor)
@@ -79,7 +77,7 @@ class KVCacheServer:
                 scheduler_route(KVCacheMethod.REGISTER_SCHEDULER, self._handle_register_scheduler),
                 scheduler_route(KVCacheMethod.UNREGISTER_SCHEDULER, self._handle_unregister_scheduler),
                 lease_route(KVCacheMethod.RENEW_SCHEDULER, self._handle_renew_scheduler),
-                lookup_route(KVCacheMethod.LOOKUP, self._handle_lookup),
+                scheduler_route(KVCacheMethod.LOOKUP, self._handle_lookup),
                 scheduler_route(KVCacheMethod.UPDATE_STATE_AFTER_ALLOC, self._handle_update_state_after_alloc),
                 scheduler_route(KVCacheMethod.BUILD_CONNECTOR_META, self._handle_build_connector_meta),
                 scheduler_route(KVCacheMethod.REQUEST_FINISHED, self._handle_request_finished),
@@ -162,18 +160,18 @@ class KVCacheServer:
     def _handle_build_connector_meta(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id, output = decode_build_connector_meta_request(payloads)
         metadata, touch_block_ids = self._service.build_connector_meta(identity, session_id, output)
-        return (encode_build_connector_meta_response(metadata, touch_block_ids),)
+        return encode_build_connector_meta_response(metadata, touch_block_ids)
 
     def _handle_request_finished(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id, req_id, block_ids, all_groups = decode_request_finished(payloads)
         delay_free, extra = self._service.request_finished(identity, session_id, req_id, block_ids, all_groups)
-        return (encode_request_finished_response(delay_free, extra),)
+        return encode_request_finished_response(delay_free, extra)
 
     def _handle_update_connector_output(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id, completed_events = decode_update_connector_output(payloads)
         output = ConnectorOutputView(kv_connector_worker_meta=AscendStoreKVConnectorWorkerMetadata(completed_events))
         free_block_ids = self._service.update_connector_output(identity, session_id, output)
-        return (encode_update_connector_output_response(free_block_ids),)
+        return encode_update_connector_output_response(free_block_ids)
 
     def run(self) -> None:
         try:

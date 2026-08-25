@@ -12,6 +12,7 @@ import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheMethod, KVCacheServer
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import (
+    encode_lookup_response,
     encode_registration_request,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
@@ -356,7 +357,7 @@ def test_lookup_retries_registration_after_server_busy() -> None:
         rpc_client.request.side_effect = [
             MPServerBusyError("Server busy"),
             [b"OK"],
-            [(16).to_bytes(8, byteorder="big"), b"\x00"],
+            encode_lookup_response(16, False),
         ]
 
         with KVCacheClient("tcp://127.0.0.1:12345") as client:
@@ -607,6 +608,6 @@ def test_lookup_recovers_when_server_starts_later() -> None:
 def test_server_rejects_malformed_lookup(kv_cache_server_url: str) -> None:
     with MPClient(kv_cache_server_url) as client:
         client.wait_until_connected()
-        with pytest.raises(MPRemoteError, match="LOOKUP expects at least 6 payloads"):
+        with pytest.raises(MPRemoteError, match="Scheduler identity expects at least 2 payloads"):
             client.request(KVCacheMethod.LOOKUP)
         assert client.ping() == "OK"

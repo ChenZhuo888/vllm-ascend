@@ -13,8 +13,8 @@ from vllm.v1.request import Request
 
 from .kv_cache_error import SERVICE_NOT_REGISTERED_PREFIX, STALE_SESSION_PREFIX, ServiceSessionExpiredError
 from .kv_cache_protocol import (
-    ACK_RESPONSE,
     KVCacheMethod,
+    decode_ack_response,
     decode_build_connector_meta_response,
     decode_lookup_response,
     decode_request_finished_response,
@@ -31,7 +31,6 @@ from .kv_cache_protocol import (
 from .registration import SchedulerRegistration, WorkerRegistration
 from .rpc import (
     MPClient,
-    MPProtocolError,
     MPRemoteError,
     MPRequestTimeoutError,
     MPServerBusyError,
@@ -45,12 +44,6 @@ _REGISTRATION_TIMEOUT_MS = 500
 _LEASE_RENEW_INTERVAL_MS = 1000
 _LEASE_REQUEST_TIMEOUT_MS = 1000
 _RegistrationState = tuple[SchedulerRegistration | WorkerRegistration, tuple[bytes, ...]]
-
-
-def _single_response(responses: tuple[bytes, ...], method: KVCacheMethod) -> bytes:
-    if len(responses) != 1:
-        raise MPProtocolError(f"{method.value} expects 1 response payload, got {len(responses)}")
-    return responses[0]
 
 
 class KVCacheClient:
@@ -146,8 +139,7 @@ class KVCacheClient:
                 return
             raise
 
-        if responses != [ACK_RESPONSE]:
-            raise MPProtocolError(f"{method.value} expects an OK response, got {responses!r}")
+        decode_ack_response(responses, method)
 
     def _start_lease_loop(self) -> None:
         with self._registration_lock:
@@ -220,8 +212,7 @@ class KVCacheClient:
                 raise ServiceSessionExpiredError(str(exc)) from exc
             raise
 
-        if responses != [ACK_RESPONSE]:
-            raise MPProtocolError(f"{method.value} expects an OK response, got {responses!r}")
+        decode_ack_response(responses, method)
 
         with self._registration_lock:
             if self._registration is not configured_registration or self._closed or self._superseded:
@@ -273,8 +264,8 @@ class KVCacheClient:
             lambda registration: encode_update_state_after_alloc(registration, request, blocks, num_external_tokens),
             timeout_ms,
         )
-        if responses is not None and responses != [ACK_RESPONSE]:
-            raise MPProtocolError(f"{KVCacheMethod.UPDATE_STATE_AFTER_ALLOC.value} expects an OK response")
+        if responses is not None:
+            decode_ack_response(responses, KVCacheMethod.UPDATE_STATE_AFTER_ALLOC)
 
     def build_connector_meta(
         self,
@@ -288,11 +279,7 @@ class KVCacheClient:
             lambda registration: encode_build_connector_meta_request(registration, scheduler_output, new_token_ids),
             timeout_ms,
         )
-        return (
-            decode_build_connector_meta_response(_single_response(responses, KVCacheMethod.BUILD_CONNECTOR_META))
-            if responses is not None
-            else None
-        )
+        return decode_build_connector_meta_response(responses) if responses is not None else None
 
     def request_finished(
         self,
@@ -306,11 +293,7 @@ class KVCacheClient:
             lambda registration: encode_request_finished(registration, request_id, block_ids, all_groups),
             timeout_ms,
         )
-        return (
-            decode_request_finished_response(_single_response(responses, KVCacheMethod.REQUEST_FINISHED))
-            if responses is not None
-            else (False, None)
-        )
+        return decode_request_finished_response(responses) if responses is not None else (False, None)
 
     def update_connector_output(
         self,
@@ -323,18 +306,14 @@ class KVCacheClient:
             lambda registration: encode_update_connector_output(registration, completed_events),
             timeout_ms,
         )
-        return (
-            decode_update_connector_output_response(_single_response(responses, KVCacheMethod.UPDATE_CONNECTOR_OUTPUT))
-            if responses is not None
-            else []
-        )
+        return decode_update_connector_output_response(responses) if responses is not None else []
 
     def _scheduler_rpc(
         self,
         method: KVCacheMethod,
         encode,
         timeout_ms: int,
-    ) -> tuple[bytes, ...] | None:
+    ) -> list[bytes] | None:
         """Send one scheduler-scoped RPC through the shared degradation ladder.
 
         Returns the raw response payloads, or None when the service is
@@ -384,8 +363,7 @@ class KVCacheClient:
 
         try:
             responses = self._rpc_client.request(method, payloads, timeout_ms=_REGISTRATION_TIMEOUT_MS)
-            if responses != [ACK_RESPONSE]:
-                raise MPProtocolError(f"{method.value} expects an OK response, got {responses!r}")
+            decode_ack_response(responses, method)
         except Exception:
             # close() is best-effort cleanup; transport recovery is no longer useful once the client is closing.
             logger.debug("Failed to unregister KV cache service during client close", exc_info=True)

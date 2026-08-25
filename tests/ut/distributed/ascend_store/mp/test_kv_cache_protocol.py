@@ -3,6 +3,9 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import (
+    ACK_RESPONSE,
+    KVCacheMethod,
+    decode_ack_response,
     decode_build_connector_meta_request,
     decode_build_connector_meta_response,
     decode_lookup_request,
@@ -29,7 +32,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protoc
     encode_update_connector_output_response,
     encode_update_state_after_alloc,
     encode_worker_session,
-    lookup_affinity_key,
     scheduler_affinity_key,
     worker_affinity_key,
 )
@@ -69,14 +71,18 @@ def test_registration_round_trip_and_type_validation() -> None:
 
     scheduler_payloads = encode_registration_request(scheduler_registration)
     worker_payloads = encode_registration_request(worker_registration)
+    serialized_scheduler = encode_registration(scheduler_registration)
+    serialized_worker = encode_registration(worker_registration)
     assert decode_registration_request(scheduler_payloads, SchedulerRegistration) == (
         scheduler_registration,
-        scheduler_payloads[-1],
+        serialized_scheduler,
     )
     assert decode_registration_request(worker_payloads, WorkerRegistration) == (
         worker_registration,
-        worker_payloads[-1],
+        serialized_worker,
     )
+    assert len(scheduler_payloads) == 4
+    assert len(worker_payloads) == 5
     assert scheduler_affinity_key(b"client", scheduler_payloads) == scheduler_registration.identity
     assert worker_affinity_key(b"client", worker_payloads) == worker_registration.identity
 
@@ -91,6 +97,8 @@ def test_service_session_round_trip() -> None:
     scheduler_payloads = encode_scheduler_session(scheduler_identity, "scheduler-session")
     worker_payloads = encode_worker_session(worker_identity, "worker-session")
 
+    assert len(scheduler_payloads) == 4
+    assert len(worker_payloads) == 5
     assert decode_scheduler_session(scheduler_payloads) == (
         scheduler_identity,
         "scheduler-session",
@@ -120,7 +128,7 @@ def test_lookup_request_preserves_required_fields_and_response_round_trip() -> N
     payloads = encode_lookup_request(registration, request, num_computed_tokens=2)
     identity, session_id, decoded_request, num_computed_tokens = decode_lookup_request(payloads)
 
-    assert lookup_affinity_key(b"client", payloads) == registration.identity
+    assert scheduler_affinity_key(b"client", payloads) == registration.identity
     assert identity == registration.identity
     assert session_id == registration.session_id
     assert decoded_request.request_id == request.request_id
@@ -132,12 +140,21 @@ def test_lookup_request_preserves_required_fields_and_response_round_trip() -> N
 
 
 def test_lookup_protocol_rejects_malformed_payloads() -> None:
-    with pytest.raises(MPProtocolError, match="expects at least 6 payloads"):
-        lookup_affinity_key(b"client", ())
     with pytest.raises(MPProtocolError, match="expects at least 2 payloads"):
         scheduler_affinity_key(b"client", ())
-    with pytest.raises(MPProtocolError, match="expects 2 response payloads"):
+    with pytest.raises(MPProtocolError, match="expects 4 payloads"):
+        decode_lookup_request(())
+    with pytest.raises(MPProtocolError, match="expects 1 response payload"):
         decode_lookup_response([])
+
+
+def test_ack_response_validation() -> None:
+    decode_ack_response((ACK_RESPONSE,), KVCacheMethod.RENEW_SCHEDULER)
+
+    with pytest.raises(MPProtocolError, match="expects 1 response payload"):
+        decode_ack_response((), KVCacheMethod.RENEW_SCHEDULER)
+    with pytest.raises(MPProtocolError, match="expects an OK response"):
+        decode_ack_response((b"invalid",), KVCacheMethod.RENEW_SCHEDULER)
 
 
 def test_update_state_after_alloc_round_trip() -> None:
@@ -190,8 +207,8 @@ def test_update_state_after_alloc_zero_external_carries_no_block_ids() -> None:
     assert num_external_tokens == 0
     assert decoded_blocks.get_block_ids() == ()
 
-    with pytest.raises(MPProtocolError, match="expects 6 payloads"):
-        decode_update_state_after_alloc(payloads[:5])
+    with pytest.raises(MPProtocolError, match="expects 4 payloads"):
+        decode_update_state_after_alloc(payloads[:3])
 
 
 def test_build_connector_meta_request_round_trip() -> None:
