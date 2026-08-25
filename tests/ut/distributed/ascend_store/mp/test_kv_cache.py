@@ -22,6 +22,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration im
     WorkerLookupHandler,
     WorkerRegistration,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPClient,
     MPRemoteError,
@@ -38,6 +39,10 @@ _BLOCK_HASHES = [bytes.fromhex("01" * 32), bytes.fromhex("02" * 32)]
 class _FakeWorker:
     def __init__(self, matched_tokens: int):
         self._matched_tokens = matched_tokens
+        self.kv_cache_spec = None
+
+    def configure_kv_caches(self, spec: WorkerKVCacheSpec) -> None:
+        self.kv_cache_spec = spec
 
     def lookup_scheduler(
         self,
@@ -421,6 +426,7 @@ def test_multiple_workers_are_registered_and_rank_zero_serves_lookup() -> None:
             clients.append(client)
             _wait_until_connected(client)
             assert client.register_worker(_make_vllm_config(rank=rank), kv_cache_config=None)
+            assert client.register_kv_caches(WorkerKVCacheSpec({f"layer.{rank}": ()}))
 
         scheduler_client = KVCacheClient(endpoint)
         clients.append(scheduler_client)

@@ -6,6 +6,7 @@ from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from ..pool_worker import KVPoolWorker
+from .request_view import WorkerKVCacheSpec
 
 
 class LookupStore(Protocol):
@@ -41,6 +42,7 @@ class MPKVPoolWorker(KVPoolWorker):
     ):
         self._registered_rank = vllm_config.parallel_config.rank if rank is None else rank
         self._store_is_external = store is not None
+        self.kv_cache_spec: WorkerKVCacheSpec | None = None
         self.m_store: LookupStore = store if store is not None else _MissingLookupStore()
         use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
         super().__init__(vllm_config, use_layerwise, kv_cache_config=kv_cache_config)
@@ -79,3 +81,7 @@ class MPKVPoolWorker(KVPoolWorker):
         if self._store_is_external:
             return
         self.m_store = store
+
+    def configure_kv_caches(self, spec: WorkerKVCacheSpec) -> None:
+        """Record cache layout until the NPU IPC adapter can map its storage."""
+        self.kv_cache_spec = spec

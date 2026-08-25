@@ -19,7 +19,14 @@ from .registration import (
     WorkerLookupHandler,
     WorkerRegistration,
 )
-from .request_view import BlocksView, ConnectorOutputView, RequestIdView, RequestView, SchedulerOutputView
+from .request_view import (
+    BlocksView,
+    ConnectorOutputView,
+    RequestIdView,
+    RequestView,
+    SchedulerOutputView,
+    WorkerKVCacheSpec,
+)
 from .rpc import TaskExecutor
 from .service import ServiceLifecycleManager
 
@@ -134,6 +141,20 @@ class KVCacheServiceManager:
     def renew_worker(self, identity: WorkerIdentity, session_id: str) -> None:
         if not self._workers.renew(identity, session_id):
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+
+    def register_worker_kv_caches(
+        self,
+        identity: WorkerIdentity,
+        session_id: str,
+        spec: WorkerKVCacheSpec,
+    ) -> None:
+        worker = self._workers.get_for_session(identity, session_id)
+        if worker is None:
+            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        configure = getattr(worker, "configure_kv_caches", None)
+        if not callable(configure):
+            raise RuntimeError(f"Worker {identity!r} does not support KV cache configuration")
+        configure(spec)
 
     def lookup(
         self,

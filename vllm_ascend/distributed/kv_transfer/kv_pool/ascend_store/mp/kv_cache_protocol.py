@@ -23,6 +23,7 @@ from .request_view import (
     RequestView,
     ScheduledNewReqPayload,
     SchedulerOutputView,
+    WorkerKVCacheSpec,
 )
 from .rpc import MPProtocolError
 
@@ -40,6 +41,7 @@ RegistrationT = TypeVar("RegistrationT", bound=_Registration)
 class KVCacheMethod(str, enum.Enum):
     REGISTER_SCHEDULER = "REGISTER_SCHEDULER"
     REGISTER_WORKER = "REGISTER_WORKER"
+    REGISTER_KV_CACHES = "REGISTER_KV_CACHES"
     UNREGISTER_SCHEDULER = "UNREGISTER_SCHEDULER"
     UNREGISTER_WORKER = "UNREGISTER_WORKER"
     RENEW_SCHEDULER = "RENEW_SCHEDULER"
@@ -144,6 +146,25 @@ def decode_worker_session(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, 
     identity, session_id, body = _decode_worker_envelope(payloads, "Worker session")
     _require_empty_body(body, "Worker session")
     return identity, session_id
+
+
+def encode_register_kv_caches_request(
+    registration: WorkerRegistration,
+    spec: WorkerKVCacheSpec,
+) -> tuple[bytes, ...]:
+    if not isinstance(spec, WorkerKVCacheSpec):
+        raise TypeError(f"spec must be WorkerKVCacheSpec, got {type(spec).__name__}")
+    return _encode_worker_request(registration, {"spec": spec}, KVCacheMethod.REGISTER_KV_CACHES)
+
+
+def decode_register_kv_caches_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str, WorkerKVCacheSpec]:
+    method = KVCacheMethod.REGISTER_KV_CACHES
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    (spec,) = _body_fields(body, method.value, "spec")
+    _require_type(spec, WorkerKVCacheSpec, "spec")
+    return identity, session_id, spec
 
 
 def scheduler_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
@@ -386,6 +407,26 @@ def _decode_scheduler_request(
     method: KVCacheMethod,
 ) -> tuple[SchedulerIdentity, str, dict]:
     identity, session_id, payload = _decode_scheduler_envelope(payloads, method.value)
+    return identity, session_id, _decode_body(payload, method.value)
+
+
+def _encode_worker_request(
+    registration: WorkerRegistration,
+    body: dict,
+    method: KVCacheMethod,
+) -> tuple[bytes, ...]:
+    return _encode_worker_envelope(
+        registration.identity,
+        registration.session_id,
+        _encode_body(body, method.value),
+    )
+
+
+def _decode_worker_request(
+    payloads: tuple[bytes, ...],
+    method: KVCacheMethod,
+) -> tuple[WorkerIdentity, str, dict]:
+    identity, session_id, payload = _decode_worker_envelope(payloads, method.value)
     return identity, session_id, _decode_body(payload, method.value)
 
 

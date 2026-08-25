@@ -10,6 +10,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protoc
     decode_build_connector_meta_response,
     decode_lookup_request,
     decode_lookup_response,
+    decode_register_kv_caches_request,
     decode_registration,
     decode_registration_request,
     decode_request_finished,
@@ -23,6 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protoc
     encode_build_connector_meta_response,
     encode_lookup_request,
     encode_lookup_response,
+    encode_register_kv_caches_request,
     encode_registration,
     encode_registration_request,
     encode_request_finished,
@@ -41,6 +43,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration im
     WorkerIdentity,
     WorkerRegistration,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import (
+    KVCacheTensorSpec,
+    WorkerKVCacheSpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import MPProtocolError
 
 
@@ -49,6 +55,21 @@ def _make_vllm_config():
         kv_transfer_config=SimpleNamespace(engine_id="engine-0"),
         parallel_config=SimpleNamespace(rank=2, data_parallel_rank=1),
     )
+
+
+def _make_worker_kv_cache_spec() -> WorkerKVCacheSpec:
+    tensor = KVCacheTensorSpec(
+        storage_index=0,
+        storage_size_bytes=4096,
+        storage_offset_bytes=0,
+        shape=(16, 2, 8),
+        stride=(16, 8, 1),
+        dtype="torch.float16",
+        element_size_bytes=2,
+        device_type="npu",
+        device_index=0,
+    )
+    return WorkerKVCacheSpec({"layer.0": (tensor,)})
 
 
 def test_registration_round_trip_and_type_validation() -> None:
@@ -109,6 +130,25 @@ def test_service_session_round_trip() -> None:
     )
     assert scheduler_affinity_key(b"client", scheduler_payloads) == scheduler_identity
     assert worker_affinity_key(b"client", worker_payloads) == worker_identity
+
+
+def test_register_kv_caches_round_trip() -> None:
+    registration = WorkerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        session_id="worker-session",
+    )
+    spec = _make_worker_kv_cache_spec()
+
+    payloads = encode_register_kv_caches_request(registration, spec)
+
+    assert len(payloads) == 5
+    assert worker_affinity_key(b"client", payloads) == registration.identity
+    assert decode_register_kv_caches_request(payloads) == (
+        registration.identity,
+        registration.session_id,
+        spec,
+    )
 
 
 def test_lookup_request_preserves_required_fields_and_response_round_trip() -> None:

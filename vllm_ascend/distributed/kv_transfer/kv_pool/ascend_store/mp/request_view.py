@@ -59,6 +59,33 @@ class ConnectorOutputView:
     kv_connector_worker_meta: "AscendStoreKVConnectorWorkerMetadata"
 
 
+@dataclass(frozen=True)
+class KVCacheTensorSpec:
+    """Process-neutral layout of one tensor in a worker KV cache.
+
+    ``storage_index`` only describes tensors sharing the same allocation. It
+    is not a process-local address and does not make that allocation remotely
+    accessible; the NPU IPC adapter will attach a memory handle later.
+    """
+
+    storage_index: int
+    storage_size_bytes: int
+    storage_offset_bytes: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: str
+    element_size_bytes: int
+    device_type: str
+    device_index: int | None
+
+
+@dataclass(frozen=True)
+class WorkerKVCacheSpec:
+    """KV cache layouts registered by one vLLM Worker process."""
+
+    caches: dict[str, tuple[KVCacheTensorSpec, ...]]
+
+
 @dataclass
 class ScheduledNewReqPayload:
     """Wire projection of the dynamic fields of vLLM NewRequestData."""

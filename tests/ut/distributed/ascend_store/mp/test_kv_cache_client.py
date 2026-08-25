@@ -11,7 +11,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_error 
     STALE_SESSION_PREFIX,
     ServiceSessionExpiredError,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import SchedulerRegistration
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
+    SchedulerRegistration,
+    WorkerRegistration,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPRemoteError,
     MPRequestTimeoutError,
@@ -44,6 +48,17 @@ def _configure_mock_client(client_class, request_side_effect) -> KVCacheClient:
     return client
 
 
+def _configure_mock_worker_client(client_class, request_side_effect) -> KVCacheClient:
+    rpc = client_class.return_value
+    rpc.is_transport_connected = True
+    rpc.request.side_effect = request_side_effect
+    client = KVCacheClient("ipc:///tmp/ascend-store-test")
+    registration = WorkerRegistration.create(_make_config(), None, session_id="sess")
+    client._registration = (registration, (b"engine-0", b"0", b"0", b"sess", b"payload"))
+    client._registered = True
+    return client
+
+
 REQUEST = SimpleNamespace(request_id="r1", prompt_token_ids=[1], block_hashes=[b"h"], num_tokens=1)
 BLOCKS = SimpleNamespace(get_block_ids=lambda: ([7],))
 SCHEDULER_OUTPUT = SimpleNamespace(
@@ -53,6 +68,24 @@ SCHEDULER_OUTPUT = SimpleNamespace(
     scheduled_new_reqs=[],
     scheduled_cached_reqs=SimpleNamespace(req_ids=[], new_block_ids=[], num_computed_tokens=[]),
 )
+WORKER_KV_CACHE_SPEC = WorkerKVCacheSpec({"layer.0": ()})
+
+
+def test_worker_cache_registration_uses_worker_rpc() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, [[b"OK"]])
+
+        assert client.register_kv_caches(WORKER_KV_CACHE_SPEC)
+        request = client_class.return_value.request
+        assert request.call_args.args[0].value == "REGISTER_KV_CACHES"
+
+
+def test_worker_cache_registration_marks_client_unregistered_when_busy() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, MPServerBusyError("busy"))
+
+        assert not client.register_kv_caches(WORKER_KV_CACHE_SPEC)
+        assert not client.is_registered
 
 
 def test_update_state_after_alloc_degrades_silently_on_timeout() -> None:

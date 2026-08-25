@@ -21,6 +21,7 @@ from .kv_cache_protocol import (
     decode_update_connector_output_response,
     encode_build_connector_meta_request,
     encode_lookup_request,
+    encode_register_kv_caches_request,
     encode_registration_request,
     encode_request_finished,
     encode_scheduler_session,
@@ -29,6 +30,7 @@ from .kv_cache_protocol import (
     encode_worker_session,
 )
 from .registration import SchedulerRegistration, WorkerRegistration
+from .request_view import WorkerKVCacheSpec
 from .rpc import (
     MPClient,
     MPRemoteError,
@@ -56,6 +58,7 @@ class KVCacheClient:
         self._lease_stop = threading.Event()
         self._lease_thread: threading.Thread | None = None
         self._registration: _RegistrationState | None = None
+        self._worker_kv_cache_payloads: tuple[bytes, ...] | None = None
         self._session_id = uuid.uuid4().hex
         self._registered = False
         self._superseded = False
@@ -186,6 +189,7 @@ class KVCacheClient:
                 raise ServiceSessionExpiredError("KV cache service session has been superseded")
 
             configured_registration = self._registration
+            worker_kv_cache_payloads = self._worker_kv_cache_payloads
             if configured_registration is None:
                 return False
             if self._registered:
@@ -203,16 +207,26 @@ class KVCacheClient:
 
         try:
             responses = self._rpc_client.request(method, payloads, timeout_ms=_REGISTRATION_TIMEOUT_MS)
+            decode_ack_response(responses, method)
+            if isinstance(registration, WorkerRegistration) and worker_kv_cache_payloads is not None:
+                responses = self._rpc_client.request(
+                    KVCacheMethod.REGISTER_KV_CACHES,
+                    worker_kv_cache_payloads,
+                    timeout_ms=_REGISTRATION_TIMEOUT_MS,
+                )
+                decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
         except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError):
             self._mark_unregistered()
             return False
         except MPRemoteError as exc:
-            if str(exc).startswith(STALE_SESSION_PREFIX):
+            message = str(exc)
+            if message.startswith(SERVICE_NOT_REGISTERED_PREFIX):
+                self._mark_unregistered()
+                return False
+            if message.startswith(STALE_SESSION_PREFIX):
                 self._mark_superseded()
-                raise ServiceSessionExpiredError(str(exc)) from exc
+                raise ServiceSessionExpiredError(message) from exc
             raise
-
-        decode_ack_response(responses, method)
 
         with self._registration_lock:
             if self._registration is not configured_registration or self._closed or self._superseded:
@@ -241,6 +255,40 @@ class KVCacheClient:
         if configured_registration is None or not isinstance(configured_registration[0], SchedulerRegistration):
             raise RuntimeError("KVCacheClient is not configured as a Scheduler client")
         return configured_registration[0]
+
+    def _get_worker_registration(self) -> WorkerRegistration:
+        with self._registration_lock:
+            configured_registration = self._registration
+
+        if configured_registration is None or not isinstance(configured_registration[0], WorkerRegistration):
+            raise RuntimeError("KVCacheClient is not configured as a Worker client")
+        return configured_registration[0]
+
+    def register_kv_caches(
+        self,
+        spec: WorkerKVCacheSpec,
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> bool:
+        """Register process-neutral cache layouts for the configured Worker."""
+        self._raise_if_superseded()
+        registration = self._get_worker_registration()
+        payloads = encode_register_kv_caches_request(registration, spec)
+        if not self.is_registered and not self._try_register():
+            with self._registration_lock:
+                self._worker_kv_cache_payloads = payloads
+            return False
+
+        with self._registration_lock:
+            self._worker_kv_cache_payloads = payloads
+
+        responses = self._service_rpc(KVCacheMethod.REGISTER_KV_CACHES, payloads, timeout_ms)
+        if responses is None:
+            # Cache layout is initialization state, so a busy response must be
+            # retried by the lease loop instead of becoming a permanent no-op.
+            self._mark_unregistered()
+            return False
+        decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
+        return True
 
     def lookup(
         self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS
@@ -323,6 +371,16 @@ class KVCacheClient:
         self._raise_if_superseded()
         registration = self._get_scheduler_registration()
         payloads = encode(registration)
+
+        return self._service_rpc(method, payloads, timeout_ms)
+
+    def _service_rpc(
+        self,
+        method: KVCacheMethod,
+        payloads: tuple[bytes, ...],
+        timeout_ms: int,
+    ) -> list[bytes] | None:
+        """Send a registered service request through the degradation ladder."""
 
         if not self.is_registered and not self._try_register():
             return None

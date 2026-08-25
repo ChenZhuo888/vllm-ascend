@@ -20,6 +20,10 @@ from vllm.v1.request import Request
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreKVEvents
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendStoreKVConnectorWorkerMetadata
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import (
+    KVCacheTensorSpec,
+    WorkerKVCacheSpec,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
@@ -41,6 +45,44 @@ def _get_kv_cache_server_url(vllm_config: VllmConfig) -> str:
     if not isinstance(server_url, str) or not server_url:
         raise ValueError(f"kv_connector_extra_config[{_KV_CACHE_SERVER_URL_KEY!r}] must be a non-empty string")
     return server_url
+
+
+def _build_worker_kv_cache_spec(kv_caches: dict[str, torch.Tensor]) -> WorkerKVCacheSpec:
+    if not kv_caches:
+        raise ValueError("kv_caches must not be empty")
+
+    storage_indices: dict[int, int] = {}
+    caches: dict[str, tuple[KVCacheTensorSpec, ...]] = {}
+    for name, cache_or_caches in kv_caches.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("KV cache names must be non-empty strings")
+        tensors = (cache_or_caches,) if isinstance(cache_or_caches, torch.Tensor) else tuple(cache_or_caches)
+        if not tensors or any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+            raise TypeError(f"KV cache {name!r} must contain one or more tensors")
+        specs = []
+        for tensor in tensors:
+            try:
+                storage = tensor.untyped_storage()
+            except AttributeError:
+                storage = tensor.storage()
+            storage_key = storage.data_ptr()
+            storage_index = storage_indices.setdefault(storage_key, len(storage_indices))
+            element_size_bytes = tensor.element_size()
+            specs.append(
+                KVCacheTensorSpec(
+                    storage_index=storage_index,
+                    storage_size_bytes=storage.nbytes(),
+                    storage_offset_bytes=tensor.storage_offset() * element_size_bytes,
+                    shape=tuple(tensor.shape),
+                    stride=tuple(tensor.stride()),
+                    dtype=str(tensor.dtype),
+                    element_size_bytes=element_size_bytes,
+                    device_type=tensor.device.type,
+                    device_index=tensor.device.index,
+                )
+            )
+        caches[name] = tuple(specs)
+    return WorkerKVCacheSpec(caches)
 
 
 class AscendStoreMPConnector(KVConnectorBase_V1):
@@ -104,6 +146,10 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
     def _require_scheduler_role(self, action: str) -> None:
         if self.role != KVConnectorRole.SCHEDULER:
             raise RuntimeError(f"{action} is only available on the scheduler connector")
+
+    def _require_worker_role(self, action: str) -> None:
+        if self.role != KVConnectorRole.WORKER:
+            raise RuntimeError(f"{action} is only available on the worker connector")
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         self._require_scheduler_role("build_connector_meta")
@@ -182,6 +228,10 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
             kv_cache_events = self._kv_cache_events.get_all_events()
             yield from kv_cache_events
             self._kv_cache_events = None
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        self._require_worker_role("register_kv_caches")
+        self._kv_cache_client.register_kv_caches(_build_worker_kv_cache_spec(kv_caches))
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         return None

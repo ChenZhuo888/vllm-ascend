@@ -1,4 +1,5 @@
 import threading
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration im
     SchedulerRegistration,
     WorkerRegistration,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import AffinityExecutor
 
 _BLOCK_HASHES = [bytes.fromhex("01" * 32), bytes.fromhex("02" * 32)]
@@ -45,6 +47,8 @@ class _FakeWorker:
         self.lookup_hashes = None
         self.lookup_threads = []
         self.close_threads = []
+        self.configure_threads = []
+        self.kv_cache_spec = None
         self.close_count = 0
 
     def close(self) -> None:
@@ -56,6 +60,10 @@ class _FakeWorker:
     def bind_lookup_store(self, store) -> None:
         self.bound_store = store
         self.binding_threads.append(threading.get_ident())
+
+    def configure_kv_caches(self, spec: WorkerKVCacheSpec) -> None:
+        self.kv_cache_spec = spec
+        self.configure_threads.append(threading.get_ident())
 
     def lookup_scheduler(
         self,
@@ -208,6 +216,41 @@ def test_scheduler_binding_and_lookup_run_on_the_worker_lane() -> None:
         assert worker.lookup_threads != [threading.get_ident()]
         service_manager.close()
         assert worker.close_threads == worker.lookup_threads
+    finally:
+        service_manager.close()
+        worker_executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_worker_cache_spec_is_configured_on_its_owner_lane() -> None:
+    workers = {0: _FakeWorker(), 1: _FakeWorker()}
+    worker_executor = AffinityExecutor(2, 4, "test-worker-cache-lane")
+
+    def worker_factory(registration):
+        return workers[registration.identity.rank]
+
+    service_manager = KVCacheServiceManager(worker_factory=worker_factory, worker_executor=worker_executor)
+    registrations = [_worker_registration(f"worker-{rank}", rank=rank) for rank in workers]
+    specs = {rank: WorkerKVCacheSpec({f"layer.{rank}": ()}) for rank in workers}
+
+    try:
+        for registration in registrations:
+            service_manager.register_worker(registration, encode_registration(registration))
+            worker_executor.submit(
+                partial(
+                    service_manager.register_worker_kv_caches,
+                    registration.identity,
+                    registration.session_id,
+                    specs[registration.identity.rank],
+                ),
+                registration.identity,
+            ).result()
+
+        assert workers[0].kv_cache_spec == specs[0]
+        assert workers[1].kv_cache_spec == specs[1]
+        assert len(workers[0].configure_threads) == 1
+        assert len(workers[1].configure_threads) == 1
+        assert workers[0].configure_threads != [threading.get_ident()]
+        assert workers[1].configure_threads != [threading.get_ident()]
     finally:
         service_manager.close()
         worker_executor.shutdown(wait=True, cancel_futures=True)

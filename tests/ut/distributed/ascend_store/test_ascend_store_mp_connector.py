@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -79,6 +80,38 @@ def test_worker_cannot_call_scheduler_lookup() -> None:
             connector.get_num_new_matched_tokens(MagicMock(), 32)
 
         client_class.return_value.lookup.assert_not_called()
+
+
+def test_worker_registers_process_neutral_kv_cache_layouts() -> None:
+    config = _make_vllm_config()
+    storage = torch.empty((4, 8), dtype=torch.float16)
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.register_kv_caches({"layer.0": storage, "layer.1": storage[1:]})
+
+    spec = client_class.return_value.register_kv_caches.call_args.args[0]
+    first = spec.caches["layer.0"][0]
+    second = spec.caches["layer.1"][0]
+    assert first.storage_index == second.storage_index == 0
+    assert first.storage_size_bytes == second.storage_size_bytes == storage.untyped_storage().nbytes()
+    assert first.storage_offset_bytes == 0
+    assert second.storage_offset_bytes == storage.stride(0) * storage.element_size()
+    assert first.shape == (4, 8)
+    assert first.stride == storage.stride()
+    assert first.dtype == "torch.float16"
+    assert first.device_type == "cpu"
+
+
+def test_worker_rejects_empty_kv_caches_before_rpc() -> None:
+    config = _make_vllm_config()
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        with pytest.raises(ValueError, match="must not be empty"):
+            connector.register_kv_caches({})
+
+        client_class.return_value.register_kv_caches.assert_not_called()
 
 
 def test_build_connector_meta_returns_empty_metadata_when_degraded() -> None:

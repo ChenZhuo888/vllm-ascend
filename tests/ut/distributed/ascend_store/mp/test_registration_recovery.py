@@ -12,6 +12,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protoc
     decode_scheduler_session,
     decode_worker_session,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPRemoteError,
     MPRequestTimeoutError,
@@ -183,6 +184,40 @@ def test_service_renewal_uses_the_registered_session(service_type: str, renew_me
             decode_session = decode_scheduler_session if service_type == "scheduler" else decode_worker_session
             _, session_id = decode_session(renew_call.args[1])
             assert session_id == registration.session_id
+        finally:
+            client.close()
+
+
+def test_worker_cache_spec_is_replayed_after_registration_recovers() -> None:
+    with (
+        patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class,
+        patch(f"{KV_CACHE_CLIENT_MODULE}.KVCacheClient._start_lease_loop"),
+    ):
+        rpc_client = rpc_client_class.return_value
+        rpc_client.is_transport_connected = True
+        rpc_client.request.side_effect = [
+            [b"OK"],
+            MPRequestTimeoutError("cache registration timeout"),
+            [b"OK"],
+            [b"OK"],
+        ]
+        client = KVCacheClient("tcp://127.0.0.1:12345")
+
+        try:
+            assert client.register_worker(_make_vllm_config(), None)
+            assert not client.register_kv_caches(WorkerKVCacheSpec({"layer.0": ()}))
+            assert not client.is_registered
+
+            client._maintain_lease()
+
+            assert client.is_registered
+            methods = [call.args[0] for call in rpc_client.request.call_args_list]
+            assert methods == [
+                KVCacheMethod.REGISTER_WORKER,
+                KVCacheMethod.REGISTER_KV_CACHES,
+                KVCacheMethod.REGISTER_WORKER,
+                KVCacheMethod.REGISTER_KV_CACHES,
+            ]
         finally:
             client.close()
 

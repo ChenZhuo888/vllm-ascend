@@ -5,6 +5,7 @@ import pytest
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.mp_pool_worker import MPKVPoolWorker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
 # isort: on
@@ -62,6 +63,15 @@ def test_mp_worker_initializes_parent_cpu_state() -> None:
     assert worker.kv_send_thread is None
     assert worker.kv_recv_thread is None
     assert worker.physical_layer_to_group_layers == {}
+
+
+def test_mp_worker_records_process_neutral_cache_spec() -> None:
+    worker = _make_worker([1, 1])
+    spec = WorkerKVCacheSpec({"layer.0": ()})
+
+    worker.configure_kv_caches(spec)
+
+    assert worker.kv_cache_spec == spec
 
 
 @pytest.mark.parametrize(

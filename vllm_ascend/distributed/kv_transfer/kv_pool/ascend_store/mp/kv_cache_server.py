@@ -12,6 +12,7 @@ from .kv_cache_protocol import (
     KVCacheMethod,
     decode_build_connector_meta_request,
     decode_lookup_request,
+    decode_register_kv_caches_request,
     decode_registration_request,
     decode_request_finished,
     decode_scheduler_session,
@@ -83,6 +84,7 @@ class KVCacheServer:
                 scheduler_route(KVCacheMethod.REQUEST_FINISHED, self._handle_request_finished),
                 scheduler_route(KVCacheMethod.UPDATE_CONNECTOR_OUTPUT, self._handle_update_connector_output),
                 worker_route(KVCacheMethod.REGISTER_WORKER, self._handle_register_worker),
+                worker_route(KVCacheMethod.REGISTER_KV_CACHES, self._handle_register_kv_caches),
                 worker_route(KVCacheMethod.UNREGISTER_WORKER, self._handle_unregister_worker),
                 lease_route(KVCacheMethod.RENEW_WORKER, self._handle_renew_worker),
             ),
@@ -120,6 +122,11 @@ class KVCacheServer:
             self._service.register_worker(registration, serialized_registration)
         except ServiceBusyError as exc:
             raise MPServerBusyError(str(exc)) from exc
+        return (ACK_RESPONSE,)
+
+    def _handle_register_kv_caches(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, spec = decode_register_kv_caches_request(payloads)
+        self._service.register_worker_kv_caches(identity, session_id, spec)
         return (ACK_RESPONSE,)
 
     def _handle_unregister_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
