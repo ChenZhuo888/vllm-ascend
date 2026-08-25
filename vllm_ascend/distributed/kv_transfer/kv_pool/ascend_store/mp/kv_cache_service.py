@@ -111,7 +111,6 @@ class KVCacheServiceManager:
             hashlib.sha256(payload).digest(),
             lambda: self._build_scheduler(registration),
         )
-        self._schedule_lookup_store_binding(registration.identity)
         return scheduler
 
     def register_worker(self, registration: WorkerRegistration, payload: bytes) -> "KVPoolWorker":
@@ -121,10 +120,6 @@ class KVCacheServiceManager:
             registration.session_id,
             hashlib.sha256(payload).digest(),
             lambda: self._worker_factory(registration),
-        )
-        self._bind_lookup_store(
-            SchedulerIdentity(registration.identity.engine_id, registration.identity.data_parallel_rank),
-            registration.identity,
         )
         return worker
 
@@ -288,29 +283,6 @@ class KVCacheServiceManager:
             callback()
             return
         executor.submit(callback, identity, block=True).result()
-
-    def _schedule_lookup_store_binding(self, scheduler_identity: SchedulerIdentity) -> None:
-        worker_identity = self._get_lookup_worker_identity(scheduler_identity)
-        callback = partial(self._bind_lookup_store, scheduler_identity, worker_identity)
-        if self._worker_executor is None:
-            callback()
-            return
-        self._worker_executor.submit(callback, worker_identity).result()
-
-    def _bind_lookup_store(
-        self,
-        scheduler_identity: SchedulerIdentity,
-        worker_identity: WorkerIdentity,
-    ) -> None:
-        scheduler = self._schedulers.find(scheduler_identity)
-        worker = self._workers.find(worker_identity)
-        if scheduler is None or worker is None:
-            return
-
-        store = getattr(scheduler, "store_scheduler", None)
-        bind_lookup_store = getattr(worker, "bind_lookup_store", None)
-        if store is not None and callable(bind_lookup_store):
-            bind_lookup_store(store)
 
     @staticmethod
     def _get_lookup_worker_identity(scheduler_identity: SchedulerIdentity) -> WorkerIdentity:

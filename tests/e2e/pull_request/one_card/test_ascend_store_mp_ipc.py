@@ -39,6 +39,15 @@ class _ModelConfig:
         return 1
 
 
+class _ObservedBackend:
+    def __init__(self, device_index: int | None):
+        self.device_index = device_index
+
+    @staticmethod
+    def exists(keys: list[str]) -> list[int]:
+        return [0] * len(keys)
+
+
 class _ObservedWorker:
     """Expose assertions from the real MPKVPoolWorker without adding test RPCs."""
 
@@ -46,11 +55,19 @@ class _ObservedWorker:
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.mp_pool_worker import MPKVPoolWorker
 
         self._connection = connection
+        self._backend: _ObservedBackend | None = None
+        self._backend_creation_count = 0
         self._worker = MPKVPoolWorker(
             registration.vllm_config,
             kv_cache_config=registration.kv_cache_config,
             rank=registration.identity.rank,
+            backend_factory=self._create_backend,
         )
+
+    def _create_backend(self, _parallel_config, device_index: int | None, _lazy_init: bool) -> _ObservedBackend:
+        self._backend_creation_count += 1
+        self._backend = _ObservedBackend(device_index)
+        return self._backend
 
     def configure_kv_caches(self, spec: "WorkerKVCacheSpec") -> None:
         previous_caches = getattr(self._worker, "kv_caches", None)
@@ -67,6 +84,8 @@ class _ObservedWorker:
                     "view_values": view.cpu().tolist(),
                     "shared_storage": base.untyped_storage().data_ptr() == view.untyped_storage().data_ptr(),
                     "previous_released": None if previous_caches is None else previous_caches == {},
+                    "backend_device_index": self._backend.device_index if self._backend is not None else None,
+                    "backend_creation_count": self._backend_creation_count,
                 },
             )
         )
@@ -434,6 +453,8 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
             "view_values": [[1.0] * 2 for _ in range(3)],
             "shared_storage": True,
             "previous_released": None,
+            "backend_device_index": 0,
+            "backend_creation_count": 1,
         }
         assert second_status == "configured"
         assert second_generation == {
@@ -443,6 +464,8 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
             "view_values": [[2.0] * 2 for _ in range(3)],
             "shared_storage": True,
             "previous_released": True,
+            "backend_device_index": 0,
+            "backend_creation_count": 1,
         }
         assert close_status == "closed"
         assert close_result == {

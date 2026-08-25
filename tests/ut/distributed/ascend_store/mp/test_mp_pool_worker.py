@@ -94,7 +94,7 @@ def test_mp_worker_maps_cache_once_and_releases_it_on_close() -> None:
     adapter = _CPUMemoryAdapter()
     exported = export_worker_kv_caches({"layer.0": torch.arange(8)}, 1, adapter)
     importer = MagicMock(side_effect=lambda spec: import_worker_kv_caches(spec, adapter))
-    worker = MPKVPoolWorker(_make_vllm_config(), cache_importer=importer)
+    worker = MPKVPoolWorker(_make_vllm_config(), store=MagicMock(), cache_importer=importer)
 
     worker.configure_kv_caches(exported.spec)
     worker.configure_kv_caches(exported.spec)
@@ -116,6 +116,7 @@ def test_mp_worker_replaces_newer_generation_and_ignores_stale_replay() -> None:
     second = export_worker_kv_caches({"layer.0": torch.ones(8)}, 2, adapter)
     worker = MPKVPoolWorker(
         _make_vllm_config(),
+        store=MagicMock(),
         cache_importer=lambda spec: import_worker_kv_caches(spec, adapter),
     )
 
@@ -135,6 +136,7 @@ def test_mp_worker_rejects_conflicting_spec_for_same_generation() -> None:
     conflicting = export_worker_kv_caches({"layer.0": torch.ones(8)}, 1, adapter)
     worker = MPKVPoolWorker(
         _make_vllm_config(),
+        store=MagicMock(),
         cache_importer=lambda spec: import_worker_kv_caches(spec, adapter),
     )
 
@@ -154,7 +156,7 @@ def test_mp_worker_keeps_current_mapping_when_new_import_fails() -> None:
             raise RuntimeError("import failed")
         return import_worker_kv_caches(spec, adapter)
 
-    worker = MPKVPoolWorker(_make_vllm_config(), cache_importer=import_cache)
+    worker = MPKVPoolWorker(_make_vllm_config(), store=MagicMock(), cache_importer=import_cache)
     worker.configure_kv_caches(first.spec)
     current_mapping = worker.kv_caches
 
@@ -203,31 +205,27 @@ def test_mp_worker_returns_miss_when_store_fails() -> None:
     assert result == 0
 
 
-def test_mp_worker_returns_miss_before_store_is_bound() -> None:
+def test_mp_worker_returns_miss_before_backend_is_initialized() -> None:
     worker = MPKVPoolWorker(_make_vllm_config())
 
     result = worker.lookup_scheduler(32, ["01" * 32, "02" * 32], use_layerwise=False)
     assert result == 0
 
 
-def test_mp_worker_uses_bound_scheduler_store() -> None:
-    worker = MPKVPoolWorker(_make_vllm_config())
+def test_mp_worker_initializes_own_backend_after_cache_mapping() -> None:
+    adapter = _CPUMemoryAdapter()
+    exported = export_worker_kv_caches({"layer.0": torch.arange(8)}, 1, adapter)
     store = MagicMock()
     store.exists.return_value = [1, 1]
+    backend_factory = MagicMock(return_value=store)
+    config = _make_vllm_config()
+    worker = MPKVPoolWorker(
+        config,
+        cache_importer=lambda spec: import_worker_kv_caches(spec, adapter),
+        backend_factory=backend_factory,
+    )
 
-    worker.bind_lookup_store(store)
+    worker.configure_kv_caches(exported.spec)
 
     assert worker.lookup_scheduler(32, ["01" * 32, "02" * 32], use_layerwise=False) == 32
-
-
-def test_mp_worker_keeps_explicit_store_when_scheduler_store_is_bound() -> None:
-    explicit_store = MagicMock()
-    explicit_store.exists.return_value = [1, 0]
-    worker = MPKVPoolWorker(_make_vllm_config(), store=explicit_store)
-    scheduler_store = MagicMock()
-    scheduler_store.exists.return_value = [1, 1]
-
-    worker.bind_lookup_store(scheduler_store)
-
-    assert worker.lookup_scheduler(32, ["01" * 32, "02" * 32], use_layerwise=False) == 16
-    scheduler_store.exists.assert_not_called()
+    backend_factory.assert_called_once_with(config.parallel_config, 3, False)
