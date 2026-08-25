@@ -87,7 +87,10 @@ class _ObservedWorker:
         )
 
 
-def _make_worker_config():
+def _make_worker_config(server_url: str | None = None):
+    extra_config = {"backend": "mooncake"}
+    if server_url is not None:
+        extra_config["kv_cache_server_url"] = server_url
     return SimpleNamespace(
         model_config=_ModelConfig(),
         parallel_config=SimpleNamespace(
@@ -100,8 +103,10 @@ def _make_worker_config():
         ),
         kv_transfer_config=SimpleNamespace(
             engine_id="ascend-store-mp-ipc-test",
+            kv_connector="AscendStoreMPConnector",
             kv_role="kv_producer",
-            kv_connector_extra_config={"backend": "mooncake"},
+            kv_connector_extra_config=extra_config,
+            is_kv_producer=True,
         ),
         cache_config=SimpleNamespace(block_size=16, prefix_match_unit=None),
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
@@ -207,6 +212,18 @@ def _wait_until_registered(client) -> None:
     while not client.is_registered:
         if time.monotonic() >= deadline:
             raise TimeoutError("Timed out waiting for Worker registration")
+        time.sleep(0.05)
+
+
+def _wait_for_active_export(connector, generation: int):
+    deadline = time.monotonic() + _MESSAGE_TIMEOUT_S
+    while True:
+        with connector._kv_cache_export_lock:
+            active = connector._active_kv_cache_export
+            if active is not None and active.spec.generation == generation:
+                return active
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for KV cache generation {generation} to become active")
         time.sleep(0.05)
 
 
@@ -340,13 +357,13 @@ def test_npu_kv_cache_storage_round_trip_across_processes() -> None:
     assert producer_exitcode == 0
 
 
-def test_worker_cache_registration_replaces_generation_and_releases_mapping() -> None:
+def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
     import torch
     import torch_npu  # noqa: F401
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_memory import (
-        export_worker_kv_caches,
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_mp_connector import (
+        AscendStoreMPConnector,
     )
 
     context = multiprocessing.get_context("spawn")
@@ -358,8 +375,7 @@ def test_worker_cache_registration_replaces_generation_and_releases_mapping() ->
         args=(endpoint_child_connection, observation_child_connection, control_child_connection),
         name="kv-cache-ipc-server",
     )
-    client = None
-    exported_caches = []
+    connector = None
     failure: BaseException | None = None
     server_exitcode = None
     server_forced = False
@@ -376,29 +392,39 @@ def test_worker_cache_registration_replaces_generation_and_releases_mapping() ->
         if not torch.npu.is_available():
             raise RuntimeError("NPU is not available in the Worker process")
         torch.npu.set_device(0)
-        client = KVCacheClient(server_result)
-        _wait_until_connected(client)
-        client.register_worker(_make_worker_config(), kv_cache_config=None)
-        _wait_until_registered(client)
+        connector = AscendStoreMPConnector(
+            _make_worker_config(server_result),
+            KVConnectorRole.WORKER,
+            kv_cache_config=None,
+        )
+        _wait_until_connected(connector._kv_cache_client)
+        _wait_until_registered(connector._kv_cache_client)
 
+        exports = []
+        generation_results = []
         for generation in (1, 2):
             base = torch.full((4, 4), generation, dtype=torch.float16, device="npu")
             view = base[1:, ::2]
             torch.npu.synchronize()
-            exported = export_worker_kv_caches({"base": base, "view": view}, generation)
-            exported_caches.append(exported)
-            if not client.register_kv_caches(exported.spec, timeout_ms=int(_MESSAGE_TIMEOUT_S * 1000)):
-                raise RuntimeError(f"KV cache generation {generation} was not registered")
-            if len(exported_caches) > 1:
-                exported_caches.pop(0).close()
+            connector.register_kv_caches({"base": base, "view": view})
+            exports.append(_wait_for_active_export(connector, generation))
+            generation_results.append(_receive(observation_connection, f"cache generation {generation}"))
 
-        client.close()
-        client = None
-        exported_caches.pop().close()
+        with connector._kv_cache_export_lock:
+            assert connector._pending_kv_cache_exports == {}
+            assert connector._active_kv_cache_export is exports[1]
+        assert exports[0]._storages == ()
 
-        first_status, first_generation = _receive(observation_connection, "first cache generation")
-        second_status, second_generation = _receive(observation_connection, "second cache generation")
-        close_status, close_result = _receive(observation_connection, "Worker cache release")
+        connector.shutdown()
+        with connector._kv_cache_export_lock:
+            assert connector._pending_kv_cache_exports == {}
+            assert connector._active_kv_cache_export is None
+        assert exports[1]._storages == ()
+        assert observation_connection.poll(0), "Connector released its export before Server released the mapping"
+        close_status, close_result = observation_connection.recv()
+        connector = None
+
+        (first_status, first_generation), (second_status, second_generation) = generation_results
 
         assert first_status == "configured"
         assert first_generation == {
@@ -428,10 +454,8 @@ def test_worker_cache_registration_replaces_generation_and_releases_mapping() ->
         failure = exc
     finally:
         endpoint_connection.close()
-        if client is not None:
-            client.close()
-        for exported in exported_caches:
-            exported.close()
+        if connector is not None:
+            connector.shutdown()
         with contextlib.suppress(BrokenPipeError, EOFError, OSError):
             control_connection.send("stop")
         control_connection.close()
