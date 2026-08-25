@@ -2,11 +2,12 @@ import multiprocessing as mp
 import queue
 import threading
 import time
+import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import zmq
@@ -23,9 +24,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPServer,
     MPServerAbortedError,
     MPServerBusyError,
+    MPServerUnavailableError,
     Route,
     SystemMethod,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.client import _ClientLifecycleState
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.protocol import (
     ResponseStatus,
     decode_request,
@@ -39,6 +42,7 @@ INVALID_RESPONSE_METHOD = "TEST_INVALID_RESPONSE"
 AFFINITY_METHOD = "TEST_AFFINITY"
 DEFAULT_AFFINITY_METHOD = "TEST_DEFAULT_AFFINITY"
 BLOCKING_METHOD = "TEST_BLOCKING"
+RPC_CLIENT_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.client"
 
 _WORKER_COUNT = 4
 _REQUESTS_PER_WORKER = 16
@@ -277,6 +281,7 @@ def test_client_server_round_trip():
         client.wait_until_connected()
 
         assert client.is_transport_connected
+        assert client._lifecycle_state is _ClientLifecycleState.CONNECTED
         assert client.ping() == "OK"
         assert client.echo(b"hello ascend store") == b"hello ascend store"
 
@@ -285,8 +290,51 @@ def test_client_server_round_trip():
 
         assert process.is_alive()
         assert client.ping() == "OK"
+        client.close()
+        assert client._lifecycle_state is _ClientLifecycleState.CLOSED
     finally:
         _cleanup(client, parent_conn, process)
+
+
+def test_client_close_wakes_thread_waiting_for_connection() -> None:
+    endpoint = f"ipc:///tmp/ascend-store-mp-{uuid.uuid4().hex}"
+    client = MPClient(endpoint)
+    wait_started = threading.Event()
+
+    def wait_until_connected() -> None:
+        wait_started.set()
+        client.wait_until_connected(timeout_ms=5000)
+
+    try:
+        assert client._lifecycle_state is _ClientLifecycleState.DISCONNECTED
+        with pytest.raises(MPServerUnavailableError, match="MP server is unavailable"):
+            client.submit_request(SystemMethod.PING)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            wait_future = executor.submit(wait_until_connected)
+            assert wait_started.wait(1)
+            client.close()
+
+            with pytest.raises(MPClientClosedError, match="MP client is closed"):
+                wait_future.result(timeout=1)
+
+        assert client._lifecycle_state is _ClientLifecycleState.CLOSED
+    finally:
+        client.close()
+
+
+def test_client_constructor_releases_resources_after_io_start_failure() -> None:
+    context = MagicMock()
+    context.socket.side_effect = RuntimeError("socket failed")
+
+    with (
+        patch(f"{RPC_CLIENT_MODULE}.zmq.Context", return_value=context),
+        pytest.raises(RuntimeError, match="Failed to start MP client I/O thread") as exc_info,
+    ):
+        MPClient("tcp://127.0.0.1:12345")
+
+    assert str(exc_info.value.__cause__) == "socket failed"
+    context.term.assert_called_once_with()
 
 
 def test_server_request_stop_wakes_run_loop() -> None:

@@ -20,6 +20,7 @@ import time
 from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
+from enum import Enum, auto
 
 import zmq
 from zmq.utils.monitor import recv_monitor_message
@@ -61,6 +62,17 @@ class _PendingRequest:
     deadline_ns: int | None
 
 
+class _ClientLifecycleState(Enum):
+    """Lifecycle of the I/O thread and its transport resources."""
+
+    STARTING = auto()
+    DISCONNECTED = auto()
+    CONNECTED = auto()
+    CLOSING = auto()
+    FAILED = auto()
+    CLOSED = auto()
+
+
 class MPClient:
     def __init__(self, server_url: str):
         self._context = zmq.Context()
@@ -70,12 +82,8 @@ class MPClient:
         self._outbound_queue: queue.Queue[_OutboundRequest] = queue.Queue()
         self._pending_requests: dict[bytes, _PendingRequest] = {}
 
-        self._close_requested = threading.Event()
-        self._transport_connected = threading.Event()
-        self._lifecycle_lock = threading.Lock()
-        self._resources_released = False
-
-        self._io_ready = threading.Event()
+        self._client_lifecycle_condition = threading.Condition()
+        self._lifecycle_state = _ClientLifecycleState.STARTING
         self._io_error: Exception | None = None
 
         self._notify_reader, self._notify_writer = socket.socketpair()
@@ -83,12 +91,14 @@ class MPClient:
         self._io_thread = threading.Thread(target=self._io_loop, daemon=True, name="ascend-store-mp-client")
         self._io_thread.start()
 
-        self._io_ready.wait()
-        if self._io_error is not None:
-            io_error = self._io_error
-            self._notify_writer.close()
-            self._context.term()
-            self._resources_released = True
+        with self._client_lifecycle_condition:
+            self._client_lifecycle_condition.wait_for(
+                lambda: self._lifecycle_state is not _ClientLifecycleState.STARTING
+            )
+            io_error = self._io_error if self._lifecycle_state is _ClientLifecycleState.FAILED else None
+
+        if io_error is not None:
+            self.close()
             raise RuntimeError("Failed to start MP client I/O thread") from io_error
 
     def __enter__(self) -> "MPClient":
@@ -100,26 +110,33 @@ class MPClient:
     @property
     def is_transport_connected(self) -> bool:
         """Whether ZMQ reports an active transport connection."""
-        return self._transport_connected.is_set()
+        with self._client_lifecycle_condition:
+            return self._lifecycle_state is _ClientLifecycleState.CONNECTED
 
     def wait_until_connected(self, timeout_ms: int = 5000) -> None:
         if timeout_ms <= 0:
             raise ValueError(f"timeout_ms must be greater than 0, got {timeout_ms}")
 
-        with self._lifecycle_lock:
-            if self._close_requested.is_set() or self._resources_released:
+        terminal_states = {
+            _ClientLifecycleState.CONNECTED,
+            _ClientLifecycleState.CLOSING,
+            _ClientLifecycleState.FAILED,
+            _ClientLifecycleState.CLOSED,
+        }
+        with self._client_lifecycle_condition:
+            reached_terminal_state = self._client_lifecycle_condition.wait_for(
+                lambda: self._lifecycle_state in terminal_states,
+                timeout_ms / 1000,
+            )
+            if not reached_terminal_state:
+                raise MPServerUnavailableError(f"Timed out connecting to MP server: {self._server_url}")
+            if self._lifecycle_state is _ClientLifecycleState.CONNECTED:
+                return
+            if self._lifecycle_state in {_ClientLifecycleState.CLOSING, _ClientLifecycleState.CLOSED}:
                 raise MPClientClosedError("MP client is closed")
-
-        if self._transport_connected.wait(timeout_ms / 1000):
-            return
-
-        with self._lifecycle_lock:
-            if self._close_requested.is_set() or self._resources_released:
-                raise MPClientClosedError("MP client is closed")
-            if self._io_error is not None:
+            if self._lifecycle_state is _ClientLifecycleState.FAILED:
                 raise MPServerUnavailableError("MP client I/O thread is unavailable") from self._io_error
-
-        raise MPServerUnavailableError(f"Timed out connecting to MP server: {self._server_url}")
+            raise RuntimeError(f"Unexpected MP client lifecycle state: {self._lifecycle_state.name}")
 
     @staticmethod
     def _deadline_from_timeout(timeout_ms: int | None) -> int | None:
@@ -141,10 +158,12 @@ class MPClient:
     ) -> Future[list[bytes]]:
         method_name = normalize_method(method)
 
-        with self._lifecycle_lock:
-            if self._close_requested.is_set() or self._resources_released:
+        with self._client_lifecycle_condition:
+            if self._lifecycle_state in {_ClientLifecycleState.CLOSING, _ClientLifecycleState.CLOSED}:
                 raise MPClientClosedError("MP client is closed")
-            if not self._transport_connected.is_set():
+            if self._lifecycle_state is not _ClientLifecycleState.CONNECTED:
+                if self._lifecycle_state is _ClientLifecycleState.FAILED:
+                    raise MPServerUnavailableError("MP client I/O thread is unavailable") from self._io_error
                 raise MPServerUnavailableError("MP server is unavailable")
 
             request_id = str(next(self._request_ids)).encode()
@@ -242,19 +261,23 @@ class MPClient:
             self._process_inbound(zmq_socket)
 
     def _handle_transport_disconnected(self, zmq_socket: zmq.Socket) -> None:
-        with self._lifecycle_lock:
-            if self._close_requested.is_set() or not self._transport_connected.is_set():
+        with self._client_lifecycle_condition:
+            if self._lifecycle_state is not _ClientLifecycleState.CONNECTED:
                 return
-            self._transport_connected.clear()
+            self._lifecycle_state = _ClientLifecycleState.DISCONNECTED
 
         self._drain_inbound(zmq_socket)
         self._fail_pending(MPServerUnavailableError(f"MP server disconnected: {self._server_url}"))
 
     def _handle_transport_connected(self) -> None:
-        with self._lifecycle_lock:
-            if self._close_requested.is_set() or self._resources_released:
+        with self._client_lifecycle_condition:
+            if self._lifecycle_state not in {
+                _ClientLifecycleState.STARTING,
+                _ClientLifecycleState.DISCONNECTED,
+            }:
                 return
-            self._transport_connected.set()
+            self._lifecycle_state = _ClientLifecycleState.CONNECTED
+            self._client_lifecycle_condition.notify_all()
 
     def _process_monitor_event(self, zmq_socket: zmq.Socket, monitor_socket: zmq.Socket) -> None:
         monitor_event = recv_monitor_message(monitor_socket)
@@ -297,7 +320,10 @@ class MPClient:
             poller.register(zmq_socket, zmq.POLLIN)
             poller.register(monitor_socket, zmq.POLLIN)
             poller.register(self._notify_reader.fileno(), zmq.POLLIN)
-            self._io_ready.set()
+            with self._client_lifecycle_condition:
+                if self._lifecycle_state is _ClientLifecycleState.STARTING:
+                    self._lifecycle_state = _ClientLifecycleState.DISCONNECTED
+                    self._client_lifecycle_condition.notify()
 
             while True:
                 timeout_ms = self._next_poll_timeout_ms()
@@ -305,7 +331,9 @@ class MPClient:
 
                 if self._notify_reader.fileno() in events:
                     self._notify_reader.recv(4096)
-                    if self._close_requested.is_set():
+                    with self._client_lifecycle_condition:
+                        closing = self._lifecycle_state is _ClientLifecycleState.CLOSING
+                    if closing:
                         self._fail_pending(MPClientClosedError("MP client was closed"))
                         break
                     self._process_outbound(zmq_socket)
@@ -316,13 +344,16 @@ class MPClient:
                     self._process_monitor_event(zmq_socket, monitor_socket)
                 self._expire_pending_requests()
         except Exception as exc:
-            self._io_error = exc
-            with self._lifecycle_lock:
-                self._transport_connected.clear()
+            with self._client_lifecycle_condition:
+                self._io_error = exc
+                if self._lifecycle_state is not _ClientLifecycleState.CLOSING:
+                    self._lifecycle_state = _ClientLifecycleState.FAILED
+                self._client_lifecycle_condition.notify_all()
             self._fail_pending(exc)
-            self._io_ready.set()
         finally:
-            self._transport_connected.clear()
+            with self._client_lifecycle_condition:
+                if self._lifecycle_state is _ClientLifecycleState.CONNECTED:
+                    self._lifecycle_state = _ClientLifecycleState.DISCONNECTED
             if monitor_socket is not None:
                 monitor_socket.close(linger=0)
             if zmq_socket is not None:
@@ -344,22 +375,22 @@ class MPClient:
         self._pending_requests.clear()
 
     def close(self) -> None:
-        with self._lifecycle_lock:
-            if self._resources_released:
+        with self._client_lifecycle_condition:
+            if self._lifecycle_state is _ClientLifecycleState.CLOSED:
                 return
 
-            if not self._close_requested.is_set():
-                self._close_requested.set()
-                self._transport_connected.clear()
+            if self._lifecycle_state is not _ClientLifecycleState.CLOSING:
+                self._lifecycle_state = _ClientLifecycleState.CLOSING
+                self._client_lifecycle_condition.notify_all()
                 if self._io_thread.is_alive():
                     with contextlib.suppress(OSError):
                         self._notify_io_thread()
 
         self._io_thread.join()
 
-        with self._lifecycle_lock:
-            if self._resources_released:
+        with self._client_lifecycle_condition:
+            if self._lifecycle_state is _ClientLifecycleState.CLOSED:
                 return
             self._notify_writer.close()
             self._context.term()
-            self._resources_released = True
+            self._lifecycle_state = _ClientLifecycleState.CLOSED
