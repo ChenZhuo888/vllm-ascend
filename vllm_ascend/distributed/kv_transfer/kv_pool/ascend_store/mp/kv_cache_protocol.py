@@ -252,11 +252,7 @@ def encode_update_state_after_alloc(
 def decode_update_state_after_alloc(
     payloads: tuple[bytes, ...],
 ) -> tuple[SchedulerIdentity, str, RequestView, BlocksView, int]:
-    if len(payloads) != _UPDATE_STATE_AFTER_ALLOC_PAYLOADS:
-        raise MPProtocolError(
-            f"{KVCacheMethod.UPDATE_STATE_AFTER_ALLOC.value} expects "
-            f"{_UPDATE_STATE_AFTER_ALLOC_PAYLOADS} payloads, got {len(payloads)}"
-        )
+    _require_payload_count(payloads, _UPDATE_STATE_AFTER_ALLOC_PAYLOADS, KVCacheMethod.UPDATE_STATE_AFTER_ALLOC.value)
     identity = _decode_scheduler_identity(payloads)
     body = _decode_body(payloads[5], KVCacheMethod.UPDATE_STATE_AFTER_ALLOC.value)
     try:
@@ -309,9 +305,7 @@ def encode_build_connector_meta_request(
         "cached_new_token_ids": {req_id: list(tokens) for req_id, tokens in new_token_ids.items()},
     }
     return (
-        _encode_text(identity.engine_id, "engine_id"),
-        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
-        _encode_text(registration.session_id, "session_id"),
+        *encode_scheduler_session(identity, registration.session_id),
         _encode_body(body, KVCacheMethod.BUILD_CONNECTOR_META.value),
     )
 
@@ -319,11 +313,7 @@ def encode_build_connector_meta_request(
 def decode_build_connector_meta_request(
     payloads: tuple[bytes, ...],
 ) -> tuple[SchedulerIdentity, str, SchedulerOutputView]:
-    if len(payloads) != _BUILD_CONNECTOR_META_PAYLOADS:
-        raise MPProtocolError(
-            f"{KVCacheMethod.BUILD_CONNECTOR_META.value} expects "
-            f"{_BUILD_CONNECTOR_META_PAYLOADS} payloads, got {len(payloads)}"
-        )
+    _require_payload_count(payloads, _BUILD_CONNECTOR_META_PAYLOADS, KVCacheMethod.BUILD_CONNECTOR_META.value)
     identity = _decode_scheduler_identity(payloads)
     session_id = _decode_text(payloads[2], "session_id")
     body = _decode_body(payloads[3], KVCacheMethod.BUILD_CONNECTOR_META.value)
@@ -372,10 +362,8 @@ def encode_request_finished(
     block_ids,
     all_groups: bool,
 ) -> tuple[bytes, ...]:
-    identity = registration.identity
     return (
-        _encode_text(identity.engine_id, "engine_id"),
-        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
+        *_encode_scheduler_identity(registration.identity),
         _encode_text(request_id, "request_id"),
         _ALL_GROUPS_VARIANT if all_groups else _SINGLE_GROUP_VARIANT,
         _encode_text(registration.session_id, "session_id"),
@@ -384,16 +372,12 @@ def encode_request_finished(
 
 
 def decode_request_finished(payloads: tuple[bytes, ...]) -> tuple[SchedulerIdentity, str, str, object, bool]:
-    if len(payloads) != _REQUEST_FINISHED_PAYLOADS:
-        raise MPProtocolError(
-            f"{KVCacheMethod.REQUEST_FINISHED.value} expects "
-            f"{_REQUEST_FINISHED_PAYLOADS} payloads, got {len(payloads)}"
-        )
+    _require_payload_count(payloads, _REQUEST_FINISHED_PAYLOADS, KVCacheMethod.REQUEST_FINISHED.value)
     identity = _decode_scheduler_identity(payloads)
     request_id = _decode_text(payloads[2], "request_id")
-    all_groups = payloads[3] == _ALL_GROUPS_VARIANT
     if payloads[3] not in (_SINGLE_GROUP_VARIANT, _ALL_GROUPS_VARIANT):
         raise MPProtocolError(f"Invalid REQUEST_FINISHED variant: {payloads[3]!r}")
+    all_groups = payloads[3] == _ALL_GROUPS_VARIANT
     session_id = _decode_text(payloads[4], "session_id")
     block_ids = _decode_body(payloads[5], KVCacheMethod.REQUEST_FINISHED.value)["block_ids"]
     return identity, session_id, request_id, block_ids, all_groups
@@ -418,11 +402,8 @@ def encode_update_connector_output(
     registration: SchedulerRegistration,
     completed_events: dict[int, int],
 ) -> tuple[bytes, ...]:
-    identity = registration.identity
     return (
-        _encode_text(identity.engine_id, "engine_id"),
-        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
-        _encode_text(registration.session_id, "session_id"),
+        *encode_scheduler_session(registration.identity, registration.session_id),
         _encode_body(
             {"completed_events": dict(completed_events)},
             KVCacheMethod.UPDATE_CONNECTOR_OUTPUT.value,
@@ -431,11 +412,7 @@ def encode_update_connector_output(
 
 
 def decode_update_connector_output(payloads: tuple[bytes, ...]) -> tuple[SchedulerIdentity, str, dict[int, int]]:
-    if len(payloads) != _UPDATE_CONNECTOR_OUTPUT_PAYLOADS:
-        raise MPProtocolError(
-            f"{KVCacheMethod.UPDATE_CONNECTOR_OUTPUT.value} expects "
-            f"{_UPDATE_CONNECTOR_OUTPUT_PAYLOADS} payloads, got {len(payloads)}"
-        )
+    _require_payload_count(payloads, _UPDATE_CONNECTOR_OUTPUT_PAYLOADS, KVCacheMethod.UPDATE_CONNECTOR_OUTPUT.value)
     identity = _decode_scheduler_identity(payloads)
     session_id = _decode_text(payloads[2], "session_id")
     completed_events = _decode_body(payloads[3], KVCacheMethod.UPDATE_CONNECTOR_OUTPUT.value)["completed_events"]
@@ -457,6 +434,11 @@ def _decode_lookup_identity(payloads: tuple[bytes, ...]) -> SchedulerIdentity:
     if len(payloads) < _LOOKUP_HEADER_PAYLOADS:
         raise MPProtocolError(f"LOOKUP expects at least {_LOOKUP_HEADER_PAYLOADS} payloads, got {len(payloads)}")
     return _decode_scheduler_identity(payloads)
+
+
+def _require_payload_count(payloads: tuple[bytes, ...], expected: int, method: str) -> None:
+    if len(payloads) != expected:
+        raise MPProtocolError(f"{method} expects {expected} payloads, got {len(payloads)}")
 
 
 def _encode_scheduler_identity(identity: SchedulerIdentity) -> tuple[bytes, ...]:

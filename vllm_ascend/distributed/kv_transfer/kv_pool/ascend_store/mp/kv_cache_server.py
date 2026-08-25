@@ -171,9 +171,7 @@ class KVCacheServer:
 
     def _handle_update_connector_output(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id, completed_events = decode_update_connector_output(payloads)
-        output = ConnectorOutputView(
-            kv_connector_worker_meta=AscendStoreKVConnectorWorkerMetadata(completed_events)
-        )
+        output = ConnectorOutputView(kv_connector_worker_meta=AscendStoreKVConnectorWorkerMetadata(completed_events))
         free_block_ids = self._service.update_connector_output(identity, session_id, output)
         return (encode_update_connector_output_response(free_block_ids),)
 

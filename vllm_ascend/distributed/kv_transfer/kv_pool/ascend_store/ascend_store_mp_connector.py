@@ -90,22 +90,23 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         request: Request,
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        if self.role != KVConnectorRole.SCHEDULER:
-            raise RuntimeError("get_num_new_matched_tokens is only available on the scheduler connector")
+        self._require_scheduler_role("get_num_new_matched_tokens")
         return self._kv_cache_client.lookup(request, num_computed_tokens)
 
     def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int) -> None:
-        if self.role != KVConnectorRole.SCHEDULER:
-            raise RuntimeError("update_state_after_alloc is only available on the scheduler connector")
+        self._require_scheduler_role("update_state_after_alloc")
         # The server registers a snapshot; the live reference stays here to
         # supply all_token_ids increments in later build_connector_meta calls.
         self._local_requests[request.request_id] = request
         self._synced_token_len[request.request_id] = len(request.prompt_token_ids)
         self._kv_cache_client.update_state_after_alloc(request, blocks, num_external_tokens)
 
-    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
+    def _require_scheduler_role(self, action: str) -> None:
         if self.role != KVConnectorRole.SCHEDULER:
-            raise RuntimeError("build_connector_meta is only available on the scheduler connector")
+            raise RuntimeError(f"{action} is only available on the scheduler connector")
+
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
+        self._require_scheduler_role("build_connector_meta")
         new_token_ids = self._collect_token_id_increments(scheduler_output)
         result = self._kv_cache_client.build_connector_meta(scheduler_output, new_token_ids)
         for req_id in scheduler_output.finished_req_ids:
@@ -139,26 +140,22 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         self._gpu_block_pool = gpu_block_pool
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
-        if self.role != KVConnectorRole.SCHEDULER:
-            raise RuntimeError("request_finished is only available on the scheduler connector")
-        delay_free, extra = self._kv_cache_client.request_finished(request.request_id, block_ids)
-        self._local_requests.pop(request.request_id, None)
-        self._synced_token_len.pop(request.request_id, None)
-        return delay_free, extra
+        return self._finish_request(request, block_ids, all_groups=False)
 
     def request_finished_all_groups(
         self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
-        if self.role != KVConnectorRole.SCHEDULER:
-            raise RuntimeError("request_finished_all_groups is only available on the scheduler connector")
-        delay_free, extra = self._kv_cache_client.request_finished(request.request_id, block_ids, all_groups=True)
+        return self._finish_request(request, block_ids, all_groups=True)
+
+    def _finish_request(self, request: Request, block_ids, all_groups: bool) -> tuple[bool, dict[str, Any] | None]:
+        self._require_scheduler_role("request_finished")
+        delay_free, extra = self._kv_cache_client.request_finished(request.request_id, block_ids, all_groups)
         self._local_requests.pop(request.request_id, None)
         self._synced_token_len.pop(request.request_id, None)
         return delay_free, extra
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
-        if self.role != KVConnectorRole.SCHEDULER:
-            raise RuntimeError("update_connector_output is only available on the scheduler connector")
+        self._require_scheduler_role("update_connector_output")
         worker_meta = connector_output.kv_connector_worker_meta
         completed_events = (
             worker_meta.completed_events if isinstance(worker_meta, AscendStoreKVConnectorWorkerMetadata) else {}

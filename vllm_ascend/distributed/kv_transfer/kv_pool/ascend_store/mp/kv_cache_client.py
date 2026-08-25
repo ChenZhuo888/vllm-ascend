@@ -47,6 +47,12 @@ _LEASE_REQUEST_TIMEOUT_MS = 1000
 _RegistrationState = tuple[SchedulerRegistration | WorkerRegistration, tuple[bytes, ...]]
 
 
+def _single_response(responses: tuple[bytes, ...], method: KVCacheMethod) -> bytes:
+    if len(responses) != 1:
+        raise MPProtocolError(f"{method.value} expects 1 response payload, got {len(responses)}")
+    return responses[0]
+
+
 class KVCacheClient:
     """Typed KV cache RPC client with recoverable service registration."""
 
@@ -248,30 +254,12 @@ class KVCacheClient:
     def lookup(
         self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS
     ) -> tuple[int, bool]:
-        self._raise_if_superseded()
-        registration = self._get_scheduler_registration()
-        payloads = encode_lookup_request(registration, request, num_computed_tokens)
-
-        if not self.is_registered and not self._try_register():
-            return 0, False
-
-        try:
-            responses = self._rpc_client.request(KVCacheMethod.LOOKUP, payloads, timeout_ms=timeout_ms)
-        except MPServerBusyError:
-            return 0, False
-        except (MPRequestTimeoutError, MPServerUnavailableError):
-            self._mark_unregistered()
-            return 0, False
-        except MPRemoteError as exc:
-            if str(exc).startswith(SERVICE_NOT_REGISTERED_PREFIX):
-                self._mark_unregistered()
-                return 0, False
-            if str(exc).startswith(STALE_SESSION_PREFIX):
-                self._mark_superseded()
-                raise ServiceSessionExpiredError(str(exc)) from exc
-            raise
-
-        return decode_lookup_response(responses)
+        responses = self._scheduler_rpc(
+            KVCacheMethod.LOOKUP,
+            lambda registration: encode_lookup_request(registration, request, num_computed_tokens),
+            timeout_ms,
+        )
+        return decode_lookup_response(responses) if responses is not None else (0, False)
 
     def update_state_after_alloc(
         self,
@@ -280,31 +268,12 @@ class KVCacheClient:
         num_external_tokens: int,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> None:
-        self._raise_if_superseded()
-        registration = self._get_scheduler_registration()
-        payloads = encode_update_state_after_alloc(registration, request, blocks, num_external_tokens)
-
-        if not self.is_registered and not self._try_register():
-            return
-
-        try:
-            responses = self._rpc_client.request(
-                KVCacheMethod.UPDATE_STATE_AFTER_ALLOC, payloads, timeout_ms=timeout_ms
-            )
-        except MPServerBusyError:
-            return
-        except (MPRequestTimeoutError, MPServerUnavailableError):
-            self._mark_unregistered()
-        except MPRemoteError as exc:
-            if str(exc).startswith(SERVICE_NOT_REGISTERED_PREFIX):
-                self._mark_unregistered()
-            elif str(exc).startswith(STALE_SESSION_PREFIX):
-                self._mark_superseded()
-                raise ServiceSessionExpiredError(str(exc)) from exc
-            else:
-                raise
-
-        if responses != [ACK_RESPONSE]:
+        responses = self._scheduler_rpc(
+            KVCacheMethod.UPDATE_STATE_AFTER_ALLOC,
+            lambda registration: encode_update_state_after_alloc(registration, request, blocks, num_external_tokens),
+            timeout_ms,
+        )
+        if responses is not None and responses != [ACK_RESPONSE]:
             raise MPProtocolError(f"{KVCacheMethod.UPDATE_STATE_AFTER_ALLOC.value} expects an OK response")
 
     def build_connector_meta(
@@ -314,34 +283,16 @@ class KVCacheClient:
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> tuple | None:
         """Return (metadata, touch_block_ids) or None when degraded."""
-        self._raise_if_superseded()
-        registration = self._get_scheduler_registration()
-        payloads = encode_build_connector_meta_request(registration, scheduler_output, new_token_ids)
-
-        if not self.is_registered and not self._try_register():
-            return None
-
-        try:
-            responses = self._rpc_client.request(KVCacheMethod.BUILD_CONNECTOR_META, payloads, timeout_ms=timeout_ms)
-        except MPServerBusyError:
-            return None
-        except (MPRequestTimeoutError, MPServerUnavailableError):
-            self._mark_unregistered()
-            return None
-        except MPRemoteError as exc:
-            if str(exc).startswith(SERVICE_NOT_REGISTERED_PREFIX):
-                self._mark_unregistered()
-                return None
-            if str(exc).startswith(STALE_SESSION_PREFIX):
-                self._mark_superseded()
-                raise ServiceSessionExpiredError(str(exc)) from exc
-            raise
-
-        if len(responses) != 1:
-            raise MPProtocolError(
-                f"{KVCacheMethod.BUILD_CONNECTOR_META.value} expects 1 response payload, got {len(responses)}"
-            )
-        return decode_build_connector_meta_response(responses[0])
+        responses = self._scheduler_rpc(
+            KVCacheMethod.BUILD_CONNECTOR_META,
+            lambda registration: encode_build_connector_meta_request(registration, scheduler_output, new_token_ids),
+            timeout_ms,
+        )
+        return (
+            decode_build_connector_meta_response(_single_response(responses, KVCacheMethod.BUILD_CONNECTOR_META))
+            if responses is not None
+            else None
+        )
 
     def request_finished(
         self,
@@ -350,35 +301,16 @@ class KVCacheClient:
         all_groups: bool = False,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> tuple[bool, dict | None]:
-        self._raise_if_superseded()
-        registration = self._get_scheduler_registration()
-        payloads = encode_request_finished(registration, request_id, block_ids, all_groups)
-
-        if not self.is_registered and not self._try_register():
-            # Degraded: let vLLM free the blocks immediately.
-            return False, None
-
-        try:
-            responses = self._rpc_client.request(KVCacheMethod.REQUEST_FINISHED, payloads, timeout_ms=timeout_ms)
-        except MPServerBusyError:
-            return False, None
-        except (MPRequestTimeoutError, MPServerUnavailableError):
-            self._mark_unregistered()
-            return False, None
-        except MPRemoteError as exc:
-            if str(exc).startswith(SERVICE_NOT_REGISTERED_PREFIX):
-                self._mark_unregistered()
-                return False, None
-            if str(exc).startswith(STALE_SESSION_PREFIX):
-                self._mark_superseded()
-                raise ServiceSessionExpiredError(str(exc)) from exc
-            raise
-
-        if len(responses) != 1:
-            raise MPProtocolError(
-                f"{KVCacheMethod.REQUEST_FINISHED.value} expects 1 response payload, got {len(responses)}"
-            )
-        return decode_request_finished_response(responses[0])
+        responses = self._scheduler_rpc(
+            KVCacheMethod.REQUEST_FINISHED,
+            lambda registration: encode_request_finished(registration, request_id, block_ids, all_groups),
+            timeout_ms,
+        )
+        return (
+            decode_request_finished_response(_single_response(responses, KVCacheMethod.REQUEST_FINISHED))
+            if responses is not None
+            else (False, None)
+        )
 
     def update_connector_output(
         self,
@@ -386,34 +318,52 @@ class KVCacheClient:
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> list[int]:
         """Report worker completion counts; return block ids to free locally."""
+        responses = self._scheduler_rpc(
+            KVCacheMethod.UPDATE_CONNECTOR_OUTPUT,
+            lambda registration: encode_update_connector_output(registration, completed_events),
+            timeout_ms,
+        )
+        return (
+            decode_update_connector_output_response(_single_response(responses, KVCacheMethod.UPDATE_CONNECTOR_OUTPUT))
+            if responses is not None
+            else []
+        )
+
+    def _scheduler_rpc(
+        self,
+        method: KVCacheMethod,
+        encode,
+        timeout_ms: int,
+    ) -> tuple[bytes, ...] | None:
+        """Send one scheduler-scoped RPC through the shared degradation ladder.
+
+        Returns the raw response payloads, or None when the service is
+        unreachable, unregistered, or busy; a stale session still raises
+        ServiceSessionExpiredError.
+        """
         self._raise_if_superseded()
         registration = self._get_scheduler_registration()
-        payloads = encode_update_connector_output(registration, completed_events)
+        payloads = encode(registration)
 
         if not self.is_registered and not self._try_register():
-            return []
+            return None
 
         try:
-            responses = self._rpc_client.request(KVCacheMethod.UPDATE_CONNECTOR_OUTPUT, payloads, timeout_ms=timeout_ms)
+            return self._rpc_client.request(method, payloads, timeout_ms=timeout_ms)
         except MPServerBusyError:
-            return []
+            return None
         except (MPRequestTimeoutError, MPServerUnavailableError):
             self._mark_unregistered()
-            return []
+            return None
         except MPRemoteError as exc:
-            if str(exc).startswith(SERVICE_NOT_REGISTERED_PREFIX):
+            message = str(exc)
+            if message.startswith(SERVICE_NOT_REGISTERED_PREFIX):
                 self._mark_unregistered()
-                return []
-            if str(exc).startswith(STALE_SESSION_PREFIX):
+                return None
+            if message.startswith(STALE_SESSION_PREFIX):
                 self._mark_superseded()
-                raise ServiceSessionExpiredError(str(exc)) from exc
+                raise ServiceSessionExpiredError(message) from exc
             raise
-
-        if len(responses) != 1:
-            raise MPProtocolError(
-                f"{KVCacheMethod.UPDATE_CONNECTOR_OUTPUT.value} expects 1 response payload, got {len(responses)}"
-            )
-        return decode_update_connector_output_response(responses[0])
 
     def _unregister(self) -> None:
         with self._registration_lock:
