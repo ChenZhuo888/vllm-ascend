@@ -1,9 +1,8 @@
 """Worker-side KV cache logic reused inside the KVCacheServer process."""
 
-import importlib
-import inspect
+import threading
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Protocol
 
 import torch
 from vllm.config import VllmConfig
@@ -12,12 +11,29 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from ....pool_worker import KVPoolWorker
 from ..memory import ImportedKVCache, import_worker_kv_caches
 from ..view import WorkerKVCacheSpec
+from .backend import create_mp_backend
+from .transfer import (
+    MPKVCacheStoreKeyLayerRecvingThread,
+    MPKVCacheStoreKeyLayerSendingThread,
+    MPKVCacheStoreLayerRecvingThread,
+    MPKVCacheStoreLayerSendingThread,
+    MPKVCacheStoreRecvingThread,
+    MPKVCacheStoreSendingThread,
+)
 
 
 class LookupStore(Protocol):
     """Metadata-only store interface the lookup paths rely on."""
 
     def exists(self, keys: list[str]) -> list[int]: ...
+
+    def register_buffer(self, ptrs: list[int], lengths: list[int]) -> None: ...
+
+    def unregister_buffer(self) -> None: ...
+
+    def set_device(self) -> None: ...
+
+    def close(self) -> None: ...
 
 
 class _MissingLookupStore:
@@ -26,23 +42,6 @@ class _MissingLookupStore:
     @staticmethod
     def exists(keys: list[str]) -> list[int]:
         return [0] * len(keys)
-
-
-class _DeviceBoundBackend:
-    """Keep backend device selection independent of torch.distributed."""
-
-    def __init__(self, backend: Any, device_index: int | None):
-        self._backend = backend
-        self._device_index = device_index
-
-    def set_device(self) -> None:
-        if self._device_index is not None:
-            torch.npu.set_device(self._device_index)
-            return
-        self._backend.set_device()
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._backend, name)
 
 
 WorkerBackendFactory = Callable[[object, int | None, bool], LookupStore]
@@ -69,7 +68,11 @@ class MPKVPoolWorker(KVPoolWorker):
         self._store_is_external = store is not None
         self._cache_importer = cache_importer
         self._backend_factory = backend_factory or self._create_backend
+        self._backend_device_index: int | None = None
         self._imported_kv_cache: ImportedKVCache | None = None
+        self._failed_imported_kv_cache: ImportedKVCache | None = None
+        self._runtime_failure: BaseException | None = None
+        self._runtime_active = False
         self.kv_cache_spec: WorkerKVCacheSpec | None = None
         self.m_store: LookupStore = store if store is not None else _MissingLookupStore()
         use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
@@ -105,6 +108,11 @@ class MPKVPoolWorker(KVPoolWorker):
 
     def configure_kv_caches(self, spec: WorkerKVCacheSpec) -> None:
         """Install a newer cache generation, tolerating stale RPC replay."""
+        if self._runtime_failure is not None:
+            raise RuntimeError("Worker KV cache runtime is unavailable; re-register the Worker service") from (
+                self._runtime_failure
+            )
+
         current_spec = self.kv_cache_spec
         if current_spec is not None:
             if spec.generation < current_spec.generation:
@@ -115,50 +123,267 @@ class MPKVPoolWorker(KVPoolWorker):
                 raise RuntimeError(f"KV cache generation {spec.generation} has conflicting specifications")
 
         imported = self._cache_importer(spec)
+        if self._imported_kv_cache is None:
+            self._configure_first_generation(spec, imported)
+            return
+        self._replace_generation(spec, imported)
+
+    def _configure_first_generation(self, spec: WorkerKVCacheSpec, imported: ImportedKVCache) -> None:
         try:
             self._activate_backend(imported.device_index)
-        except Exception:
+            self._register_runtime(imported)
+        except BaseException:
+            try:
+                self._deactivate_runtime()
+            except BaseException as cleanup_error:
+                self._failed_imported_kv_cache = imported
+                self._runtime_failure = cleanup_error
+                raise RuntimeError("Failed to clean up the first KV cache generation") from cleanup_error
+            try:
+                self._close_backend()
+            finally:
+                imported.close()
+            raise
+        self._publish_generation(spec, imported)
+
+    def _replace_generation(self, spec: WorkerKVCacheSpec, imported: ImportedKVCache) -> None:
+        previous = self._imported_kv_cache
+        previous_spec = self.kv_cache_spec
+        assert previous is not None and previous_spec is not None
+
+        if imported.device_index != self._backend_device_index and not self._store_is_external:
+            imported.close()
+            raise RuntimeError(
+                f"KV cache generation moved from NPU {self._backend_device_index} to {imported.device_index}"
+            )
+
+        try:
+            self._deactivate_runtime()
+        except BaseException:
             imported.close()
             raise
 
-        previous = self._imported_kv_cache
+        try:
+            self._register_runtime(imported)
+        except BaseException as registration_error:
+            try:
+                self._deactivate_runtime()
+            except BaseException as cleanup_error:
+                self._failed_imported_kv_cache = imported
+                self._runtime_failure = cleanup_error
+                raise RuntimeError(
+                    f"Failed to clean up KV cache generation {spec.generation} after activation failed"
+                ) from cleanup_error
+            try:
+                self._register_runtime(previous)
+            except BaseException as rollback_error:
+                imported.close()
+                self._runtime_failure = rollback_error
+                raise RuntimeError(
+                    f"Failed to activate KV cache generation {spec.generation} and restore "
+                    f"generation {previous_spec.generation}: {type(registration_error).__name__}: {registration_error}"
+                ) from rollback_error
+            imported.close()
+            raise
+
+        self._publish_generation(spec, imported)
+        previous.close()
+
+    def _register_runtime(self, imported: ImportedKVCache) -> None:
+        self.m_store.set_device()
+        self._runtime_active = True
+        super().register_kv_caches(imported.tensors)
+
+    def _publish_generation(self, spec: WorkerKVCacheSpec, imported: ImportedKVCache) -> None:
         self._imported_kv_cache = imported
         self.kv_cache_spec = spec
         self.kv_caches = imported.tensors
         if imported.device_index is not None:
             self.local_rank = imported.device_index
-        if previous is not None:
-            previous.close()
 
-    def _activate_backend(self, device_index: int | None) -> None:
-        if self._store_is_external or not isinstance(self.m_store, _MissingLookupStore):
-            return
-        backend = self._backend_factory(self._parallel_config, device_index, self.use_compress)
-        self.m_store = _DeviceBoundBackend(backend, device_index)
-
-    def _create_backend(self, parallel_config, device_index: int | None, lazy_init: bool) -> LookupStore:
-        from ..backend import backend_map
-
-        backend_config = backend_map.get(self.backend.lower())
-        if backend_config is None:
-            raise ValueError(f"Unsupported AscendStore backend {self.backend!r}")
-
-        backend_module = importlib.import_module(backend_config["path"])
-        backend_class = getattr(backend_module, backend_config["name"])
-        parameters = inspect.signature(backend_class).parameters
-        backend_kwargs = {}
-        if "lazy_init" in parameters:
-            backend_kwargs["lazy_init"] = lazy_init
-        if device_index is not None and "local_rank" in parameters:
-            backend_kwargs["local_rank"] = device_index
-        if device_index is not None:
-            torch.npu.set_device(device_index)
-        return backend_class(parallel_config, **backend_kwargs)
-
-    def close(self) -> None:
-        if self._imported_kv_cache is None:
-            return
-        self._imported_kv_cache.close()
+    def _clear_generation(self) -> None:
         self._imported_kv_cache = None
         self.kv_cache_spec = None
         self.kv_caches = {}
+
+    def _activate_backend(self, device_index: int | None) -> None:
+        if self._store_is_external:
+            return
+        if not isinstance(self.m_store, _MissingLookupStore):
+            if device_index != self._backend_device_index:
+                raise RuntimeError(
+                    f"Worker backend is bound to NPU {self._backend_device_index}, got cache on NPU {device_index}"
+                )
+            return
+        self.m_store = self._backend_factory(self._parallel_config, device_index, self.use_compress)
+        self._backend_device_index = device_index
+
+    def _create_backend(self, parallel_config, device_index: int | None, lazy_init: bool) -> LookupStore:
+        return create_mp_backend(self.backend, parallel_config, device_index, lazy_init)
+
+    def _start_kv_transfer_threads(self) -> None:
+        if self._transfer_threads_started:
+            return
+
+        if self.use_layerwise:
+            self.get_event = threading.Event()
+            self.layer_load_finished_events = [threading.Event() for _ in range(self.num_layers)]
+            self.layer_save_finished_events = [threading.Event() for _ in range(self.num_layers)]
+            self.sync_save_events = [torch.npu.Event() for _ in range(self.num_layers)]
+            can_save = self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put
+            if self.use_gva_layerwise and can_save:
+                ready_event_sending = threading.Event()
+                self.kv_send_thread = MPKVCacheStoreLayerSendingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    self.put_step,
+                    self.my_key_index,
+                    self.num_ranks_per_layer,
+                    self.page_size_bytes,
+                    ready_event_sending,
+                    self.num_layers,
+                    self.layer_save_finished_events,
+                    self.sync_save_events,
+                    self.layerwise_max_transfer_blocks,
+                    self.layerwise_max_transfer_bytes,
+                    group_builders=self._build_group_layer_builders(),
+                )
+                self._start_transfer_thread(self.kv_send_thread, ready_event_sending)
+            elif can_save:
+                ready_event_sending = threading.Event()
+                self.kv_send_thread = MPKVCacheStoreKeyLayerSendingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    self.put_step,
+                    ready_event_sending,
+                    self.num_layers,
+                    self.layer_save_finished_events,
+                    self.sync_save_events,
+                )
+                self._start_transfer_thread(self.kv_send_thread, ready_event_sending)
+
+            ready_event = threading.Event()
+            if self.use_gva_layerwise:
+                self.kv_recv_thread = MPKVCacheStoreLayerRecvingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    self.my_key_index,
+                    self.num_ranks_per_layer,
+                    self.page_size_bytes,
+                    ready_event,
+                    self.get_event,
+                    self.layer_load_finished_events,
+                    self.layer_save_finished_events,
+                    self.sync_save_events,
+                    self.num_layers,
+                    self.h2d_stagger_us,
+                    self.layerwise_max_transfer_blocks,
+                    self.layerwise_max_transfer_bytes,
+                    group_builders=self._build_group_layer_builders(),
+                )
+            else:
+                self.kv_recv_thread = MPKVCacheStoreKeyLayerRecvingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    ready_event,
+                    self.get_event,
+                    self.layer_load_finished_events,
+                    self.layer_save_finished_events,
+                    self.num_layers,
+                )
+            self._start_transfer_thread(self.kv_recv_thread, ready_event)
+        else:
+            if self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put:
+                ready_event_sending = threading.Event()
+                self.kv_send_thread = MPKVCacheStoreSendingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.grouped_block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    self.put_step,
+                    self.kv_role,
+                    ready_event_sending,
+                    self.group_uses_align_state,
+                    self.enable_kv_events,
+                )
+                self._start_transfer_thread(self.kv_send_thread, ready_event_sending)
+            if self.load_async:
+                ready_event = threading.Event()
+                self.kv_recv_thread = MPKVCacheStoreRecvingThread(
+                    self.m_store,
+                    self.token_database,
+                    self.grouped_block_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dcp_size,
+                    ready_event,
+                    invalid_block_ids=self._invalid_block_ids,
+                    invalid_block_ids_lock=self._invalid_block_ids_lock,
+                )
+                self._start_transfer_thread(self.kv_recv_thread, ready_event)
+        self._transfer_threads_started = True
+
+    @staticmethod
+    def _start_transfer_thread(thread, ready_event: threading.Event) -> None:
+        thread.start()
+        ready_event.wait()
+        thread.raise_if_failed()
+
+    def _stop_kv_transfer_threads(self) -> None:
+        threads = [thread for thread in (self.kv_send_thread, self.kv_recv_thread) if thread is not None]
+        for thread in threads:
+            thread.stop(wait=False)
+        for thread in threads:
+            thread.stop()
+        self.kv_send_thread = None
+        self.kv_recv_thread = None
+        self._transfer_threads_started = False
+
+    def close(self) -> None:
+        imported = self._imported_kv_cache
+        failed_imported = self._failed_imported_kv_cache
+        self._deactivate_runtime()
+        try:
+            self._close_backend()
+        finally:
+            if imported is not None:
+                imported.close()
+            if failed_imported is not None:
+                failed_imported.close()
+            self._failed_imported_kv_cache = None
+            self._runtime_failure = None
+            self._clear_generation()
+
+    def _deactivate_runtime(self) -> None:
+        if not self._runtime_active:
+            return
+        self._stop_kv_transfer_threads()
+        self.m_store.unregister_buffer()
+        self._runtime_active = False
+
+    def _close_backend(self) -> None:
+        if self._store_is_external or isinstance(self.m_store, _MissingLookupStore):
+            return
+        try:
+            self.m_store.close()
+        finally:
+            self.m_store = _MissingLookupStore()
+            self._backend_device_index = None

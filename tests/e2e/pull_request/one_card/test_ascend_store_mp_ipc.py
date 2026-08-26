@@ -42,6 +42,22 @@ class _ModelConfig:
 class _ObservedBackend:
     def __init__(self, device_index: int | None):
         self.device_index = device_index
+        self.registered_buffers: tuple[list[int], list[int]] | None = None
+
+    def set_device(self) -> None:
+        import torch
+
+        if self.device_index is not None:
+            torch.npu.set_device(self.device_index)
+
+    def register_buffer(self, ptrs: list[int], lengths: list[int]) -> None:
+        self.registered_buffers = (list(ptrs), list(lengths))
+
+    def unregister_buffer(self) -> None:
+        self.registered_buffers = None
+
+    def close(self) -> None:
+        self.unregister_buffer()
 
     @staticmethod
     def exists(keys: list[str]) -> list[int]:
@@ -72,8 +88,8 @@ class _ObservedWorker:
     def configure_kv_caches(self, spec: "WorkerKVCacheSpec") -> None:
         previous_caches = getattr(self._worker, "kv_caches", None)
         self._worker.configure_kv_caches(spec)
-        base = self._worker.kv_caches["base"][0]
-        view = self._worker.kv_caches["view"][0]
+        base = self._worker.kv_caches["model.layers.0.attn"][0]
+        view = self._worker.kv_caches["model.layers.1.attn"][0]
         self._connection.send(
             (
                 "configured",
@@ -423,9 +439,9 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
         generation_results = []
         for generation in (1, 2):
             base = torch.full((4, 4), generation, dtype=torch.float16, device="npu")
-            view = base[1:, ::2]
+            view = base[:, ::2]
             torch.npu.synchronize()
-            connector.register_kv_caches({"base": base, "view": view})
+            connector.register_kv_caches({"model.layers.0.attn": base, "model.layers.1.attn": view})
             exports.append(_wait_for_active_export(connector, generation))
             generation_results.append(_receive(observation_connection, f"cache generation {generation}"))
 
@@ -450,7 +466,7 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
             "generation": 1,
             "device_type": "npu",
             "base_values": [[1.0] * 4 for _ in range(4)],
-            "view_values": [[1.0] * 2 for _ in range(3)],
+            "view_values": [[1.0] * 2 for _ in range(4)],
             "shared_storage": True,
             "previous_released": None,
             "backend_device_index": 0,
@@ -461,7 +477,7 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
             "generation": 2,
             "device_type": "npu",
             "base_values": [[2.0] * 4 for _ in range(4)],
-            "view_values": [[2.0] * 2 for _ in range(3)],
+            "view_values": [[2.0] * 2 for _ in range(4)],
             "shared_storage": True,
             "previous_released": True,
             "backend_device_index": 0,
