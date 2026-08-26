@@ -103,6 +103,7 @@ def _build_llm(model_path: str, server_url: str, monkeypatch):
     # cannot re-initialize NPU once this process has touched it. Run the
     # engine in-process instead.
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    gpu_memory_utilization = float(os.getenv("ASCEND_STORE_MP_SMOKE_GPU_MEM", "0.5"))
 
     kv_transfer_config = KVTransferConfig(
         kv_connector="AscendStoreMPConnector",
@@ -116,7 +117,7 @@ def _build_llm(model_path: str, server_url: str, monkeypatch):
         model=model_path,
         kv_transfer_config=kv_transfer_config,
         max_model_len=1024,
-        gpu_memory_utilization=0.5,
+        gpu_memory_utilization=gpu_memory_utilization,
         enforce_eager=True,
     )
 
