@@ -45,7 +45,13 @@ _PROMPT = (
 
 def _model_path() -> str | None:
     path = os.getenv(_MODEL_ENV)
-    return path if path else None
+    if path is None:
+        return None
+    if not os.path.isdir(path):
+        # Fail loudly instead of letting transformers misreport the path as an
+        # invalid hub repo id: a configured path must be a visible directory.
+        pytest.fail(f"{_MODEL_ENV}={path!r} is not a directory visible to this process")
+    return path
 
 
 def _run_smoke_server(endpoint_connection: Connection, control_connection: Connection, log_path: str) -> None:
