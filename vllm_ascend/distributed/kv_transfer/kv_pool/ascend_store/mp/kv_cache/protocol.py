@@ -82,7 +82,7 @@ def encode_registration(registration: _Registration) -> bytes:
     try:
         return cloudpickle.dumps(registration)
     except Exception as exc:
-        raise MPProtocolError(f"Failed to encode {type(registration).__name__}") from exc
+        raise MPProtocolError(f"Failed to encode {type(registration).__name__}: {exc}") from exc
 
 
 def decode_registration(payloads: Sequence[bytes], expected_type: type[RegistrationT]) -> RegistrationT:
@@ -90,7 +90,9 @@ def decode_registration(payloads: Sequence[bytes], expected_type: type[Registrat
     try:
         registration = cloudpickle.loads(payload)
     except Exception as exc:
-        raise MPProtocolError(f"Failed to decode {expected_type.__name__}") from exc
+        # The wire error must carry the pickle root cause, otherwise a real
+        # VllmConfig failing to unpickle is undiagnosable from the client.
+        raise MPProtocolError(f"Failed to decode {expected_type.__name__}: {exc}") from exc
 
     if not isinstance(registration, expected_type):
         raise MPProtocolError(f"Expected {expected_type.__name__}, got {type(registration).__name__}")
