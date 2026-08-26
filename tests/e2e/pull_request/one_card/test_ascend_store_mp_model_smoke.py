@@ -88,9 +88,14 @@ def _run_smoke_server(endpoint_connection: Connection, control_connection: Conne
         control_connection.close()
 
 
-def _build_llm(model_path: str, server_url: str):
+def _build_llm(model_path: str, server_url: str, monkeypatch):
     from vllm import LLM
     from vllm.config import KVTransferConfig
+
+    # vLLM forks an EngineCore subprocess by default, and a forked child
+    # cannot re-initialize NPU once this process has touched it. Run the
+    # engine in-process instead.
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     kv_transfer_config = KVTransferConfig(
         kv_connector="AscendStoreMPConnector",
@@ -176,7 +181,7 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch) -> None:
                 raise RuntimeError(f"KV cache server failed to start:\n{server_result}")
 
             torch.npu.set_device(0)
-            llm = _build_llm(model_path, server_result)
+            llm = _build_llm(model_path, server_result, monkeypatch)
             first_output = _generate_once(llm)
             assert first_output.strip(), "First generation produced empty output"
 
@@ -207,7 +212,7 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch) -> None:
     assert server_exitcode == 0
 
 
-def test_real_model_degrades_when_server_unavailable() -> None:
+def test_real_model_degrades_when_server_unavailable(monkeypatch) -> None:
     import torch
     import torch_npu  # noqa: F401
 
@@ -220,7 +225,7 @@ def test_real_model_degrades_when_server_unavailable() -> None:
     # Port 1 never accepts: registration and lookup must degrade to misses
     # instead of failing engine startup or generation.
     torch.npu.set_device(0)
-    llm = _build_llm(model_path, "tcp://127.0.0.1:1")
+    llm = _build_llm(model_path, "tcp://127.0.0.1:1", monkeypatch)
     output = _generate_once(llm)
 
     assert output.strip(), "Generation produced empty output while degraded"
