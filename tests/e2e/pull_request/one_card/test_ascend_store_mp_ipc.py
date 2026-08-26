@@ -44,6 +44,7 @@ class _ObservedBackend:
         self.device_index = device_index
         self.registered_buffers: tuple[list[int], list[int]] | None = None
         self.load_callback = None
+        self.stored_keys: list[str] = []
 
     def set_device(self) -> None:
         import torch
@@ -68,6 +69,9 @@ class _ObservedBackend:
         if self.load_callback is not None:
             self.load_callback()
         return [0] * len(keys)
+
+    def put(self, keys: list[str], _addrs: list[list[int]], _sizes: list[list[int]]) -> None:
+        self.stored_keys.extend(keys)
 
 
 class _ObservedWorker:
@@ -128,6 +132,25 @@ class _ObservedWorker:
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         return self._worker.get_block_ids_with_load_errors()
+
+    def wait_for_save(self, metadata, event_spec) -> None:
+        self._worker.wait_for_save(metadata, event_spec)
+        base = self._worker.kv_caches["model.layers.0.attn"][0]
+        view = self._worker.kv_caches["model.layers.1.attn"][0]
+        assert self._backend is not None
+        self._connection.send(
+            (
+                "stored",
+                {
+                    "base_values": base.cpu().tolist(),
+                    "view_values": view.cpu().tolist(),
+                    "stored_key_count": len(self._backend.stored_keys),
+                },
+            )
+        )
+
+    def get_finished(self, finished_req_ids, metadata):
+        return self._worker.get_finished(finished_req_ids, metadata)
 
     def close(self) -> None:
         generation = self._worker.kv_cache_spec.generation if self._worker.kv_cache_spec is not None else None
@@ -506,6 +529,34 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
         assert torch.equal(base.cpu(), torch.full((4, 4), 9, dtype=torch.float16))
         assert torch.equal(view.cpu(), torch.full((4, 2), 9, dtype=torch.float16))
         assert connector.get_block_ids_with_load_errors() == set()
+        connector.clear_connector_metadata()
+
+        store_metadata = AscendConnectorMetadata(
+            set(),
+            set(),
+            delayed_free_req_ids={"store-request"},
+        )
+        store_metadata.add_request(
+            ReqMeta(
+                "store-request",
+                token_len_chunk=16,
+                block_ids=[1],
+                block_hashes=["store-hash"],
+                can_save=True,
+            )
+        )
+        connector.bind_connector_metadata(store_metadata)
+        base.fill_(11)
+        connector.wait_for_save()
+
+        store_status, store_result = _receive(observation_connection, "KV cache store")
+        assert store_status == "stored"
+        assert store_result == {
+            "base_values": [[11.0] * 4 for _ in range(4)],
+            "view_values": [[11.0] * 2 for _ in range(4)],
+            "stored_key_count": 1,
+        }
+        assert connector.get_finished({"store-request"}) == ({"store-request"}, set())
         connector.clear_connector_metadata()
 
         connector.shutdown()

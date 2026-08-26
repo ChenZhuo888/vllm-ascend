@@ -80,6 +80,7 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         self._pending_kv_cache_exports: dict[int, ExportedKVCache] = {}
         self._pending_load_block_ids: set[int] = set()
         self._local_load_error_block_ids: set[int] = set()
+        self._locally_finished_store_req_ids: set[str] = set()
         self._kv_cache_client = KVCacheClient(_get_kv_cache_server_url(vllm_config))
         # Scheduler-process-local state: the live Request references feeding
         # the all_token_ids increments, the real BlockPool the server's
@@ -297,9 +298,12 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
 
         exported_event = record_npu_event()
         try:
-            self._kv_cache_client.wait_for_save(metadata, exported_event.spec)
+            accepted = self._kv_cache_client.wait_for_save(metadata, exported_event.spec)
         finally:
             exported_event.close()
+        if not accepted:
+            save_req_ids = {request.req_id for request in metadata.requests if request.can_save}
+            self._locally_finished_store_req_ids.update(save_req_ids & metadata.delayed_free_req_ids)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         self._require_worker_role("get_finished")
@@ -308,7 +312,10 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
             return set(), set()
         if not isinstance(metadata, AscendConnectorMetadata):
             raise TypeError(f"Expected AscendConnectorMetadata, got {type(metadata).__name__}")
-        return self._kv_cache_client.get_finished(finished_req_ids, metadata)
+        done_sending, done_recving = self._kv_cache_client.get_finished(finished_req_ids, metadata)
+        locally_finished = self._locally_finished_store_req_ids & metadata.delayed_free_req_ids
+        self._locally_finished_store_req_ids -= locally_finished
+        return done_sending | locally_finished, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         self._require_worker_role("get_block_ids_with_load_errors")

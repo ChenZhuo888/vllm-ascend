@@ -167,6 +167,33 @@ def test_worker_wait_for_save_releases_source_event_when_rpc_fails() -> None:
     exported_event.close.assert_called_once_with()
 
 
+def test_worker_rejected_store_releases_delayed_request() -> None:
+    config = _make_vllm_config()
+    metadata = AscendConnectorMetadata(
+        set(),
+        set(),
+        delayed_free_req_ids={"request-0"},
+    )
+    metadata.add_request(ReqMeta("request-0", can_save=True))
+    exported_event = MagicMock()
+
+    with (
+        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
+        patch(f"{CONNECTOR_MODULE}.record_npu_event", return_value=exported_event),
+    ):
+        client_class.return_value.wait_for_save.return_value = False
+        client_class.return_value.get_finished.return_value = (set(), set())
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.bind_connector_metadata(metadata)
+
+        connector.wait_for_save()
+
+        assert connector.get_finished({"request-0"}) == ({"request-0"}, set())
+        assert connector.get_finished({"request-0"}) == (set(), set())
+
+    exported_event.close.assert_called_once_with()
+
+
 def test_worker_get_finished_delegates_with_bound_metadata() -> None:
     config = _make_vllm_config()
     metadata = AscendConnectorMetadata(set(), set())

@@ -24,12 +24,14 @@ from .transfer import (
 )
 
 
-class LookupStore(Protocol):
-    """Metadata-only store interface the lookup paths rely on."""
+class WorkerBackend(Protocol):
+    """Backend operations reused by the Worker service."""
 
     def exists(self, keys: list[str]) -> list[int]: ...
 
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> list[int] | None: ...
+
+    def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> None: ...
 
     def register_buffer(self, ptrs: list[int], lengths: list[int]) -> None: ...
 
@@ -40,15 +42,15 @@ class LookupStore(Protocol):
     def close(self) -> None: ...
 
 
-class _MissingLookupStore:
-    """Stand-in until this Worker can initialize its own backend."""
+class _MissingWorkerBackend:
+    """Lookup-only stand-in used before the Worker runtime is active."""
 
     @staticmethod
     def exists(keys: list[str]) -> list[int]:
         return [0] * len(keys)
 
 
-WorkerBackendFactory = Callable[[object, int | None, bool], LookupStore]
+WorkerBackendFactory = Callable[[object, int | None, bool], WorkerBackend]
 
 
 class MPKVPoolWorker(KVPoolWorker):
@@ -62,7 +64,7 @@ class MPKVPoolWorker(KVPoolWorker):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        store: LookupStore | None = None,
+        store: WorkerBackend | None = None,
         kv_cache_config: KVCacheConfig | None = None,
         rank: int | None = None,
         cache_importer: Callable[[WorkerKVCacheSpec], ImportedKVCache] = import_worker_kv_caches,
@@ -78,7 +80,7 @@ class MPKVPoolWorker(KVPoolWorker):
         self._runtime_failure: BaseException | None = None
         self._runtime_active = False
         self.kv_cache_spec: WorkerKVCacheSpec | None = None
-        self.m_store: LookupStore = store if store is not None else _MissingLookupStore()
+        self.m_store: WorkerBackend = store if store is not None else _MissingWorkerBackend()
         use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
         super().__init__(vllm_config, use_layerwise, kv_cache_config=kv_cache_config)
 
@@ -213,7 +215,7 @@ class MPKVPoolWorker(KVPoolWorker):
     def _activate_backend(self, device_index: int | None) -> None:
         if self._store_is_external:
             return
-        if not isinstance(self.m_store, _MissingLookupStore):
+        if not isinstance(self.m_store, _MissingWorkerBackend):
             if device_index != self._backend_device_index:
                 raise RuntimeError(
                     f"Worker backend is bound to NPU {self._backend_device_index}, got cache on NPU {device_index}"
@@ -222,7 +224,7 @@ class MPKVPoolWorker(KVPoolWorker):
         self.m_store = self._backend_factory(self._parallel_config, device_index, self.use_compress)
         self._backend_device_index = device_index
 
-    def _create_backend(self, parallel_config, device_index: int | None, lazy_init: bool) -> LookupStore:
+    def _create_backend(self, parallel_config, device_index: int | None, lazy_init: bool) -> WorkerBackend:
         return create_mp_backend(self.backend, parallel_config, device_index, lazy_init)
 
     def _start_kv_transfer_threads(self) -> None:
@@ -407,10 +409,10 @@ class MPKVPoolWorker(KVPoolWorker):
         self._runtime_active = False
 
     def _close_backend(self) -> None:
-        if self._store_is_external or isinstance(self.m_store, _MissingLookupStore):
+        if self._store_is_external or isinstance(self.m_store, _MissingWorkerBackend):
             return
         try:
             self.m_store.close()
         finally:
-            self.m_store = _MissingLookupStore()
+            self.m_store = _MissingWorkerBackend()
             self._backend_device_index = None
