@@ -58,6 +58,8 @@ class KVCacheMethod(str, enum.Enum):
     GET_FINISHED = "GET_FINISHED"
     BUILD_CONNECTOR_WORKER_META = "BUILD_CONNECTOR_WORKER_META"
     GET_KV_EVENTS = "GET_KV_EVENTS"
+    START_LOAD_KV = "START_LOAD_KV"
+    GET_BLOCK_IDS_WITH_LOAD_ERRORS = "GET_BLOCK_IDS_WITH_LOAD_ERRORS"
 
 
 @dataclass
@@ -300,6 +302,48 @@ def decode_get_kv_events_response(responses: Sequence[bytes]) -> list[BlockStore
     for event in events:
         _require_type(event, BlockStored, "event")
     return events
+
+
+def encode_start_load_kv_request(
+    registration: WorkerRegistration,
+    metadata: AscendConnectorMetadata,
+) -> tuple[bytes, ...]:
+    if not isinstance(metadata, AscendConnectorMetadata):
+        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
+    return _encode_worker_request(registration, {"metadata": metadata}, KVCacheMethod.START_LOAD_KV)
+
+
+def decode_start_load_kv_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str, AscendConnectorMetadata]:
+    method = KVCacheMethod.START_LOAD_KV
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    (metadata,) = _body_fields(body, method.value, "metadata")
+    _require_type(metadata, AscendConnectorMetadata, "metadata")
+    return identity, session_id, metadata
+
+
+def encode_get_block_ids_with_load_errors_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
+    return _encode_empty_worker_request(registration, KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS)
+
+
+def decode_get_block_ids_with_load_errors_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str]:
+    return _decode_empty_worker_request(payloads, KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS)
+
+
+def encode_get_block_ids_with_load_errors_response(block_ids: set[int]) -> tuple[bytes, ...]:
+    return _encode_response(
+        KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS,
+        {"block_ids": _validate_non_negative_int_set(block_ids, "block_ids")},
+    )
+
+
+def decode_get_block_ids_with_load_errors_response(responses: Sequence[bytes]) -> set[int]:
+    body = _decode_response(responses, KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS)
+    (block_ids,) = _body_fields(body, "GET_BLOCK_IDS_WITH_LOAD_ERRORS response", "block_ids")
+    return _decode_non_negative_int_set(block_ids, "block_ids")
 
 
 def scheduler_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
@@ -780,6 +824,18 @@ def _decode_text_set(value, field_name: str) -> set[str]:
     if not isinstance(value, set):
         raise MPProtocolError(f"{field_name} must be a set, got {type(value).__name__}")
     return {_decode_text_value(item, f"{field_name} item") for item in value}
+
+
+def _validate_non_negative_int_set(value: set[int], field_name: str) -> set[int]:
+    if not isinstance(value, set):
+        raise TypeError(f"{field_name} must be a set, got {type(value).__name__}")
+    return {_validate_non_negative_int(item, f"{field_name} item") for item in value}
+
+
+def _decode_non_negative_int_set(value, field_name: str) -> set[int]:
+    if not isinstance(value, set):
+        raise MPProtocolError(f"{field_name} must be a set, got {type(value).__name__}")
+    return {_decode_non_negative_int_value(item, f"{field_name} item") for item in value}
 
 
 def _validate_bool(value: bool, field_name: str) -> bool:

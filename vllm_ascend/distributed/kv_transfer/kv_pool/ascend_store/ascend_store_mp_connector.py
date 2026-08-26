@@ -78,6 +78,8 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         self._next_kv_cache_generation = 1
         self._active_kv_cache_export: ExportedKVCache | None = None
         self._pending_kv_cache_exports: dict[int, ExportedKVCache] = {}
+        self._pending_load_block_ids: set[int] = set()
+        self._local_load_error_block_ids: set[int] = set()
         self._kv_cache_client = KVCacheClient(_get_kv_cache_server_url(vllm_config))
         # Scheduler-process-local state: the live Request references feeding
         # the all_token_ids increments, the real BlockPool the server's
@@ -251,7 +253,20 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
             cache_export.close()
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
-        return None
+        self._require_worker_role("start_load_kv")
+        if self.use_layerwise:
+            raise NotImplementedError("AscendStoreMPConnector does not support layerwise Retrieve yet")
+
+        metadata = self._get_connector_metadata()
+        if isinstance(metadata, AscendStoreMPConnectorMetadata):
+            return
+        if not isinstance(metadata, AscendConnectorMetadata):
+            raise TypeError(f"Expected AscendConnectorMetadata, got {type(metadata).__name__}")
+
+        load_block_ids = self._collect_load_block_ids(metadata)
+        self._pending_load_block_ids.update(load_block_ids)
+        if not self._kv_cache_client.start_load_kv(metadata):
+            self._local_load_error_block_ids.update(load_block_ids)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return None
@@ -295,6 +310,18 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
             raise TypeError(f"Expected AscendConnectorMetadata, got {type(metadata).__name__}")
         return self._kv_cache_client.get_finished(finished_req_ids, metadata)
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        self._require_worker_role("get_block_ids_with_load_errors")
+        server_errors = self._kv_cache_client.get_block_ids_with_load_errors()
+        load_errors = self._local_load_error_block_ids
+        if server_errors is None:
+            load_errors.update(self._pending_load_block_ids)
+        else:
+            load_errors.update(server_errors)
+        self._pending_load_block_ids = set()
+        self._local_load_error_block_ids = set()
+        return load_errors
+
     def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
         self._require_worker_role("build_connector_worker_meta")
         return self._kv_cache_client.build_connector_worker_meta()
@@ -308,6 +335,16 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         kv_cache_events = AscendStoreKVEvents(num_workers=1)
         kv_cache_events.add_events(events)
         return kv_cache_events
+
+    @staticmethod
+    def _collect_load_block_ids(metadata: AscendConnectorMetadata) -> set[int]:
+        block_ids: set[int] = set()
+        for request in metadata.requests:
+            if request.load_spec is None or not request.load_spec.can_load:
+                continue
+            if len(request.block_ids_by_group) == 1:
+                block_ids.update(block_id for block_id in request.block_ids_by_group[0] if block_id > 0)
+        return block_ids
 
     def shutdown(self) -> None:
         try:

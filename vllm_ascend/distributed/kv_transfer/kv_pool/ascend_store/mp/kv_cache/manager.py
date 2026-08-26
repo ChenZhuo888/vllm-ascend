@@ -197,6 +197,23 @@ class KVCacheServiceManager:
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
         return worker.get_kv_events()
 
+    def start_load_kv(
+        self,
+        identity: WorkerIdentity,
+        session_id: str,
+        metadata: AscendConnectorMetadata,
+    ) -> None:
+        worker = self._workers.get_for_session(identity, session_id)
+        if worker is None:
+            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        worker.start_load_kv(metadata)
+
+    def get_block_ids_with_load_errors(self, identity: WorkerIdentity, session_id: str) -> set[int]:
+        worker = self._workers.get_for_session(identity, session_id)
+        if worker is None:
+            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        return worker.get_block_ids_with_load_errors()
+
     def lookup(
         self,
         identity: SchedulerIdentity,

@@ -43,6 +43,7 @@ class _ObservedBackend:
     def __init__(self, device_index: int | None):
         self.device_index = device_index
         self.registered_buffers: tuple[list[int], list[int]] | None = None
+        self.load_callback = None
 
     def set_device(self) -> None:
         import torch
@@ -61,6 +62,11 @@ class _ObservedBackend:
 
     @staticmethod
     def exists(keys: list[str]) -> list[int]:
+        return [0] * len(keys)
+
+    def get(self, keys: list[str], _addrs: list[list[int]], _sizes: list[list[int]]) -> list[int]:
+        if self.load_callback is not None:
+            self.load_callback()
         return [0] * len(keys)
 
 
@@ -90,6 +96,17 @@ class _ObservedWorker:
         self._worker.configure_kv_caches(spec)
         base = self._worker.kv_caches["model.layers.0.attn"][0]
         view = self._worker.kv_caches["model.layers.1.attn"][0]
+        assert self._backend is not None
+
+        def load_values() -> None:
+            import torch
+
+            for tensors in self._worker.kv_caches.values():
+                for tensor in tensors:
+                    tensor.fill_(9)
+            torch.npu.synchronize()
+
+        self._backend.load_callback = load_values
         self._connection.send(
             (
                 "configured",
@@ -105,6 +122,12 @@ class _ObservedWorker:
                 },
             )
         )
+
+    def start_load_kv(self, metadata) -> None:
+        self._worker.start_load_kv(metadata)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        return self._worker.get_block_ids_with_load_errors()
 
     def close(self) -> None:
         generation = self._worker.kv_cache_spec.generation if self._worker.kv_cache_spec is not None else None
@@ -411,6 +434,11 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_mp_connector import (
         AscendStoreMPConnector,
     )
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+        AscendConnectorMetadata,
+        LoadSpec,
+        ReqMeta,
+    )
 
     context = multiprocessing.get_context("spawn")
     endpoint_connection, endpoint_child_connection = context.Pipe()
@@ -460,6 +488,25 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
             assert connector._pending_kv_cache_exports == {}
             assert connector._active_kv_cache_export is exports[1]
         assert exports[0]._storages == ()
+
+        metadata = AscendConnectorMetadata(set(), set())
+        metadata.add_request(
+            ReqMeta(
+                "request-0",
+                token_len_chunk=16,
+                block_ids=[1],
+                block_hashes=["hash-0"],
+                load_spec=LoadSpec(0, 16, True),
+            )
+        )
+        connector.bind_connector_metadata(metadata)
+        connector.start_load_kv(None)
+        torch.npu.synchronize()
+
+        assert torch.equal(base.cpu(), torch.full((4, 4), 9, dtype=torch.float16))
+        assert torch.equal(view.cpu(), torch.full((4, 2), 9, dtype=torch.float16))
+        assert connector.get_block_ids_with_load_errors() == set()
+        connector.clear_connector_metadata()
 
         connector.shutdown()
         with connector._kv_cache_export_lock:

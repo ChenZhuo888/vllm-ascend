@@ -23,6 +23,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     encode_build_connector_worker_meta_response,
+    encode_get_block_ids_with_load_errors_response,
     encode_get_finished_response,
     encode_get_kv_events_response,
 )
@@ -195,6 +196,45 @@ def test_worker_get_kv_events_degrades_to_empty_list_when_busy() -> None:
         client = _configure_mock_worker_client(client_class, MPServerBusyError("busy"))
 
         assert client.get_kv_events() == []
+
+
+def test_worker_start_load_has_no_default_deadline() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, [[b"OK"]])
+        metadata = AscendConnectorMetadata(set(), set())
+
+        assert client.start_load_kv(metadata)
+
+        request = client_class.return_value.request
+        assert request.call_args.args[0].value == "START_LOAD_KV"
+        assert request.call_args.kwargs["timeout_ms"] is None
+
+
+def test_worker_start_load_degrades_when_server_is_busy() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, MPServerBusyError("busy"))
+
+        assert not client.start_load_kv(AscendConnectorMetadata(set(), set()))
+
+
+def test_worker_load_errors_use_worker_rpc() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(
+            client_class,
+            [list(encode_get_block_ids_with_load_errors_response({7, 9}))],
+        )
+
+        assert client.get_block_ids_with_load_errors() == {7, 9}
+
+        request = client_class.return_value.request
+        assert request.call_args.args[0].value == "GET_BLOCK_IDS_WITH_LOAD_ERRORS"
+
+
+def test_worker_load_errors_return_none_when_server_is_busy() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, MPServerBusyError("busy"))
+
+        assert client.get_block_ids_with_load_errors() is None
 
 
 def test_update_state_after_alloc_degrades_silently_on_timeout() -> None:

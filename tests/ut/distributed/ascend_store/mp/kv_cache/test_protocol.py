@@ -6,6 +6,7 @@ from vllm.distributed.kv_events import BlockStored
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
     AscendStoreKVConnectorWorkerMetadata,
+    LoadSpec,
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
@@ -16,6 +17,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     decode_build_connector_meta_response,
     decode_build_connector_worker_meta_request,
     decode_build_connector_worker_meta_response,
+    decode_get_block_ids_with_load_errors_request,
+    decode_get_block_ids_with_load_errors_response,
     decode_get_finished_request,
     decode_get_finished_response,
     decode_get_kv_events_request,
@@ -28,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     decode_request_finished,
     decode_request_finished_response,
     decode_scheduler_session,
+    decode_start_load_kv_request,
     decode_update_connector_output,
     decode_update_connector_output_response,
     decode_update_state_after_alloc,
@@ -37,6 +41,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     encode_build_connector_meta_response,
     encode_build_connector_worker_meta_request,
     encode_build_connector_worker_meta_response,
+    encode_get_block_ids_with_load_errors_request,
+    encode_get_block_ids_with_load_errors_response,
     encode_get_finished_request,
     encode_get_finished_response,
     encode_get_kv_events_request,
@@ -49,6 +55,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     encode_request_finished,
     encode_request_finished_response,
     encode_scheduler_session,
+    encode_start_load_kv_request,
     encode_update_connector_output,
     encode_update_connector_output_response,
     encode_update_state_after_alloc,
@@ -273,6 +280,42 @@ def test_get_kv_events_round_trip() -> None:
     )
     assert decode_get_kv_events_response(encode_get_kv_events_response([event])) == [event]
     assert decode_get_kv_events_response(encode_get_kv_events_response([])) == []
+
+
+def test_start_load_kv_and_load_errors_round_trip() -> None:
+    registration = WorkerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        session_id="worker-session",
+    )
+    metadata = AscendConnectorMetadata(set(), set())
+    metadata.add_request(
+        ReqMeta(
+            "request-0",
+            token_len_chunk=16,
+            block_ids=[7],
+            block_hashes=[b"hash-0"],
+            load_spec=LoadSpec(0, 16, True),
+        )
+    )
+
+    payloads = encode_start_load_kv_request(registration, metadata)
+    identity, session_id, decoded_metadata = decode_start_load_kv_request(payloads)
+
+    assert worker_affinity_key(b"client", payloads) == registration.identity
+    assert (identity, session_id) == (registration.identity, registration.session_id)
+    assert decoded_metadata.requests[0].req_id == "request-0"
+    assert decoded_metadata.requests[0].block_ids == [7]
+
+    error_payloads = encode_get_block_ids_with_load_errors_request(registration)
+    assert decode_get_block_ids_with_load_errors_request(error_payloads) == (
+        registration.identity,
+        registration.session_id,
+    )
+    assert decode_get_block_ids_with_load_errors_response(encode_get_block_ids_with_load_errors_response({7, 9})) == {
+        7,
+        9,
+    }
 
 
 def test_lookup_request_preserves_required_fields_and_response_round_trip() -> None:

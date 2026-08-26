@@ -14,6 +14,8 @@ from vllm.distributed.kv_events import BlockStored
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
     AscendStoreKVConnectorWorkerMetadata,
+    LoadSpec,
+    ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheMethod, KVCacheServer
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
@@ -45,6 +47,7 @@ _BLOCK_HASHES = [bytes.fromhex("01" * 32), bytes.fromhex("02" * 32)]
 class _FakeWorker:
     def __init__(self, matched_tokens: int):
         self._matched_tokens = matched_tokens
+        self._invalid_block_ids: set[int] = set()
         self.kv_cache_spec = None
 
     def configure_kv_caches(self, spec: WorkerKVCacheSpec) -> None:
@@ -88,6 +91,16 @@ class _FakeWorker:
                 lora_name=None,
             )
         ]
+
+    def start_load_kv(self, metadata: AscendConnectorMetadata) -> None:
+        for request in metadata.requests:
+            if request.load_spec is not None and request.load_spec.can_load:
+                self._invalid_block_ids.update(request.block_ids)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        block_ids = self._invalid_block_ids
+        self._invalid_block_ids = set()
+        return block_ids
 
 
 class _FakeScheduler:
@@ -549,6 +562,32 @@ def test_worker_get_kv_events_round_trip() -> None:
         assert len(events) == 1
         assert isinstance(events[0], BlockStored)
         assert events[0].block_hashes == [b"hash-0"]
+    finally:
+        client.close()
+        _stop_server(process)
+
+
+def test_worker_start_load_and_load_errors_round_trip() -> None:
+    process, endpoint = _start_server()
+    client = KVCacheClient(endpoint)
+
+    try:
+        _wait_until_connected(client)
+        assert client.register_worker(_make_vllm_config(), kv_cache_config=None)
+        metadata = AscendConnectorMetadata(set(), set())
+        metadata.add_request(
+            ReqMeta(
+                "request-0",
+                token_len_chunk=16,
+                block_ids=[7],
+                block_hashes=[b"hash-0"],
+                load_spec=LoadSpec(0, 16, True),
+            )
+        )
+
+        assert client.start_load_kv(metadata)
+        assert client.get_block_ids_with_load_errors() == {7}
+        assert client.get_block_ids_with_load_errors() == set()
     finally:
         client.close()
         _stop_server(process)

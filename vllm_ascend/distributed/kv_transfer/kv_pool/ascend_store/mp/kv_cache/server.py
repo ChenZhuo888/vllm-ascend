@@ -21,6 +21,7 @@ from .protocol import (
     KVCacheMethod,
     decode_build_connector_meta_request,
     decode_build_connector_worker_meta_request,
+    decode_get_block_ids_with_load_errors_request,
     decode_get_finished_request,
     decode_get_kv_events_request,
     decode_lookup_request,
@@ -28,12 +29,14 @@ from .protocol import (
     decode_registration_request,
     decode_request_finished,
     decode_scheduler_session,
+    decode_start_load_kv_request,
     decode_update_connector_output,
     decode_update_state_after_alloc,
     decode_wait_for_save_request,
     decode_worker_session,
     encode_build_connector_meta_response,
     encode_build_connector_worker_meta_response,
+    encode_get_block_ids_with_load_errors_response,
     encode_get_finished_response,
     encode_get_kv_events_response,
     encode_lookup_response,
@@ -101,6 +104,11 @@ class KVCacheServer:
                     self._handle_build_connector_worker_meta,
                 ),
                 worker_route(KVCacheMethod.GET_KV_EVENTS, self._handle_get_kv_events),
+                worker_route(KVCacheMethod.START_LOAD_KV, self._handle_start_load_kv),
+                worker_route(
+                    KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS,
+                    self._handle_get_block_ids_with_load_errors,
+                ),
             ),
         )
 
@@ -166,6 +174,16 @@ class KVCacheServer:
     def _handle_get_kv_events(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id = decode_get_kv_events_request(payloads)
         return encode_get_kv_events_response(self._service.get_kv_events(identity, session_id))
+
+    def _handle_start_load_kv(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, metadata = decode_start_load_kv_request(payloads)
+        self._service.start_load_kv(identity, session_id, metadata)
+        return (ACK_RESPONSE,)
+
+    def _handle_get_block_ids_with_load_errors(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id = decode_get_block_ids_with_load_errors_request(payloads)
+        block_ids = self._service.get_block_ids_with_load_errors(identity, session_id)
+        return encode_get_block_ids_with_load_errors_response(block_ids)
 
     def _handle_unregister_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id = decode_scheduler_session(payloads)

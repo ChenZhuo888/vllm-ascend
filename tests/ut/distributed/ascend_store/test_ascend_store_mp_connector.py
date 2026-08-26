@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
     AscendStoreKVConnectorWorkerMetadata,
+    LoadSpec,
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_mp_connector import (
@@ -240,6 +241,82 @@ def test_worker_kv_events_return_none_when_no_events_are_available() -> None:
         connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
 
         assert connector.get_kv_connector_kv_cache_events() is None
+
+
+def _make_load_metadata() -> AscendConnectorMetadata:
+    metadata = AscendConnectorMetadata(set(), set())
+    metadata.add_request(
+        ReqMeta(
+            "request-0",
+            token_len_chunk=16,
+            block_ids=[7, 8],
+            block_hashes=[b"hash-0"],
+            load_spec=LoadSpec(0, 16, True),
+        )
+    )
+    return metadata
+
+
+def test_worker_start_load_delegates_and_returns_server_load_errors() -> None:
+    config = _make_vllm_config()
+    metadata = _make_load_metadata()
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.start_load_kv.return_value = True
+        client_class.return_value.get_block_ids_with_load_errors.return_value = {8}
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.bind_connector_metadata(metadata)
+
+        connector.start_load_kv(MagicMock())
+
+        assert connector.get_block_ids_with_load_errors() == {8}
+
+    client_class.return_value.start_load_kv.assert_called_once_with(metadata)
+
+
+def test_worker_start_load_marks_candidate_blocks_invalid_when_rpc_fails() -> None:
+    config = _make_vllm_config()
+    metadata = _make_load_metadata()
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.start_load_kv.return_value = False
+        client_class.return_value.get_block_ids_with_load_errors.return_value = set()
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.bind_connector_metadata(metadata)
+
+        connector.start_load_kv(MagicMock())
+
+        assert connector.get_block_ids_with_load_errors() == {7, 8}
+
+
+def test_worker_load_error_query_failure_invalidates_pending_load_blocks() -> None:
+    config = _make_vllm_config()
+    metadata = _make_load_metadata()
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.start_load_kv.return_value = True
+        client_class.return_value.get_block_ids_with_load_errors.return_value = None
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.bind_connector_metadata(metadata)
+
+        connector.start_load_kv(MagicMock())
+
+        assert connector.get_block_ids_with_load_errors() == {7, 8}
+
+
+def test_worker_start_load_rejects_layerwise_retrieve() -> None:
+    config = _make_vllm_config()
+    config.kv_transfer_config.kv_connector_extra_config = {
+        "kv_cache_server_url": SERVER_URL,
+        "use_layerwise": True,
+    }
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient"):
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.bind_connector_metadata(_make_load_metadata())
+
+        with pytest.raises(NotImplementedError, match="layerwise Retrieve"):
+            connector.start_load_kv(MagicMock())
 
 
 def test_worker_keeps_exported_cache_alive_until_shutdown() -> None:

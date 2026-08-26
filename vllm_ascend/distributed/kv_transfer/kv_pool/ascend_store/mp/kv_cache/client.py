@@ -34,6 +34,7 @@ from .protocol import (
     decode_ack_response,
     decode_build_connector_meta_response,
     decode_build_connector_worker_meta_response,
+    decode_get_block_ids_with_load_errors_response,
     decode_get_finished_response,
     decode_get_kv_events_response,
     decode_lookup_response,
@@ -41,6 +42,7 @@ from .protocol import (
     decode_update_connector_output_response,
     encode_build_connector_meta_request,
     encode_build_connector_worker_meta_request,
+    encode_get_block_ids_with_load_errors_request,
     encode_get_finished_request,
     encode_get_kv_events_request,
     encode_lookup_request,
@@ -48,6 +50,7 @@ from .protocol import (
     encode_registration_request,
     encode_request_finished,
     encode_scheduler_session,
+    encode_start_load_kv_request,
     encode_update_connector_output,
     encode_update_state_after_alloc,
     encode_wait_for_save_request,
@@ -415,6 +418,32 @@ class KVCacheClient:
             timeout_ms,
         )
         return decode_get_kv_events_response(responses) if responses is not None else []
+
+    def start_load_kv(
+        self,
+        metadata: AscendConnectorMetadata,
+        timeout_ms: int | None = None,
+    ) -> bool:
+        responses = self._worker_rpc(
+            KVCacheMethod.START_LOAD_KV,
+            lambda registration: encode_start_load_kv_request(registration, metadata),
+            timeout_ms,
+        )
+        if responses is None:
+            return False
+        decode_ack_response(responses, KVCacheMethod.START_LOAD_KV)
+        return True
+
+    def get_block_ids_with_load_errors(
+        self,
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> set[int] | None:
+        responses = self._worker_rpc(
+            KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS,
+            encode_get_block_ids_with_load_errors_request,
+            timeout_ms,
+        )
+        return decode_get_block_ids_with_load_errors_response(responses) if responses is not None else None
 
     def lookup(
         self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS
