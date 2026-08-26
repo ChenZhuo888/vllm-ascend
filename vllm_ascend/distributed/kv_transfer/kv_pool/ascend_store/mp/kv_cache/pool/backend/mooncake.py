@@ -9,6 +9,30 @@ from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import g
 
 from .....backend.mooncake_backend import MooncakeBackend
 
+_MOONCAKE_MP_MIN_VERSION = "mooncake-transfer-engine-npu>=0.3.12.post1"
+_MOONCAKE_MP_REQUIRED_API = "register_memory(address, size, location)"
+
+
+def _mooncake_register_version_error(exc: TypeError) -> RuntimeError:
+    """Explain a location-argument rejection from an old mooncake binding.
+
+    The rejection is either an outdated package or an old mooncake module
+    (typically under the CANN python path) shadowing the pip-installed one,
+    so the message includes where mooncake.engine was actually loaded from.
+    """
+    try:
+        import mooncake.engine as mooncake_engine
+
+        loaded_from = getattr(mooncake_engine, "__file__", "<unknown>")
+    except Exception:
+        loaded_from = "<mooncake.engine not importable>"
+    return RuntimeError(
+        f"AscendStore MP with Mooncake requires {_MOONCAKE_MP_MIN_VERSION} "
+        f"(needs {_MOONCAKE_MP_REQUIRED_API}); the loaded binding rejected the "
+        f"location argument: {exc}. mooncake.engine was loaded from {loaded_from!r} "
+        "and may be shadowing the pip-installed package."
+    )
+
 
 class MPMooncakeBackend(MooncakeBackend):
     """Register every Worker generation instead of using the process-wide one-shot path."""
@@ -41,9 +65,11 @@ class MPMooncakeBackend(MooncakeBackend):
                             f"address=0x{ptr:x}, length={length}"
                         )
                     registered.append(ptr)
-            except BaseException:
+            except BaseException as exc:
                 for ptr in reversed(registered):
                     transfer_engine.unregister_memory(ptr)
+                if isinstance(exc, TypeError) and "register_memory" in str(exc):
+                    raise _mooncake_register_version_error(exc) from exc
                 raise
         self._mp_registered_ptrs = registered
 
