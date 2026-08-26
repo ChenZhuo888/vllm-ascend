@@ -84,6 +84,10 @@ def test_mp_worker_reuses_original_cache_registration() -> None:
     assert MPKVPoolWorker.register_kv_caches is KVPoolWorker.register_kv_caches
 
 
+def test_mp_worker_reuses_original_get_finished() -> None:
+    assert MPKVPoolWorker.get_finished is KVPoolWorker.get_finished
+
+
 def test_mp_worker_uses_registered_rank() -> None:
     worker = _make_worker([1, 1, 1, 1], tp_size=2, rank=1)
 

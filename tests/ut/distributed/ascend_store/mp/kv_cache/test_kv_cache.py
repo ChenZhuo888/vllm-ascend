@@ -60,6 +60,13 @@ class _FakeWorker:
         assert isinstance(metadata, AscendConnectorMetadata)
         assert isinstance(event, NPUEventSpec)
 
+    @staticmethod
+    def get_finished(
+        finished_req_ids: set[str],
+        metadata: AscendConnectorMetadata,
+    ) -> tuple[set[str], set[str]]:
+        return finished_req_ids & metadata.delayed_free_req_ids, finished_req_ids & metadata.loading_req_ids
+
 
 class _FakeScheduler:
     def __init__(self, identity: SchedulerIdentity, lookup_handler: WorkerLookupHandler):
@@ -462,6 +469,29 @@ def test_worker_wait_for_save_round_trip() -> None:
         event = NPUEventSpec("host-0", b"event-handle")
 
         assert client.wait_for_save(metadata, event)
+    finally:
+        client.close()
+        _stop_server(process)
+
+
+def test_worker_get_finished_round_trip() -> None:
+    process, endpoint = _start_server()
+    client = KVCacheClient(endpoint)
+
+    try:
+        _wait_until_connected(client)
+        assert client.register_worker(_make_vllm_config(), kv_cache_config=None)
+        metadata = AscendConnectorMetadata(
+            set(),
+            set(),
+            loading_req_ids={"loading-0", "loading-stale"},
+            delayed_free_req_ids={"saving-0", "saving-stale"},
+        )
+
+        assert client.get_finished({"saving-0", "loading-0"}, metadata) == (
+            {"saving-0"},
+            {"loading-0"},
+        )
     finally:
         client.close()
         _stop_server(process)

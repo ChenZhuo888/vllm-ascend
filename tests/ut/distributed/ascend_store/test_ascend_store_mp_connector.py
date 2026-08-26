@@ -161,6 +161,36 @@ def test_worker_wait_for_save_releases_source_event_when_rpc_fails() -> None:
     exported_event.close.assert_called_once_with()
 
 
+def test_worker_get_finished_delegates_with_bound_metadata() -> None:
+    config = _make_vllm_config()
+    metadata = AscendConnectorMetadata(set(), set())
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.get_finished.return_value = ({"saving-0"}, {"loading-0"})
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.bind_connector_metadata(metadata)
+
+        result = connector.get_finished({"saving-0", "loading-0"})
+
+    assert result == ({"saving-0"}, {"loading-0"})
+    client_class.return_value.get_finished.assert_called_once_with(
+        {"saving-0", "loading-0"},
+        metadata,
+    )
+
+
+def test_worker_get_finished_returns_empty_sets_for_degraded_metadata() -> None:
+    config = _make_vllm_config()
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.bind_connector_metadata(AscendStoreMPConnectorMetadata())
+
+        assert connector.get_finished({"request-0"}) == (set(), set())
+
+    client_class.return_value.get_finished.assert_not_called()
+
+
 def test_worker_keeps_exported_cache_alive_until_shutdown() -> None:
     config = _make_vllm_config()
     exported = MagicMock()

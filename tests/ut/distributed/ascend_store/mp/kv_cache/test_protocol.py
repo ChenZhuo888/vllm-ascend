@@ -12,6 +12,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     decode_ack_response,
     decode_build_connector_meta_request,
     decode_build_connector_meta_response,
+    decode_get_finished_request,
+    decode_get_finished_response,
     decode_lookup_request,
     decode_lookup_response,
     decode_register_kv_caches_request,
@@ -27,6 +29,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     decode_worker_session,
     encode_build_connector_meta_request,
     encode_build_connector_meta_response,
+    encode_get_finished_request,
+    encode_get_finished_response,
     encode_lookup_request,
     encode_lookup_response,
     encode_register_kv_caches_request,
@@ -185,6 +189,32 @@ def test_wait_for_save_round_trip() -> None:
     assert decoded_metadata.requests[0].req_id == "request-0"
     assert decoded_metadata.requests[0].can_save is True
     assert decoded_event == event
+
+
+def test_get_finished_round_trip() -> None:
+    registration = WorkerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        session_id="worker-session",
+    )
+    metadata = AscendConnectorMetadata(
+        set(),
+        {"preempted-0"},
+        loading_req_ids={"loading-0"},
+        delayed_free_req_ids={"saving-0"},
+    )
+
+    payloads = encode_get_finished_request(registration, {"saving-0", "loading-0"}, metadata)
+    identity, session_id, finished_req_ids, decoded_metadata = decode_get_finished_request(payloads)
+
+    assert worker_affinity_key(b"client", payloads) == registration.identity
+    assert (identity, session_id) == (registration.identity, registration.session_id)
+    assert finished_req_ids == {"saving-0", "loading-0"}
+    assert decoded_metadata.preempted_req_ids == {"preempted-0"}
+    assert decoded_metadata.loading_req_ids == {"loading-0"}
+    assert decoded_metadata.delayed_free_req_ids == {"saving-0"}
+    response = encode_get_finished_response({"saving-0"}, {"loading-0"})
+    assert decode_get_finished_response(response) == ({"saving-0"}, {"loading-0"})
 
 
 def test_lookup_request_preserves_required_fields_and_response_round_trip() -> None:

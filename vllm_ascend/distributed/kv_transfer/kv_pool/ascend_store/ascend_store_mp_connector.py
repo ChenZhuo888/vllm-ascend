@@ -286,6 +286,15 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         finally:
             exported_event.close()
 
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        self._require_worker_role("get_finished")
+        metadata = self._get_connector_metadata()
+        if isinstance(metadata, AscendStoreMPConnectorMetadata):
+            return set(), set()
+        if not isinstance(metadata, AscendConnectorMetadata):
+            raise TypeError(f"Expected AscendConnectorMetadata, got {type(metadata).__name__}")
+        return self._kv_cache_client.get_finished(finished_req_ids, metadata)
+
     def shutdown(self) -> None:
         try:
             self._kv_cache_client.close()

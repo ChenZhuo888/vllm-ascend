@@ -168,6 +168,18 @@ class KVCacheServiceManager:
             raise RuntimeError(f"Worker {identity!r} does not support wait_for_save")
         handler(metadata, event_spec)
 
+    def get_finished(
+        self,
+        identity: WorkerIdentity,
+        session_id: str,
+        finished_req_ids: set[str],
+        metadata: AscendConnectorMetadata,
+    ) -> tuple[set[str], set[str]]:
+        worker = self._workers.get_for_session(identity, session_id)
+        if worker is None:
+            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        return worker.get_finished(finished_req_ids, metadata)
+
     def lookup(
         self,
         identity: SchedulerIdentity,

@@ -17,6 +17,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
     SchedulerRegistration,
     WorkerRegistration,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
+    encode_get_finished_response,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
@@ -106,6 +109,36 @@ def test_worker_wait_for_save_has_no_default_deadline() -> None:
         request = client_class.return_value.request
         assert request.call_args.args[0].value == "WAIT_FOR_SAVE"
         assert request.call_args.kwargs["timeout_ms"] is None
+
+
+def test_worker_get_finished_uses_bounded_worker_rpc() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(
+            client_class,
+            [list(encode_get_finished_response({"saving-0"}, {"loading-0"}))],
+        )
+        metadata = AscendConnectorMetadata(
+            set(),
+            set(),
+            loading_req_ids={"loading-0"},
+            delayed_free_req_ids={"saving-0"},
+        )
+
+        assert client.get_finished({"saving-0", "loading-0"}, metadata) == (
+            {"saving-0"},
+            {"loading-0"},
+        )
+
+        request = client_class.return_value.request
+        assert request.call_args.args[0].value == "GET_FINISHED"
+        assert request.call_args.kwargs["timeout_ms"] == 5000
+
+
+def test_worker_get_finished_degrades_to_empty_sets_when_busy() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, MPServerBusyError("busy"))
+
+        assert client.get_finished(set(), AscendConnectorMetadata(set(), set())) == (set(), set())
 
 
 def test_update_state_after_alloc_degrades_silently_on_timeout() -> None:

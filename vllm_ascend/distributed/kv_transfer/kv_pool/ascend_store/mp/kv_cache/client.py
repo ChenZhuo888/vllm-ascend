@@ -32,10 +32,12 @@ from .protocol import (
     KVCacheMethod,
     decode_ack_response,
     decode_build_connector_meta_response,
+    decode_get_finished_response,
     decode_lookup_response,
     decode_request_finished_response,
     decode_update_connector_output_response,
     encode_build_connector_meta_request,
+    encode_get_finished_request,
     encode_lookup_request,
     encode_register_kv_caches_request,
     encode_registration_request,
@@ -376,6 +378,19 @@ class KVCacheClient:
             return False
         decode_ack_response(responses, KVCacheMethod.WAIT_FOR_SAVE)
         return True
+
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+        metadata: AscendConnectorMetadata,
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> tuple[set[str], set[str]]:
+        responses = self._worker_rpc(
+            KVCacheMethod.GET_FINISHED,
+            lambda registration: encode_get_finished_request(registration, finished_req_ids, metadata),
+            timeout_ms,
+        )
+        return decode_get_finished_response(responses) if responses is not None else (set(), set())
 
     def lookup(
         self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS

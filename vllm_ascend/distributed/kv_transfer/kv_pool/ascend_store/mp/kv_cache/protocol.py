@@ -54,6 +54,7 @@ class KVCacheMethod(str, enum.Enum):
     REQUEST_FINISHED = "REQUEST_FINISHED"
     UPDATE_CONNECTOR_OUTPUT = "UPDATE_CONNECTOR_OUTPUT"
     WAIT_FOR_SAVE = "WAIT_FOR_SAVE"
+    GET_FINISHED = "GET_FINISHED"
 
 
 @dataclass
@@ -195,6 +196,54 @@ def decode_wait_for_save_request(
     _require_type(metadata, AscendConnectorMetadata, "metadata")
     _require_type(event_spec, NPUEventSpec, "event_spec")
     return identity, session_id, metadata, event_spec
+
+
+def encode_get_finished_request(
+    registration: WorkerRegistration,
+    finished_req_ids: set[str],
+    metadata: AscendConnectorMetadata,
+) -> tuple[bytes, ...]:
+    if not isinstance(metadata, AscendConnectorMetadata):
+        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
+    return _encode_worker_request(
+        registration,
+        {"finished_req_ids": _validate_text_set(finished_req_ids, "finished_req_ids"), "metadata": metadata},
+        KVCacheMethod.GET_FINISHED,
+    )
+
+
+def decode_get_finished_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str, set[str], AscendConnectorMetadata]:
+    method = KVCacheMethod.GET_FINISHED
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    finished_req_ids, metadata = _body_fields(body, method.value, "finished_req_ids", "metadata")
+    _require_type(metadata, AscendConnectorMetadata, "metadata")
+    return identity, session_id, _decode_text_set(finished_req_ids, "finished_req_ids"), metadata
+
+
+def encode_get_finished_response(
+    done_sending: set[str],
+    done_recving: set[str],
+) -> tuple[bytes, ...]:
+    return _encode_response(
+        KVCacheMethod.GET_FINISHED,
+        {
+            "done_sending": _validate_text_set(done_sending, "done_sending"),
+            "done_recving": _validate_text_set(done_recving, "done_recving"),
+        },
+    )
+
+
+def decode_get_finished_response(responses: Sequence[bytes]) -> tuple[set[str], set[str]]:
+    body = _decode_response(responses, KVCacheMethod.GET_FINISHED)
+    done_sending, done_recving = _body_fields(
+        body,
+        "GET_FINISHED response",
+        "done_sending",
+        "done_recving",
+    )
+    return _decode_text_set(done_sending, "done_sending"), _decode_text_set(done_recving, "done_recving")
 
 
 def scheduler_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
@@ -646,6 +695,18 @@ def _validate_block_hash(value: BlockHash) -> BlockHash:
     if not value:
         raise ValueError("block_hash must not be empty")
     return value
+
+
+def _validate_text_set(value: set[str], field_name: str) -> set[str]:
+    if not isinstance(value, set):
+        raise TypeError(f"{field_name} must be a set, got {type(value).__name__}")
+    return {_validate_text(item, f"{field_name} item") for item in value}
+
+
+def _decode_text_set(value, field_name: str) -> set[str]:
+    if not isinstance(value, set):
+        raise MPProtocolError(f"{field_name} must be a set, got {type(value).__name__}")
+    return {_decode_text_value(item, f"{field_name} item") for item in value}
 
 
 def _validate_bool(value: bool, field_name: str) -> bool:

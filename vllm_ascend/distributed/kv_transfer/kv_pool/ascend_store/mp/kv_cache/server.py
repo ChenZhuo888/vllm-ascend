@@ -20,6 +20,7 @@ from .protocol import (
     ACK_RESPONSE,
     KVCacheMethod,
     decode_build_connector_meta_request,
+    decode_get_finished_request,
     decode_lookup_request,
     decode_register_kv_caches_request,
     decode_registration_request,
@@ -30,6 +31,7 @@ from .protocol import (
     decode_wait_for_save_request,
     decode_worker_session,
     encode_build_connector_meta_response,
+    encode_get_finished_response,
     encode_lookup_response,
     encode_request_finished_response,
     encode_update_connector_output_response,
@@ -89,6 +91,7 @@ class KVCacheServer:
                 worker_route(KVCacheMethod.UNREGISTER_WORKER, self._handle_unregister_worker),
                 lease_route(KVCacheMethod.RENEW_WORKER, self._handle_renew_worker),
                 worker_route(KVCacheMethod.WAIT_FOR_SAVE, self._handle_wait_for_save),
+                worker_route(KVCacheMethod.GET_FINISHED, self._handle_get_finished),
             ),
         )
 
@@ -135,6 +138,16 @@ class KVCacheServer:
         identity, session_id, metadata, event_spec = decode_wait_for_save_request(payloads)
         self._service.wait_for_save(identity, session_id, metadata, event_spec)
         return (ACK_RESPONSE,)
+
+    def _handle_get_finished(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, finished_req_ids, metadata = decode_get_finished_request(payloads)
+        done_sending, done_recving = self._service.get_finished(
+            identity,
+            session_id,
+            finished_req_ids,
+            metadata,
+        )
+        return encode_get_finished_response(done_sending, done_recving)
 
     def _handle_unregister_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id = decode_scheduler_session(payloads)
