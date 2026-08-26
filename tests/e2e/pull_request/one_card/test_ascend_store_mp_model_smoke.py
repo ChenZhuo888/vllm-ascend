@@ -15,6 +15,7 @@ import multiprocessing
 import os
 import re
 import threading
+import time
 from multiprocessing.connection import Connection
 
 import pytest
@@ -29,6 +30,7 @@ from tests.e2e.pull_request.one_card.test_ascend_store_mp_ipc import (
 
 _MODEL_ENV = "ASCEND_STORE_MP_SMOKE_MODEL"
 _HIT_LOG_PATTERN = re.compile(r"kvpool hit tokens: (\d+)")
+_STORE_DRAIN_TIMEOUT_S = 30.0
 
 # Repeat the context so it spans multiple whole Ascend hash blocks. The test
 # also verifies this against the engine's actual block size before generation.
@@ -131,6 +133,25 @@ def _generate_once(llm) -> str:
     return outputs[0].outputs[0].text
 
 
+def _wait_for_prefix_cache_reset(llm) -> None:
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    deadline = time.monotonic() + _STORE_DRAIN_TIMEOUT_S
+    dummy_params = SamplingParams(max_tokens=1)
+    while not llm.reset_prefix_cache():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"External KV Store did not drain within {_STORE_DRAIN_TIMEOUT_S:.0f} seconds")
+        # A completed async Store is released when the scheduler next polls
+        # get_finished. This one-token request advances that scheduler step
+        # without creating another external Store operation.
+        llm.generate(
+            [TokensPrompt(prompt_token_ids=[0])],
+            dummy_params,
+            use_tqdm=False,
+        )
+
+
 def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch) -> None:
     import torch
     import torch_npu  # noqa: F401
@@ -202,7 +223,7 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch) -> None:
 
             # Drop the engine's own prefix cache so the second request must be
             # served by the external pool instead of local HBM blocks.
-            assert llm.reset_prefix_cache(), "Failed to reset the local vLLM prefix cache"
+            _wait_for_prefix_cache_reset(llm)
             second_output = _generate_once(llm)
 
             assert second_output == first_output, "Retrieved KV changed the greedy output"
