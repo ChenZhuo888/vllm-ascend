@@ -180,7 +180,7 @@ class MPClient:
         self,
         method: str,
         payloads: Sequence[bytes] | None = None,
-        timeout_ms: int = 5000,
+        timeout_ms: int | None = 5000,
     ) -> list[bytes]:
         return self.submit_request(method, payloads, timeout_ms=timeout_ms).result()
 

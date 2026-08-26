@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
 
+from ...metadata import AscendConnectorMetadata
 from ..rpc import MPProtocolError
 from .registration import (
     SchedulerIdentity,
@@ -18,6 +19,7 @@ from .registration import (
     WorkerIdentity,
     WorkerRegistration,
 )
+from .synchronization import NPUEventSpec
 from .view import (
     BlocksView,
     CachedReqsView,
@@ -51,6 +53,7 @@ class KVCacheMethod(str, enum.Enum):
     BUILD_CONNECTOR_META = "BUILD_CONNECTOR_META"
     REQUEST_FINISHED = "REQUEST_FINISHED"
     UPDATE_CONNECTOR_OUTPUT = "UPDATE_CONNECTOR_OUTPUT"
+    WAIT_FOR_SAVE = "WAIT_FOR_SAVE"
 
 
 @dataclass
@@ -165,6 +168,33 @@ def decode_register_kv_caches_request(
     (spec,) = _body_fields(body, method.value, "spec")
     _require_type(spec, WorkerKVCacheSpec, "spec")
     return identity, session_id, spec
+
+
+def encode_wait_for_save_request(
+    registration: WorkerRegistration,
+    metadata: AscendConnectorMetadata,
+    event_spec: NPUEventSpec,
+) -> tuple[bytes, ...]:
+    if not isinstance(metadata, AscendConnectorMetadata):
+        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
+    if not isinstance(event_spec, NPUEventSpec):
+        raise TypeError(f"event_spec must be NPUEventSpec, got {type(event_spec).__name__}")
+    return _encode_worker_request(
+        registration,
+        {"metadata": metadata, "event_spec": event_spec},
+        KVCacheMethod.WAIT_FOR_SAVE,
+    )
+
+
+def decode_wait_for_save_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str, AscendConnectorMetadata, NPUEventSpec]:
+    method = KVCacheMethod.WAIT_FOR_SAVE
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    metadata, event_spec = _body_fields(body, method.value, "metadata", "event_spec")
+    _require_type(metadata, AscendConnectorMetadata, "metadata")
+    _require_type(event_spec, NPUEventSpec, "event_spec")
+    return identity, session_id, metadata, event_spec
 
 
 def scheduler_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:

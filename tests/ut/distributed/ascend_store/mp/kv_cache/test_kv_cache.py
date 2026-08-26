@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheMethod, KVCacheServer
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     encode_lookup_response,
@@ -22,6 +23,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
     WorkerLookupHandler,
     WorkerRegistration,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPClient,
@@ -53,6 +55,10 @@ class _FakeWorker:
         hbm_hit_tokens: int = 0,
     ) -> int:
         return min(token_len, self._matched_tokens)
+
+    def wait_for_save(self, metadata: AscendConnectorMetadata, event: NPUEventSpec) -> None:
+        assert isinstance(metadata, AscendConnectorMetadata)
+        assert isinstance(event, NPUEventSpec)
 
 
 class _FakeScheduler:
@@ -442,6 +448,22 @@ def test_multiple_workers_are_registered_and_rank_zero_serves_lookup() -> None:
     finally:
         for client in clients:
             client.close()
+        _stop_server(process)
+
+
+def test_worker_wait_for_save_round_trip() -> None:
+    process, endpoint = _start_server()
+    client = KVCacheClient(endpoint)
+
+    try:
+        _wait_until_connected(client)
+        assert client.register_worker(_make_vllm_config(), kv_cache_config=None)
+        metadata = AscendConnectorMetadata(set(), set())
+        event = NPUEventSpec("host-0", b"event-handle")
+
+        assert client.wait_for_save(metadata, event)
+    finally:
+        client.close()
         _stop_server(process)
 
 

@@ -2,6 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendConnectorMetadata,
+    ReqMeta,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     ACK_RESPONSE,
     KVCacheMethod,
@@ -19,6 +23,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     decode_update_connector_output,
     decode_update_connector_output_response,
     decode_update_state_after_alloc,
+    decode_wait_for_save_request,
     decode_worker_session,
     encode_build_connector_meta_request,
     encode_build_connector_meta_response,
@@ -33,6 +38,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     encode_update_connector_output,
     encode_update_connector_output_response,
     encode_update_state_after_alloc,
+    encode_wait_for_save_request,
     encode_worker_session,
     scheduler_affinity_key,
     worker_affinity_key,
@@ -43,6 +49,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
     WorkerIdentity,
     WorkerRegistration,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import (
     KVCacheStorageSpec,
     KVCacheTensorSpec,
@@ -158,6 +165,26 @@ def test_register_kv_caches_round_trip() -> None:
         registration.session_id,
         spec,
     )
+
+
+def test_wait_for_save_round_trip() -> None:
+    registration = WorkerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        session_id="worker-session",
+    )
+    metadata = AscendConnectorMetadata(set(), set())
+    metadata.add_request(ReqMeta("request-0", can_save=True))
+    event = NPUEventSpec("host-0", b"event-handle")
+
+    payloads = encode_wait_for_save_request(registration, metadata, event)
+    identity, session_id, decoded_metadata, decoded_event = decode_wait_for_save_request(payloads)
+
+    assert worker_affinity_key(b"client", payloads) == registration.identity
+    assert (identity, session_id) == (registration.identity, registration.session_id)
+    assert decoded_metadata.requests[0].req_id == "request-0"
+    assert decoded_metadata.requests[0].can_save is True
+    assert decoded_event == event
 
 
 def test_lookup_request_preserves_required_fields_and_response_round_trip() -> None:

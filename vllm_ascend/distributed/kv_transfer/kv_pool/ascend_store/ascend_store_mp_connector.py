@@ -19,12 +19,16 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreKVEvents
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendStoreKVConnectorWorkerMetadata
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendConnectorMetadata,
+    AscendStoreKVConnectorWorkerMetadata,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
     ExportedKVCache,
     export_worker_kv_caches,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import record_npu_event
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 
 if TYPE_CHECKING:
@@ -64,6 +68,12 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         if getattr(vllm_config.model_config, "enable_sleep_mode", False) is True:
             raise ValueError("AscendStoreMPConnector does not support sleep mode")
 
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        extra_config = kv_transfer_config.kv_connector_extra_config or {}
+        self.kv_role = kv_transfer_config.kv_role
+        self.use_layerwise = extra_config.get("use_layerwise", False)
+        self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
         self._kv_cache_export_lock = threading.Lock()
         self._next_kv_cache_generation = 1
         self._active_kv_cache_export: ExportedKVCache | None = None
@@ -256,7 +266,25 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         return None
 
     def wait_for_save(self) -> None:
-        return None
+        self._require_worker_role("wait_for_save")
+        if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
+            return
+        if self.use_layerwise:
+            return
+
+        metadata = self._get_connector_metadata()
+        if isinstance(metadata, AscendStoreMPConnectorMetadata):
+            return
+        if not isinstance(metadata, AscendConnectorMetadata):
+            raise TypeError(f"Expected AscendConnectorMetadata, got {type(metadata).__name__}")
+        if not any(request.can_save for request in metadata.requests):
+            return
+
+        exported_event = record_npu_event()
+        try:
+            self._kv_cache_client.wait_for_save(metadata, exported_event.spec)
+        finally:
+            exported_event.close()
 
     def shutdown(self) -> None:
         try:

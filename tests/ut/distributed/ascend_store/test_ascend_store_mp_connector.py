@@ -6,6 +6,7 @@ import torch
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata, ReqMeta
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_mp_connector import (
     AscendStoreMPConnector,
     AscendStoreMPConnectorMetadata,
@@ -40,6 +41,7 @@ def _make_vllm_config(server_url: object = SERVER_URL, rank: int = 0) -> MagicMo
     config.parallel_config.rank = rank
     config.kv_transfer_config.kv_connector = "AscendStoreMPConnector"
     config.kv_transfer_config.engine_id = "engine-0"
+    config.kv_transfer_config.kv_role = "kv_producer"
     config.kv_transfer_config.kv_connector_extra_config = {}
     if server_url is not None:
         config.kv_transfer_config.kv_connector_extra_config["kv_cache_server_url"] = server_url
@@ -137,6 +139,26 @@ def test_worker_rejects_empty_kv_caches_before_rpc() -> None:
             connector.register_kv_caches({})
 
         client_class.return_value.register_kv_caches.assert_not_called()
+
+
+def test_worker_wait_for_save_releases_source_event_when_rpc_fails() -> None:
+    config = _make_vllm_config()
+    metadata = AscendConnectorMetadata(set(), set())
+    metadata.add_request(ReqMeta("request-0", can_save=True))
+    exported_event = MagicMock()
+
+    with (
+        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
+        patch(f"{CONNECTOR_MODULE}.record_npu_event", return_value=exported_event),
+    ):
+        client_class.return_value.wait_for_save.side_effect = RuntimeError("RPC failed")
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.bind_connector_metadata(metadata)
+        with pytest.raises(RuntimeError, match="RPC failed"):
+            connector.wait_for_save()
+
+    client_class.return_value.wait_for_save.assert_called_once_with(metadata, exported_event.spec)
+    exported_event.close.assert_called_once_with()
 
 
 def test_worker_keeps_exported_cache_alive_until_shutdown() -> None:

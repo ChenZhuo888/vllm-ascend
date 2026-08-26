@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.request import Request
 
+from ...metadata import AscendConnectorMetadata
 from ..rpc import TaskExecutor
 from ..service import ServiceLifecycleManager
 from .error import ServiceNotRegisteredError
@@ -21,6 +22,7 @@ from .registration import (
     WorkerLookupHandler,
     WorkerRegistration,
 )
+from .synchronization import NPUEventSpec
 from .view import (
     BlocksView,
     ConnectorOutputView,
@@ -150,6 +152,21 @@ class KVCacheServiceManager:
         if not callable(configure):
             raise RuntimeError(f"Worker {identity!r} does not support KV cache configuration")
         configure(spec)
+
+    def wait_for_save(
+        self,
+        identity: WorkerIdentity,
+        session_id: str,
+        metadata: AscendConnectorMetadata,
+        event_spec: NPUEventSpec,
+    ) -> None:
+        worker = self._workers.get_for_session(identity, session_id)
+        if worker is None:
+            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        handler = getattr(worker, "wait_for_save", None)
+        if not callable(handler):
+            raise RuntimeError(f"Worker {identity!r} does not support wait_for_save")
+        handler(metadata, event_spec)
 
     def lookup(
         self,

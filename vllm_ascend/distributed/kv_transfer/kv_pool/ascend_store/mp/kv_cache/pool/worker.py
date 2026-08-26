@@ -8,8 +8,10 @@ import torch
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from ....metadata import AscendConnectorMetadata
 from ....pool_worker import KVPoolWorker
 from ..memory import ImportedKVCache, import_worker_kv_caches
+from ..synchronization import NPUEventSpec, import_npu_event
 from ..view import WorkerKVCacheSpec
 from .backend import create_mp_backend
 from .transfer import (
@@ -356,6 +358,29 @@ class MPKVPoolWorker(KVPoolWorker):
         self.kv_send_thread = None
         self.kv_recv_thread = None
         self._transfer_threads_started = False
+
+    def wait_for_save(self, connector_metadata: AscendConnectorMetadata, event_spec: NPUEventSpec) -> None:
+        if self.kv_send_thread is None:
+            raise RuntimeError("Worker Store runtime is not initialized")
+        send_thread = self.kv_send_thread
+        send_thread.raise_if_failed()
+        save_requests = [request for request in connector_metadata.requests if request.can_save]
+        if not save_requests:
+            return
+
+        if self.kv_cache_spec is None:
+            raise RuntimeError("Worker KV caches must be configured before wait_for_save")
+        device_uuids = {storage.device_uuid for storage in self.kv_cache_spec.storages}
+        if event_spec.device_uuid not in device_uuids:
+            raise ValueError(f"NPU event device {event_spec.device_uuid!r} does not match Worker KV caches")
+
+        current_event = import_npu_event(event_spec)
+        for request in save_requests:
+            request.skip_null_blocks_by_group = self.group_uses_align_state
+            request.current_event = current_event
+            send_thread.add_stored_request(request.req_id)
+            send_thread.add_request(request)
+        send_thread.request_queue.join()
 
     def close(self) -> None:
         imported = self._imported_kv_cache

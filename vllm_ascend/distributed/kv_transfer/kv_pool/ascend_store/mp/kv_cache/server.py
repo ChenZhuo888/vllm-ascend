@@ -27,6 +27,7 @@ from .protocol import (
     decode_scheduler_session,
     decode_update_connector_output,
     decode_update_state_after_alloc,
+    decode_wait_for_save_request,
     decode_worker_session,
     encode_build_connector_meta_response,
     encode_lookup_response,
@@ -87,6 +88,7 @@ class KVCacheServer:
                 worker_route(KVCacheMethod.REGISTER_KV_CACHES, self._handle_register_kv_caches),
                 worker_route(KVCacheMethod.UNREGISTER_WORKER, self._handle_unregister_worker),
                 lease_route(KVCacheMethod.RENEW_WORKER, self._handle_renew_worker),
+                worker_route(KVCacheMethod.WAIT_FOR_SAVE, self._handle_wait_for_save),
             ),
         )
 
@@ -127,6 +129,11 @@ class KVCacheServer:
     def _handle_register_kv_caches(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id, spec = decode_register_kv_caches_request(payloads)
         self._service.register_worker_kv_caches(identity, session_id, spec)
+        return (ACK_RESPONSE,)
+
+    def _handle_wait_for_save(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, metadata, event_spec = decode_wait_for_save_request(payloads)
+        self._service.wait_for_save(identity, session_id, metadata, event_spec)
         return (ACK_RESPONSE,)
 
     def _handle_unregister_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:

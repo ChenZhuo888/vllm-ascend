@@ -14,6 +14,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 
+from ...metadata import AscendConnectorMetadata
 from ..rpc import (
     MPClient,
     MPRemoteError,
@@ -42,9 +43,11 @@ from .protocol import (
     encode_scheduler_session,
     encode_update_connector_output,
     encode_update_state_after_alloc,
+    encode_wait_for_save_request,
     encode_worker_session,
 )
 from .registration import SchedulerRegistration, WorkerRegistration
+from .synchronization import NPUEventSpec
 from .view import WorkerKVCacheSpec
 
 logger = logging.getLogger(__name__)
@@ -287,7 +290,7 @@ class KVCacheClient:
         self,
         method: KVCacheMethod,
         payloads: tuple[bytes, ...],
-        timeout_ms: int,
+        timeout_ms: int | None,
     ) -> list[bytes]:
         """Send one request and translate errors defined by the KV cache service."""
         try:
@@ -356,6 +359,23 @@ class KVCacheClient:
                     if self._worker_kv_cache_registration is cache_registration:
                         self._worker_kv_cache_registration = previous_registration
             raise
+
+    def wait_for_save(
+        self,
+        metadata: AscendConnectorMetadata,
+        event_spec: NPUEventSpec,
+        timeout_ms: int | None = None,
+    ) -> bool:
+        """Wait without a default deadline so the source Event outlives accepted Store work."""
+        responses = self._worker_rpc(
+            KVCacheMethod.WAIT_FOR_SAVE,
+            lambda registration: encode_wait_for_save_request(registration, metadata, event_spec),
+            timeout_ms,
+        )
+        if responses is None:
+            return False
+        decode_ack_response(responses, KVCacheMethod.WAIT_FOR_SAVE)
+        return True
 
     def lookup(
         self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS
@@ -438,7 +458,7 @@ class KVCacheClient:
         self,
         method: KVCacheMethod,
         encode: Callable[[WorkerRegistration], tuple[bytes, ...]],
-        timeout_ms: int,
+        timeout_ms: int | None,
     ) -> list[bytes] | None:
         self._raise_if_superseded()
         registration = self._get_worker_registration()
@@ -449,7 +469,7 @@ class KVCacheClient:
         self,
         method: KVCacheMethod,
         payloads: tuple[bytes, ...],
-        timeout_ms: int,
+        timeout_ms: int | None,
     ) -> list[bytes] | None:
         if not self.is_registered and not self._try_register():
             return None

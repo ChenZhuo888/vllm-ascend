@@ -5,6 +5,7 @@ import pytest
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.client import _RegistrationState
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.error import (
@@ -16,6 +17,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
     SchedulerRegistration,
     WorkerRegistration,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPRemoteError,
@@ -91,6 +93,19 @@ def test_worker_cache_registration_marks_client_unregistered_when_busy() -> None
         assert not client.register_kv_caches(WORKER_KV_CACHE_SPEC, on_registered=confirmed.append)
         assert not client.is_registered
         assert confirmed == []
+
+
+def test_worker_wait_for_save_has_no_default_deadline() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, [[b"OK"]])
+        metadata = AscendConnectorMetadata(set(), set())
+        event = NPUEventSpec("host-0", b"event-handle")
+
+        assert client.wait_for_save(metadata, event)
+
+        request = client_class.return_value.request
+        assert request.call_args.args[0].value == "WAIT_FOR_SAVE"
+        assert request.call_args.kwargs["timeout_ms"] is None
 
 
 def test_update_state_after_alloc_degrades_silently_on_timeout() -> None:

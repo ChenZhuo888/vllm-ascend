@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -6,11 +6,16 @@ import torch
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.worker import MPKVPoolWorker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata, ReqMeta
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
     export_worker_kv_caches,
     import_worker_kv_caches,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import KVCacheStorageSpec
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import (
+    KVCacheStorageSpec,
+    WorkerKVCacheSpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
 # isort: on
@@ -308,3 +313,41 @@ def test_mp_worker_initializes_own_backend_after_cache_mapping() -> None:
     backend_factory.assert_called_once_with(config.parallel_config, 3, False)
     assert store.set_device.call_count == 2
     worker.close()
+
+
+def test_mp_worker_wait_for_save_imports_source_event() -> None:
+    worker = _make_worker([0, 0])
+    worker.kv_cache_spec = WorkerKVCacheSpec(
+        generation=1,
+        caches={"layer.0": ()},
+        storages=(
+            KVCacheStorageSpec(
+                size_bytes=1,
+                device_type="npu",
+                device_uuid="host-0",
+                handle_type="test",
+                handle_version=1,
+                handle=b"cache-handle",
+            ),
+        ),
+    )
+    send_thread = MagicMock()
+    worker.kv_send_thread = send_thread
+    metadata = AscendConnectorMetadata(set(), set())
+    request = ReqMeta("request-0", can_save=True)
+    metadata.add_request(request)
+    event_spec = NPUEventSpec("host-0", b"event-handle")
+    imported_event = MagicMock()
+
+    with patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.worker.import_npu_event",
+        return_value=imported_event,
+    ) as import_event:
+        worker.wait_for_save(metadata, event_spec)
+
+    import_event.assert_called_once_with(event_spec)
+    assert request.current_event is imported_event
+    assert request.skip_null_blocks_by_group == worker.group_uses_align_state
+    send_thread.add_stored_request.assert_called_once_with("request-0")
+    send_thread.add_request.assert_called_once_with(request)
+    send_thread.request_queue.join.assert_called_once_with()
