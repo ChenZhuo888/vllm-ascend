@@ -159,12 +159,16 @@ def _create_observed_worker(
 
 def _producer(connection: Connection) -> None:
     exported = None
+    exported_event = None
     try:
         import torch
         import torch_npu  # noqa: F401
 
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
             export_worker_kv_caches,
+        )
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import (
+            record_npu_event,
         )
 
         if not torch.npu.is_available():
@@ -173,10 +177,10 @@ def _producer(connection: Connection) -> None:
         torch.npu.set_device(0)
         base = torch.arange(64, dtype=torch.float16, device="npu").reshape(8, 8)
         view = base[1:, ::2]
-        torch.npu.synchronize()
+        exported_event = record_npu_event()
 
         exported = export_worker_kv_caches({"base": base, "view": view}, generation=1)
-        connection.send(("ready", exported.spec))
+        connection.send(("ready", (exported.spec, exported_event.spec)))
 
         if not connection.poll(_PRODUCER_RELEASE_TIMEOUT_S):
             raise TimeoutError("Timed out waiting for the consumer to release the IPC mapping")
@@ -189,10 +193,12 @@ def _producer(connection: Connection) -> None:
     finally:
         if exported is not None:
             exported.close()
+        if exported_event is not None:
+            exported_event.close()
         connection.close()
 
 
-def _consumer(connection: Connection, spec) -> None:
+def _consumer(connection: Connection, specs) -> None:
     imported = None
     try:
         import torch
@@ -201,11 +207,16 @@ def _consumer(connection: Connection, spec) -> None:
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
             import_worker_kv_caches,
         )
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import (
+            import_npu_event,
+        )
 
         if not torch.npu.is_available():
             raise RuntimeError("NPU is not available in the consumer process")
 
-        imported = import_worker_kv_caches(spec)
+        cache_spec, event_spec = specs
+        imported = import_worker_kv_caches(cache_spec)
+        import_npu_event(event_spec).synchronize()
         base = imported.tensors["base"][0]
         view = imported.tensors["view"][0]
         expected = torch.arange(64, dtype=torch.float16).reshape(8, 8)
