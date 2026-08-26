@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm.distributed.kv_events import BlockStored
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
@@ -17,6 +18,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     decode_build_connector_worker_meta_response,
     decode_get_finished_request,
     decode_get_finished_response,
+    decode_get_kv_events_request,
+    decode_get_kv_events_response,
     decode_lookup_request,
     decode_lookup_response,
     decode_register_kv_caches_request,
@@ -36,6 +39,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     encode_build_connector_worker_meta_response,
     encode_get_finished_request,
     encode_get_finished_response,
+    encode_get_kv_events_request,
+    encode_get_kv_events_response,
     encode_lookup_request,
     encode_lookup_response,
     encode_register_kv_caches_request,
@@ -241,6 +246,33 @@ def test_build_connector_worker_meta_round_trip() -> None:
         decode_build_connector_worker_meta_response(encode_build_connector_worker_meta_response(metadata)) == metadata
     )
     assert decode_build_connector_worker_meta_response(encode_build_connector_worker_meta_response(None)) is None
+
+
+def test_get_kv_events_round_trip() -> None:
+    registration = WorkerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        session_id="worker-session",
+    )
+    event = BlockStored(
+        block_hashes=[b"hash-0"],
+        parent_block_hash=None,
+        token_ids=[1, 2],
+        block_size=2,
+        lora_id=None,
+        medium="CPU",
+        lora_name=None,
+    )
+
+    payloads = encode_get_kv_events_request(registration)
+
+    assert worker_affinity_key(b"client", payloads) == registration.identity
+    assert decode_get_kv_events_request(payloads) == (
+        registration.identity,
+        registration.session_id,
+    )
+    assert decode_get_kv_events_response(encode_get_kv_events_response([event])) == [event]
+    assert decode_get_kv_events_response(encode_get_kv_events_response([])) == []
 
 
 def test_lookup_request_preserves_required_fields_and_response_round_trip() -> None:

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 import cloudpickle
+from vllm.distributed.kv_events import BlockStored
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -56,6 +57,7 @@ class KVCacheMethod(str, enum.Enum):
     WAIT_FOR_SAVE = "WAIT_FOR_SAVE"
     GET_FINISHED = "GET_FINISHED"
     BUILD_CONNECTOR_WORKER_META = "BUILD_CONNECTOR_WORKER_META"
+    GET_KV_EVENTS = "GET_KV_EVENTS"
 
 
 @dataclass
@@ -248,15 +250,11 @@ def decode_get_finished_response(responses: Sequence[bytes]) -> tuple[set[str], 
 
 
 def encode_build_connector_worker_meta_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
-    return _encode_worker_request(registration, {}, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
+    return _encode_empty_worker_request(registration, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
 
 
 def decode_build_connector_worker_meta_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
-    method = KVCacheMethod.BUILD_CONNECTOR_WORKER_META
-    identity, session_id, body = _decode_worker_request(payloads, method)
-    if body:
-        raise MPProtocolError(f"{method.value} body must be empty")
-    return identity, session_id
+    return _decode_empty_worker_request(payloads, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
 
 
 def encode_build_connector_worker_meta_response(
@@ -275,6 +273,33 @@ def decode_build_connector_worker_meta_response(
     if metadata is not None:
         _require_type(metadata, AscendStoreKVConnectorWorkerMetadata, "metadata")
     return metadata
+
+
+def encode_get_kv_events_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
+    return _encode_empty_worker_request(registration, KVCacheMethod.GET_KV_EVENTS)
+
+
+def decode_get_kv_events_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
+    return _decode_empty_worker_request(payloads, KVCacheMethod.GET_KV_EVENTS)
+
+
+def encode_get_kv_events_response(events: list[BlockStored]) -> tuple[bytes, ...]:
+    if not isinstance(events, list):
+        raise TypeError(f"events must be a list, got {type(events).__name__}")
+    for event in events:
+        if not isinstance(event, BlockStored):
+            raise TypeError(f"event must be BlockStored, got {type(event).__name__}")
+    return _encode_response(KVCacheMethod.GET_KV_EVENTS, {"events": events})
+
+
+def decode_get_kv_events_response(responses: Sequence[bytes]) -> list[BlockStored]:
+    body = _decode_response(responses, KVCacheMethod.GET_KV_EVENTS)
+    (events,) = _body_fields(body, "GET_KV_EVENTS response", "events")
+    if not isinstance(events, list):
+        raise MPProtocolError(f"events must be a list, got {type(events).__name__}")
+    for event in events:
+        _require_type(event, BlockStored, "event")
+    return events
 
 
 def scheduler_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
@@ -538,6 +563,23 @@ def _decode_worker_request(
 ) -> tuple[WorkerIdentity, str, dict]:
     identity, session_id, payload = _decode_worker_envelope(payloads, method.value)
     return identity, session_id, _decode_body(payload, method.value)
+
+
+def _encode_empty_worker_request(
+    registration: WorkerRegistration,
+    method: KVCacheMethod,
+) -> tuple[bytes, ...]:
+    return _encode_worker_request(registration, {}, method)
+
+
+def _decode_empty_worker_request(
+    payloads: tuple[bytes, ...],
+    method: KVCacheMethod,
+) -> tuple[WorkerIdentity, str]:
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    if body:
+        raise MPProtocolError(f"{method.value} body must be empty")
+    return identity, session_id
 
 
 def _encode_scheduler_envelope(

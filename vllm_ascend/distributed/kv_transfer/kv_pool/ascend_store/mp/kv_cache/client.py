@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_events import BlockStored
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -34,12 +35,14 @@ from .protocol import (
     decode_build_connector_meta_response,
     decode_build_connector_worker_meta_response,
     decode_get_finished_response,
+    decode_get_kv_events_response,
     decode_lookup_response,
     decode_request_finished_response,
     decode_update_connector_output_response,
     encode_build_connector_meta_request,
     encode_build_connector_worker_meta_request,
     encode_get_finished_request,
+    encode_get_kv_events_request,
     encode_lookup_request,
     encode_register_kv_caches_request,
     encode_registration_request,
@@ -404,6 +407,14 @@ class KVCacheClient:
             timeout_ms,
         )
         return decode_build_connector_worker_meta_response(responses) if responses is not None else None
+
+    def get_kv_events(self, timeout_ms: int = _DEFAULT_TIMEOUT_MS) -> list[BlockStored]:
+        responses = self._worker_rpc(
+            KVCacheMethod.GET_KV_EVENTS,
+            encode_get_kv_events_request,
+            timeout_ms,
+        )
+        return decode_get_kv_events_response(responses) if responses is not None else []
 
     def lookup(
         self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS

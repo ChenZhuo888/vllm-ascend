@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from vllm.distributed.kv_events import BlockStored
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -23,6 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     encode_build_connector_worker_meta_response,
     encode_get_finished_response,
+    encode_get_kv_events_response,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
@@ -164,6 +166,35 @@ def test_worker_build_connector_meta_degrades_to_none_when_busy() -> None:
         client = _configure_mock_worker_client(client_class, MPServerBusyError("busy"))
 
         assert client.build_connector_worker_meta() is None
+
+
+def test_worker_get_kv_events_uses_worker_rpc() -> None:
+    event = BlockStored(
+        block_hashes=[b"hash-0"],
+        parent_block_hash=None,
+        token_ids=[1],
+        block_size=1,
+        lora_id=None,
+        medium="CPU",
+        lora_name=None,
+    )
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(
+            client_class,
+            [list(encode_get_kv_events_response([event]))],
+        )
+
+        assert client.get_kv_events() == [event]
+
+        request = client_class.return_value.request
+        assert request.call_args.args[0].value == "GET_KV_EVENTS"
+
+
+def test_worker_get_kv_events_degrades_to_empty_list_when_busy() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, MPServerBusyError("busy"))
+
+        assert client.get_kv_events() == []
 
 
 def test_update_state_after_alloc_degrades_silently_on_timeout() -> None:

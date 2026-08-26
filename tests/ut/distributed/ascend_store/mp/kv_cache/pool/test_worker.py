@@ -92,6 +92,10 @@ def test_mp_worker_reuses_original_worker_metadata() -> None:
     assert MPKVPoolWorker.build_connector_worker_meta is KVPoolWorker.build_connector_worker_meta
 
 
+def test_mp_worker_reuses_original_kv_events() -> None:
+    assert MPKVPoolWorker.get_kv_events is KVPoolWorker.get_kv_events
+
+
 def test_mp_worker_uses_registered_rank() -> None:
     worker = _make_worker([1, 1, 1, 1], tp_size=2, rank=1)
 

@@ -22,6 +22,7 @@ from .protocol import (
     decode_build_connector_meta_request,
     decode_build_connector_worker_meta_request,
     decode_get_finished_request,
+    decode_get_kv_events_request,
     decode_lookup_request,
     decode_register_kv_caches_request,
     decode_registration_request,
@@ -34,6 +35,7 @@ from .protocol import (
     encode_build_connector_meta_response,
     encode_build_connector_worker_meta_response,
     encode_get_finished_response,
+    encode_get_kv_events_response,
     encode_lookup_response,
     encode_request_finished_response,
     encode_update_connector_output_response,
@@ -98,6 +100,7 @@ class KVCacheServer:
                     KVCacheMethod.BUILD_CONNECTOR_WORKER_META,
                     self._handle_build_connector_worker_meta,
                 ),
+                worker_route(KVCacheMethod.GET_KV_EVENTS, self._handle_get_kv_events),
             ),
         )
 
@@ -159,6 +162,10 @@ class KVCacheServer:
         identity, session_id = decode_build_connector_worker_meta_request(payloads)
         metadata = self._service.build_connector_worker_meta(identity, session_id)
         return encode_build_connector_worker_meta_response(metadata)
+
+    def _handle_get_kv_events(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id = decode_get_kv_events_request(payloads)
+        return encode_get_kv_events_response(self._service.get_kv_events(identity, session_id))
 
     def _handle_unregister_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id = decode_scheduler_session(payloads)

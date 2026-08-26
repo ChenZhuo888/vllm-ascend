@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from vllm.distributed.kv_events import BlockStored
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
@@ -73,6 +74,20 @@ class _FakeWorker:
     @staticmethod
     def build_connector_worker_meta() -> AscendStoreKVConnectorWorkerMetadata:
         return AscendStoreKVConnectorWorkerMetadata({7: 1})
+
+    @staticmethod
+    def get_kv_events() -> list[BlockStored]:
+        return [
+            BlockStored(
+                block_hashes=[b"hash-0"],
+                parent_block_hash=None,
+                token_ids=[1],
+                block_size=1,
+                lora_id=None,
+                medium="CPU",
+                lora_name=None,
+            )
+        ]
 
 
 class _FakeScheduler:
@@ -516,6 +531,24 @@ def test_worker_build_connector_meta_round_trip() -> None:
 
         assert isinstance(metadata, AscendStoreKVConnectorWorkerMetadata)
         assert metadata.completed_events == {7: 1}
+    finally:
+        client.close()
+        _stop_server(process)
+
+
+def test_worker_get_kv_events_round_trip() -> None:
+    process, endpoint = _start_server()
+    client = KVCacheClient(endpoint)
+
+    try:
+        _wait_until_connected(client)
+        assert client.register_worker(_make_vllm_config(), kv_cache_config=None)
+
+        events = client.get_kv_events()
+
+        assert len(events) == 1
+        assert isinstance(events[0], BlockStored)
+        assert events[0].block_hashes == [b"hash-0"]
     finally:
         client.close()
         _stop_server(process)

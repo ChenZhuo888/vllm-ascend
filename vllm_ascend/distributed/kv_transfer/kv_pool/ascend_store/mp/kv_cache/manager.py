@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from functools import partial
 from typing import TYPE_CHECKING
 
+from vllm.distributed.kv_events import BlockStored
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.request import Request
 
@@ -189,6 +190,12 @@ class KVCacheServiceManager:
         if worker is None:
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
         return worker.build_connector_worker_meta()
+
+    def get_kv_events(self, identity: WorkerIdentity, session_id: str) -> list[BlockStored]:
+        worker = self._workers.get_for_session(identity, session_id)
+        if worker is None:
+            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        return worker.get_kv_events()
 
     def lookup(
         self,

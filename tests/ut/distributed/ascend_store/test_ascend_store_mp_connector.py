@@ -2,6 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.distributed.kv_events import BlockStored
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -206,6 +207,39 @@ def test_worker_build_connector_meta_delegates_to_client() -> None:
         assert connector.build_connector_worker_meta() is metadata
 
     client_class.return_value.build_connector_worker_meta.assert_called_once_with()
+
+
+def test_worker_kv_events_are_wrapped_for_vllm_aggregation() -> None:
+    config = _make_vllm_config()
+    event = BlockStored(
+        block_hashes=[b"hash-0"],
+        parent_block_hash=None,
+        token_ids=[1],
+        block_size=1,
+        lora_id=None,
+        medium="CPU",
+        lora_name=None,
+    )
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.get_kv_events.return_value = [event]
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+
+        events = connector.get_kv_connector_kv_cache_events()
+
+    assert events is not None
+    assert events.get_all_events() == [event]
+    assert events.get_number_of_workers() == 1
+
+
+def test_worker_kv_events_return_none_when_no_events_are_available() -> None:
+    config = _make_vllm_config()
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.get_kv_events.return_value = []
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+
+        assert connector.get_kv_connector_kv_cache_events() is None
 
 
 def test_worker_keeps_exported_cache_alive_until_shutdown() -> None:

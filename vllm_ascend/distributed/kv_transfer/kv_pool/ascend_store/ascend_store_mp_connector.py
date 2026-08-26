@@ -299,6 +299,16 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         self._require_worker_role("build_connector_worker_meta")
         return self._kv_cache_client.build_connector_worker_meta()
 
+    def get_kv_connector_kv_cache_events(self) -> AscendStoreKVEvents | None:
+        self._require_worker_role("get_kv_connector_kv_cache_events")
+        events = self._kv_cache_client.get_kv_events()
+        if not events:
+            return None
+
+        kv_cache_events = AscendStoreKVEvents(num_workers=1)
+        kv_cache_events.add_events(events)
+        return kv_cache_events
+
     def shutdown(self) -> None:
         try:
             self._kv_cache_client.close()
