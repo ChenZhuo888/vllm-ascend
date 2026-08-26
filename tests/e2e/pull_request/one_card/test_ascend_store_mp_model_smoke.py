@@ -57,16 +57,20 @@ def _model_path() -> str | None:
 def _run_smoke_server(endpoint_connection: Connection, control_connection: Connection, log_path: str) -> None:
     server = None
     control_thread = None
+    file_handler = None
+    vllm_logger = None
     try:
+        from vllm.logger import logger as vllm_logger
+
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheServer
+
         # pool_scheduler reports lookup hits at DEBUG through the vllm logger;
         # capture it to a file so the test can assert the hit really happened.
         file_handler = logging.FileHandler(log_path)
         file_handler.setLevel(logging.DEBUG)
-        vllm_logger = logging.getLogger("vllm")
         vllm_logger.setLevel(logging.DEBUG)
         vllm_logger.addHandler(file_handler)
-
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheServer
+        vllm_logger.debug("KV cache smoke server log capture ready")
 
         server = KVCacheServer(_SERVER_URL, max_workers=2)
         control_thread = threading.Thread(
@@ -86,6 +90,10 @@ def _run_smoke_server(endpoint_connection: Connection, control_connection: Conne
             control_thread.join(10.0)
         endpoint_connection.close()
         control_connection.close()
+        if file_handler is not None:
+            if vllm_logger is not None:
+                vllm_logger.removeHandler(file_handler)
+            file_handler.close()
 
 
 def _build_llm(model_path: str, server_url: str, monkeypatch):
@@ -188,7 +196,7 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch) -> None:
 
             # Drop the engine's own prefix cache so the second request must be
             # served by the external pool instead of local HBM blocks.
-            llm.reset_prefix_cache()
+            assert llm.reset_prefix_cache(), "Failed to reset the local vLLM prefix cache"
             second_output = _generate_once(llm)
 
             assert second_output == first_output, "Retrieved KV changed the greedy output"
