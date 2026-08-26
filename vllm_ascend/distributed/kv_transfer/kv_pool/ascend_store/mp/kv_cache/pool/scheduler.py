@@ -44,12 +44,12 @@ class MPKVPoolScheduler(KVPoolScheduler):
     """
 
     def __init__(self, registration: SchedulerRegistration, lookup_handler: WorkerLookupHandler):
-        vllm_config = registration.vllm_config
+        vllm_config, kv_cache_config = registration.config.build_runtime()
         use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
         super().__init__(
             vllm_config,
             use_layerwise,
-            kv_cache_config=registration.kv_cache_config,
+            kv_cache_config=kv_cache_config,
             page_size_bytes=registration.page_size_bytes,
         )
         self.client = _WorkerLookupBridge(registration.identity, lookup_handler)  # type: ignore[assignment]

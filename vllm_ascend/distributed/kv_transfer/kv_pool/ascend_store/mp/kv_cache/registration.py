@@ -8,6 +8,8 @@ from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from .config import KVPoolConfigSpec
+
 if TYPE_CHECKING:
     from ..pool_scheduler import KVPoolScheduler
     from ..pool_worker import KVPoolWorker
@@ -59,6 +61,13 @@ class SchedulerIdentity:
             data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
         )
 
+    @classmethod
+    def from_config_spec(cls, config: KVPoolConfigSpec) -> "SchedulerIdentity":
+        return cls(
+            engine_id=config.kv_transfer_config.engine_id,
+            data_parallel_rank=config.parallel_config.data_parallel_rank,
+        )
+
 
 @dataclass(frozen=True)
 class WorkerIdentity:
@@ -82,12 +91,19 @@ class WorkerIdentity:
             data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
         )
 
+    @classmethod
+    def from_config_spec(cls, config: KVPoolConfigSpec) -> "WorkerIdentity":
+        return cls(
+            engine_id=config.kv_transfer_config.engine_id,
+            rank=config.parallel_config.rank,
+            data_parallel_rank=config.parallel_config.data_parallel_rank,
+        )
+
 
 @dataclass(frozen=True)
 class SchedulerRegistration:
     identity: SchedulerIdentity
-    vllm_config: VllmConfig
-    kv_cache_config: KVCacheConfig | None
+    config: KVPoolConfigSpec
     page_size_bytes: int
     session_id: str = _LEGACY_SESSION_ID
 
@@ -105,8 +121,7 @@ class SchedulerRegistration:
         _validate_rank(page_size_bytes, "page_size_bytes")
         return cls(
             identity=SchedulerIdentity.from_vllm_config(vllm_config),
-            vllm_config=vllm_config,
-            kv_cache_config=kv_cache_config,
+            config=KVPoolConfigSpec.from_vllm_config(vllm_config, kv_cache_config),
             page_size_bytes=page_size_bytes,
             session_id=session_id,
         )
@@ -115,8 +130,7 @@ class SchedulerRegistration:
 @dataclass(frozen=True)
 class WorkerRegistration:
     identity: WorkerIdentity
-    vllm_config: VllmConfig
-    kv_cache_config: KVCacheConfig | None
+    config: KVPoolConfigSpec
     session_id: str = _LEGACY_SESSION_ID
 
     def __post_init__(self) -> None:
@@ -131,7 +145,6 @@ class WorkerRegistration:
     ) -> "WorkerRegistration":
         return cls(
             identity=WorkerIdentity.from_vllm_config(vllm_config),
-            vllm_config=vllm_config,
-            kv_cache_config=kv_cache_config,
+            config=KVPoolConfigSpec.from_vllm_config(vllm_config, kv_cache_config),
             session_id=session_id,
         )

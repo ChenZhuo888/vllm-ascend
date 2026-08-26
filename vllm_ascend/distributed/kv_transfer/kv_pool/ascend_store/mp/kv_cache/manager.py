@@ -97,9 +97,10 @@ class KVCacheServiceManager:
     def _create_worker(registration: WorkerRegistration) -> "KVPoolWorker":
         from .pool.worker import MPKVPoolWorker
 
+        vllm_config, kv_cache_config = registration.config.build_runtime()
         return MPKVPoolWorker(
-            registration.vllm_config,
-            kv_cache_config=registration.kv_cache_config,
+            vllm_config,
+            kv_cache_config=kv_cache_config,
             rank=registration.identity.rank,
         )
 
@@ -363,16 +364,18 @@ class KVCacheServiceManager:
 
     @staticmethod
     def _validate_scheduler_registration(registration: SchedulerRegistration) -> None:
-        expected_identity = SchedulerIdentity.from_vllm_config(registration.vllm_config)
+        expected_identity = SchedulerIdentity.from_config_spec(registration.config)
         if registration.identity != expected_identity:
             raise ValueError(
-                f"Scheduler identity does not match VllmConfig: {registration.identity!r} != {expected_identity!r}"
+                f"Scheduler identity does not match registration config: "
+                f"{registration.identity!r} != {expected_identity!r}"
             )
 
     @staticmethod
     def _validate_worker_registration(registration: WorkerRegistration) -> None:
-        expected_identity = WorkerIdentity.from_vllm_config(registration.vllm_config)
+        expected_identity = WorkerIdentity.from_config_spec(registration.config)
         if registration.identity != expected_identity:
             raise ValueError(
-                f"Worker identity does not match VllmConfig: {registration.identity!r} != {expected_identity!r}"
+                f"Worker identity does not match registration config: "
+                f"{registration.identity!r} != {expected_identity!r}"
             )

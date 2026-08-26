@@ -9,6 +9,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LoadSpec,
     ReqMeta,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache import protocol as kv_cache_protocol
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     ACK_RESPONSE,
     KVCacheMethod,
@@ -147,6 +148,17 @@ def test_registration_round_trip_and_type_validation() -> None:
     mismatched_payloads = (b"other-engine", *scheduler_payloads[1:])
     with pytest.raises(MPProtocolError, match="identity does not match request header"):
         decode_registration_request(mismatched_payloads, SchedulerRegistration)
+
+
+def test_registration_size_is_checked_before_encoding_and_decoding(monkeypatch) -> None:
+    registration = SchedulerRegistration.create(_make_vllm_config(), None, 0)
+    payload = encode_registration(registration)
+    monkeypatch.setattr(kv_cache_protocol, "_MAX_REGISTRATION_BYTES", len(payload) - 1)
+
+    with pytest.raises(MPProtocolError, match="registration limit"):
+        encode_registration(registration)
+    with pytest.raises(MPProtocolError, match="registration limit"):
+        decode_registration((payload,), SchedulerRegistration)
 
 
 def test_service_session_round_trip() -> None:

@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.manager import KVCacheServiceManager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import encode_registration
@@ -45,21 +46,62 @@ class _FakeWorker:
         return 0
 
 
-def _make_vllm_config(engine_id: str = "engine-0", rank: int = 0, data_parallel_rank: int = 0, marker: str = ""):
+class _UnserializableRuntimeState:
+    def __reduce__(self):
+        raise AssertionError("runtime state must not enter a registration payload")
+
+
+def _make_vllm_config(
+    engine_id: str = "engine-0",
+    rank: int = 0,
+    data_parallel_rank: int = 0,
+    block_size: int = 16,
+):
     return SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
         kv_transfer_config=SimpleNamespace(engine_id=engine_id),
         parallel_config=SimpleNamespace(rank=rank, data_parallel_rank=data_parallel_rank),
-        marker=marker,
     )
 
 
-def _scheduler_registration(session_id: str, *, data_parallel_rank: int = 0, marker: str = ""):
+def _scheduler_registration(session_id: str, *, data_parallel_rank: int = 0, block_size: int = 16):
     return SchedulerRegistration.create(
-        _make_vllm_config(data_parallel_rank=data_parallel_rank, marker=marker),
+        _make_vllm_config(data_parallel_rank=data_parallel_rank, block_size=block_size),
         None,
         0,
         session_id=session_id,
     )
+
+
+def test_registration_projects_only_kv_pool_configuration() -> None:
+    config = _make_vllm_config()
+    config.model_config = SimpleNamespace(
+        model="org/model",
+        max_model_len=1024,
+        runtime_state=_UnserializableRuntimeState(),
+        runtime_tensor=torch.ones(1024),
+    )
+    config.compilation_config = _UnserializableRuntimeState()
+    config.kv_transfer_config.kv_role = "kv_both"
+    config.kv_transfer_config.kv_connector_extra_config = {"backend": "mooncake"}
+
+    registration = SchedulerRegistration.create(config, None, 4096)
+    payload = encode_registration(registration)
+    runtime_config, kv_cache_config = registration.config.build_runtime()
+
+    assert len(payload) < 64 * 1024
+    assert runtime_config.model_config.model == "org/model"
+    assert runtime_config.model_config.max_model_len == 1024
+    assert runtime_config.kv_transfer_config.kv_connector_extra_config == {"backend": "mooncake"}
+    assert kv_cache_config is None
+
+
+def test_registration_rejects_runtime_objects_in_extra_config() -> None:
+    config = _make_vllm_config()
+    config.kv_transfer_config.kv_connector_extra_config = {"tensor": torch.ones(1)}
+
+    with pytest.raises(TypeError, match="Unsupported registration configuration value Tensor"):
+        SchedulerRegistration.create(config, None, 0)
 
 
 def _worker_registration(session_id: str, *, data_parallel_rank: int = 0, rank: int = 0):
@@ -155,8 +197,8 @@ def test_conflicting_scheduler_registration_fails_while_original_is_registering(
         return _FakeScheduler()
 
     service_manager = _create_service_manager(scheduler_factory=scheduler_factory)
-    registration = _scheduler_registration("session-0", marker="first")
-    conflicting = _scheduler_registration("session-0", marker="second")
+    registration = _scheduler_registration("session-0", block_size=16)
+    conflicting = _scheduler_registration("session-0", block_size=32)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(service_manager.register_scheduler, registration, encode_registration(registration))

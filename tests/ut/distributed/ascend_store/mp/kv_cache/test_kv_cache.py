@@ -137,13 +137,13 @@ def _make_vllm_config(
     engine_id: str = "engine-0",
     rank: int = 0,
     data_parallel_rank: int = 0,
-    marker: str = "",
+    block_size: int = 16,
 ):
     parallel_config = SimpleNamespace(rank=rank, data_parallel_rank=data_parallel_rank)
     kv_transfer_config = SimpleNamespace(engine_id=engine_id)
     return SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
         kv_transfer_config=kv_transfer_config,
-        marker=marker,
         parallel_config=parallel_config,
     )
 
@@ -635,13 +635,13 @@ def test_registration_identity_uses_engine_id_dp_rank_and_worker_rank() -> None:
 
 def test_registration_is_idempotent_and_rejects_conflicts(kv_cache_server_url: str) -> None:
     registration = SchedulerRegistration.create(
-        _make_vllm_config(marker="first"),
+        _make_vllm_config(block_size=16),
         kv_cache_config=None,
         page_size_bytes=0,
     )
     payloads = encode_registration_request(registration)
     conflicting_registration = SchedulerRegistration.create(
-        _make_vllm_config(marker="second"),
+        _make_vllm_config(block_size=32),
         kv_cache_config=None,
         page_size_bytes=0,
     )

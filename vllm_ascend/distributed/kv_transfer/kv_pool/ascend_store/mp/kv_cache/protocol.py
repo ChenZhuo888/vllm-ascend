@@ -34,6 +34,7 @@ ACK_RESPONSE = b"OK"
 
 _INTEGER_BYTES = 8
 _BYTE_ORDER = "big"
+_MAX_REGISTRATION_BYTES = 8 * 1024 * 1024
 _SCHEDULER_REQUEST_PAYLOADS = 4
 _WORKER_REQUEST_PAYLOADS = 5
 
@@ -80,23 +81,33 @@ def decode_ack_response(responses: Sequence[bytes], method: KVCacheMethod) -> No
 
 def encode_registration(registration: _Registration) -> bytes:
     try:
-        return cloudpickle.dumps(registration)
+        payload = cloudpickle.dumps(registration)
     except Exception as exc:
         raise MPProtocolError(f"Failed to encode {type(registration).__name__}: {exc}") from exc
+    _validate_registration_size(payload, type(registration).__name__)
+    return payload
 
 
 def decode_registration(payloads: Sequence[bytes], expected_type: type[RegistrationT]) -> RegistrationT:
     payload = _single_response(payloads, expected_type.__name__)
+    _validate_registration_size(payload, expected_type.__name__)
     try:
         registration = cloudpickle.loads(payload)
     except Exception as exc:
-        # The wire error must carry the pickle root cause, otherwise a real
-        # VllmConfig failing to unpickle is undiagnosable from the client.
+        # Preserve the pickle root cause because the client cannot inspect a
+        # payload that failed inside the server process.
         raise MPProtocolError(f"Failed to decode {expected_type.__name__}: {exc}") from exc
 
     if not isinstance(registration, expected_type):
         raise MPProtocolError(f"Expected {expected_type.__name__}, got {type(registration).__name__}")
     return registration
+
+
+def _validate_registration_size(payload: bytes, name: str) -> None:
+    if len(payload) > _MAX_REGISTRATION_BYTES:
+        raise MPProtocolError(
+            f"{name} exceeds the {_MAX_REGISTRATION_BYTES}-byte registration limit: {len(payload)} bytes"
+        )
 
 
 def encode_registration_request(registration: _Registration) -> tuple[bytes, ...]:

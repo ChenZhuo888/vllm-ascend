@@ -66,13 +66,6 @@ def _run_smoke_server(endpoint_connection: Connection, control_connection: Conne
         vllm_logger.setLevel(logging.DEBUG)
         vllm_logger.addHandler(file_handler)
 
-        # A real VllmConfig pickles references to classes like DeviceOperator.
-        # Importing device_op directly deadlocks on a module cycle
-        # (device_op -> ops/__init__ -> fused_moe -> moe_mlp -> device_op);
-        # entering through the ops package first matches the order every
-        # vLLM engine process uses and lets device_op import cleanly.
-        import vllm_ascend.ops  # noqa: F401
-        from vllm_ascend.device import device_op  # noqa: F401
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheServer
 
         server = KVCacheServer(_SERVER_URL, max_workers=2)

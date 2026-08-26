@@ -2,10 +2,9 @@
 
 import threading
 from collections.abc import Callable
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
-from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from ....metadata import AscendConnectorMetadata
@@ -63,7 +62,7 @@ class MPKVPoolWorker(KVPoolWorker):
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
+        vllm_config: Any,
         store: WorkerBackend | None = None,
         kv_cache_config: KVCacheConfig | None = None,
         rank: int | None = None,
