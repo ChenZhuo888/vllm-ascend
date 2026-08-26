@@ -29,11 +29,12 @@ class MPMooncakeBackend(MooncakeBackend):
 
         self.set_device()
         transfer_engine = global_te.get_transfer_engine(get_ip(), device_name=None)
+        location = f"npu:{self.local_rank}"
         registered: list[int] = []
         with global_te.register_buffer_lock:
             try:
                 for ptr, length in zip(ptrs, lengths):
-                    result = transfer_engine.register_memory(ptr, length)
+                    result = transfer_engine.register_memory(ptr, length, location)
                     if result != 0:
                         raise RuntimeError(
                             f"Mooncake memory registration failed with code {result}: "

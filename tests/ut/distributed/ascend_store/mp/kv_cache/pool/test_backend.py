@@ -63,7 +63,7 @@ def test_mp_mooncake_backend_registers_and_unregisters_each_worker_region() -> N
     backend.register_buffer([10, 20], [4, 8])
     backend.unregister_buffer()
 
-    assert transfer_engine.register_memory.call_args_list == [((10, 4),), ((20, 8),)]
+    assert transfer_engine.register_memory.call_args_list == [((10, 4, "npu:1"),), ((20, 8, "npu:1"),)]
     assert transfer_engine.unregister_memory.call_args_list == [((20,),), ((10,),)]
 
 
