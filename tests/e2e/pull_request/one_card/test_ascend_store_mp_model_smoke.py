@@ -30,17 +30,18 @@ from tests.e2e.pull_request.one_card.test_ascend_store_mp_ipc import (
 _MODEL_ENV = "ASCEND_STORE_MP_SMOKE_MODEL"
 _HIT_LOG_PATTERN = re.compile(r"kvpool hit tokens: (\d+)")
 
-# Long enough that a hit spans many whole hash blocks (block size 16).
-_PROMPT = (
+# Repeat the context so it spans multiple whole Ascend hash blocks. The test
+# also verifies this against the engine's actual block size before generation.
+_PROMPT_CONTEXT = (
     "The history of computing machinery is a story of abstraction layers. "
     "Early machines were programmed by rewiring panels; then came stored programs, "
     "assemblers, compilers, and operating systems. Each layer hid the one below it "
     "and let programmers think in larger units. Modern inference stacks continue the "
     "same tradition: kernels hide accelerators, runtimes hide schedulers, and cache "
     "layers hide storage boundaries. A well-designed system lets each layer evolve "
-    "without renegotiating its contracts. With that in mind, summarize the guiding "
-    "principle in one sentence:"
+    "without renegotiating its contracts."
 )
+_PROMPT = " ".join([_PROMPT_CONTEXT] * 4) + " Summarize the guiding principle in one sentence:"
 
 
 def _model_path() -> str | None:
@@ -155,8 +156,8 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch) -> None:
 
     master_port = get_open_port()
     metrics_port = get_open_port()
-    try:
-        with MooncakeLauncher(master_port, metrics_port) as launcher:
+    with MooncakeLauncher(master_port, metrics_port) as launcher:
+        try:
             _wait_for_mooncake_master(launcher.process, master_port)
             config_path = tmp_path / "mooncake.json"
             config_path.write_text(
@@ -191,6 +192,11 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch) -> None:
 
             torch.npu.set_device(0)
             llm = _build_llm(model_path, server_result, monkeypatch)
+            block_size = llm.llm_engine.vllm_config.cache_config.block_size
+            prompt_token_count = len(llm.get_tokenizer().encode(_PROMPT))
+            assert prompt_token_count >= 2 * block_size, (
+                f"Smoke prompt has {prompt_token_count} tokens, but at least {2 * block_size} are required"
+            )
             first_output = _generate_once(llm)
             assert first_output.strip(), "First generation produced empty output"
 
@@ -203,16 +209,18 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch) -> None:
 
             hits = [int(value) for value in _HIT_LOG_PATTERN.findall(server_log.read_text())]
             assert hits and max(hits) > 0, "No external KV pool hit was recorded by the server"
-    except BaseException as exc:
-        failure = exc
-    finally:
-        endpoint_connection.close()
-        llm = None
-        gc.collect()
-        with contextlib.suppress(BrokenPipeError, EOFError, OSError):
-            control_connection.send("stop")
-        control_connection.close()
-        server_exitcode, server_forced = _stop_process(server)
+        except BaseException as exc:
+            failure = exc
+        finally:
+            endpoint_connection.close()
+            endpoint_child_connection.close()
+            control_child_connection.close()
+            with contextlib.suppress(BrokenPipeError, EOFError, OSError):
+                control_connection.send("stop")
+            control_connection.close()
+            server_exitcode, server_forced = _stop_process(server)
+            llm = None
+            gc.collect()
 
     if failure is not None:
         raise failure
