@@ -3,11 +3,11 @@ from dataclasses import replace
 import pytest
 import torch
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_memory import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
     export_worker_kv_caches,
     import_worker_kv_caches,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import KVCacheStorageSpec
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import KVCacheStorageSpec
 
 
 class _CPUMemoryAdapter:

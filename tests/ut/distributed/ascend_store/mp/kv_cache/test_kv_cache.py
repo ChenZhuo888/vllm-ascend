@@ -11,18 +11,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheMethod, KVCacheServer
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     encode_lookup_response,
     encode_registration_request,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import (
     SchedulerIdentity,
     SchedulerRegistration,
     WorkerIdentity,
     WorkerLookupHandler,
     WorkerRegistration,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import WorkerKVCacheSpec
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPClient,
     MPRemoteError,
@@ -31,7 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPServerUnavailableError,
 )
 
-KV_CACHE_CLIENT_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_client"
+KV_CACHE_CLIENT_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.client"
 _DEFAULT_URL = "tcp://127.0.0.1:*"
 _BLOCK_HASHES = [bytes.fromhex("01" * 32), bytes.fromhex("02" * 32)]
 

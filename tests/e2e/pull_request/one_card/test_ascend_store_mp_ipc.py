@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 if TYPE_CHECKING:
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import WorkerRegistration
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import WorkerKVCacheSpec
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import WorkerRegistration
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 
 _MESSAGE_TIMEOUT_S = 60.0
 _PROCESS_EXIT_TIMEOUT_S = 10.0
@@ -52,7 +52,7 @@ class _ObservedWorker:
     """Expose assertions from the real MPKVPoolWorker without adding test RPCs."""
 
     def __init__(self, registration: "WorkerRegistration", connection: Connection):
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.mp_pool_worker import MPKVPoolWorker
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.worker import MPKVPoolWorker
 
         self._connection = connection
         self._backend: _ObservedBackend | None = None
@@ -147,7 +147,7 @@ def _producer(connection: Connection) -> None:
         import torch
         import torch_npu  # noqa: F401
 
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_memory import (
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
             export_worker_kv_caches,
         )
 
@@ -182,7 +182,7 @@ def _consumer(connection: Connection, spec) -> None:
         import torch
         import torch_npu  # noqa: F401
 
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_memory import (
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
             import_worker_kv_caches,
         )
 

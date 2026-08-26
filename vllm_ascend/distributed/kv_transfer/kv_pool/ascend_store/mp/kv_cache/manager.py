@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.request import Request
 
-from .kv_cache_error import ServiceNotRegisteredError
+from ..rpc import TaskExecutor
+from ..service import ServiceLifecycleManager
+from .error import ServiceNotRegisteredError
 from .registration import (
     SchedulerFactory,
     SchedulerIdentity,
@@ -19,7 +21,7 @@ from .registration import (
     WorkerLookupHandler,
     WorkerRegistration,
 )
-from .request_view import (
+from .view import (
     BlocksView,
     ConnectorOutputView,
     RequestIdView,
@@ -27,12 +29,10 @@ from .request_view import (
     SchedulerOutputView,
     WorkerKVCacheSpec,
 )
-from .rpc import TaskExecutor
-from .service import ServiceLifecycleManager
 
 if TYPE_CHECKING:
-    from ..pool_scheduler import KVPoolScheduler
-    from ..pool_worker import KVPoolWorker
+    from ...pool_scheduler import KVPoolScheduler
+    from ...pool_worker import KVPoolWorker
 
 _LOOKUP_COORDINATOR_RANK = 0
 _SERVICE_LEASE_TIMEOUT_S = 60.0
@@ -86,13 +86,13 @@ class KVCacheServiceManager:
     def _create_scheduler(
         registration: SchedulerRegistration, lookup_handler: WorkerLookupHandler
     ) -> "KVPoolScheduler":
-        from .mp_pool_scheduler import MPKVPoolScheduler
+        from .pool.scheduler import MPKVPoolScheduler
 
         return MPKVPoolScheduler(registration, lookup_handler)
 
     @staticmethod
     def _create_worker(registration: WorkerRegistration) -> "KVPoolWorker":
-        from .mp_pool_worker import MPKVPoolWorker
+        from .pool.worker import MPKVPoolWorker
 
         return MPKVPoolWorker(
             registration.vllm_config,

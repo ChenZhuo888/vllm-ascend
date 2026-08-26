@@ -5,12 +5,12 @@ import torch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.mp_pool_worker import MPKVPoolWorker
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_memory import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.worker import MPKVPoolWorker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
     export_worker_kv_caches,
     import_worker_kv_caches,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import KVCacheStorageSpec
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import KVCacheStorageSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
 # isort: on

@@ -2,13 +2,13 @@ import threading
 from functools import partial
 from types import SimpleNamespace
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import encode_registration
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_service import KVCacheServiceManager
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.manager import KVCacheServiceManager
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import encode_registration
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import (
     SchedulerRegistration,
     WorkerRegistration,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import WorkerKVCacheSpec
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import AffinityExecutor
 
 _BLOCK_HASHES = [bytes.fromhex("01" * 32), bytes.fromhex("02" * 32)]

@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     ACK_RESPONSE,
     KVCacheMethod,
     decode_ack_response,
@@ -37,13 +37,13 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protoc
     scheduler_affinity_key,
     worker_affinity_key,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import (
     SchedulerIdentity,
     SchedulerRegistration,
     WorkerIdentity,
     WorkerRegistration,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import (
     KVCacheStorageSpec,
     KVCacheTensorSpec,
     WorkerKVCacheSpec,

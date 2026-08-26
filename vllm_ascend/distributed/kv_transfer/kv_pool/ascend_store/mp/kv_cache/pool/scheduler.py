@@ -4,9 +4,9 @@ from collections.abc import Sequence
 
 from vllm.v1.core.kv_cache_utils import BlockHash
 
-from ..pool_scheduler import KVPoolScheduler
-from .registration import SchedulerIdentity, SchedulerRegistration, WorkerLookupHandler
-from .request_view import BlockPoolProxy, SchedulerOutputView
+from ....pool_scheduler import KVPoolScheduler
+from ..registration import SchedulerIdentity, SchedulerRegistration, WorkerLookupHandler
+from ..view import BlockPoolProxy, SchedulerOutputView
 
 
 class _WorkerLookupBridge:

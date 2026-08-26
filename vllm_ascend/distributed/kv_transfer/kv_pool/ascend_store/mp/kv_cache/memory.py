@@ -6,7 +6,7 @@ from typing import Protocol
 import cloudpickle
 import torch
 
-from .request_view import KVCacheStorageSpec, KVCacheTensorSpec, WorkerKVCacheSpec
+from .view import KVCacheStorageSpec, KVCacheTensorSpec, WorkerKVCacheSpec
 
 TORCH_NPU_IPC_HANDLE = "torch_npu_ipc"
 TORCH_NPU_IPC_VERSION = 1

@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_protocol import encode_registration
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_service import KVCacheServiceManager
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.manager import KVCacheServiceManager
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import encode_registration
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import (
     SchedulerRegistration,
     WorkerRegistration,
 )

@@ -11,13 +11,14 @@ from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
 
+from ..rpc import MPProtocolError
 from .registration import (
     SchedulerIdentity,
     SchedulerRegistration,
     WorkerIdentity,
     WorkerRegistration,
 )
-from .request_view import (
+from .view import (
     BlocksView,
     CachedReqsView,
     RequestView,
@@ -25,7 +26,6 @@ from .request_view import (
     SchedulerOutputView,
     WorkerKVCacheSpec,
 )
-from .rpc import MPProtocolError
 
 ACK_RESPONSE = b"OK"
 

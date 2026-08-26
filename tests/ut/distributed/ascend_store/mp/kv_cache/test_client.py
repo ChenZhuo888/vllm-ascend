@@ -6,17 +6,17 @@ import pytest
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_client import _RegistrationState
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_error import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.client import _RegistrationState
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.error import (
     SERVICE_NOT_REGISTERED_PREFIX,
     STALE_SESSION_PREFIX,
     ServiceSessionExpiredError,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import (
     SchedulerRegistration,
     WorkerRegistration,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import WorkerKVCacheSpec
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPRemoteError,
     MPRequestTimeoutError,
@@ -26,7 +26,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
 
 # isort: on
 
-CLIENT_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_client"
+CLIENT_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.client"
 
 
 def _make_config() -> SimpleNamespace:

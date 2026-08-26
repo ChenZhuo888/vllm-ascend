@@ -4,10 +4,10 @@ The implementation lives in focused client, server, protocol, and service module
 import path for callers.
 """
 
-from .kv_cache_client import KVCacheClient
-from .kv_cache_error import ServiceNotRegisteredError, ServiceSessionExpiredError
-from .kv_cache_protocol import KVCacheMethod
-from .kv_cache_server import KVCacheServer
+from .client import KVCacheClient
+from .error import ServiceNotRegisteredError, ServiceSessionExpiredError
+from .protocol import KVCacheMethod
+from .server import KVCacheServer
 
 __all__ = [
     "KVCacheClient",

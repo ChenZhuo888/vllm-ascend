@@ -9,12 +9,12 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
     RequestTracker,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.mp_pool_scheduler import MPKVPoolScheduler
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.registration import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.scheduler import MPKVPoolScheduler
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import (
     SchedulerIdentity,
     SchedulerRegistration,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import (
     BlocksView,
     CachedReqsView,
     ConnectorOutputView,

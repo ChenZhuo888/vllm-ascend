@@ -9,9 +9,9 @@ import torch
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from ..pool_worker import KVPoolWorker
-from .kv_cache_memory import ImportedKVCache, import_worker_kv_caches
-from .request_view import WorkerKVCacheSpec
+from ....pool_worker import KVPoolWorker
+from ..memory import ImportedKVCache, import_worker_kv_caches
+from ..view import WorkerKVCacheSpec
 
 
 class LookupStore(Protocol):

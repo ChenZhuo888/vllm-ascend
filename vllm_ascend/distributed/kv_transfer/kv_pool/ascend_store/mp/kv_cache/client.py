@@ -14,13 +14,20 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 
-from .kv_cache_error import (
+from ..rpc import (
+    MPClient,
+    MPRemoteError,
+    MPRequestTimeoutError,
+    MPServerBusyError,
+    MPServerUnavailableError,
+)
+from .error import (
     SERVICE_NOT_REGISTERED_PREFIX,
     STALE_SESSION_PREFIX,
     ServiceNotRegisteredError,
     ServiceSessionExpiredError,
 )
-from .kv_cache_protocol import (
+from .protocol import (
     KVCacheMethod,
     decode_ack_response,
     decode_build_connector_meta_response,
@@ -38,14 +45,7 @@ from .kv_cache_protocol import (
     encode_worker_session,
 )
 from .registration import SchedulerRegistration, WorkerRegistration
-from .request_view import WorkerKVCacheSpec
-from .rpc import (
-    MPClient,
-    MPRemoteError,
-    MPRequestTimeoutError,
-    MPServerBusyError,
-    MPServerUnavailableError,
-)
+from .view import WorkerKVCacheSpec
 
 logger = logging.getLogger(__name__)
 

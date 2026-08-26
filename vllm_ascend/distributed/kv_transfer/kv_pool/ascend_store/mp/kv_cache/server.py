@@ -6,8 +6,17 @@ from typing import cast
 
 from vllm.v1.request import Request
 
-from ..metadata import AscendStoreKVConnectorWorkerMetadata
-from .kv_cache_protocol import (
+from ...metadata import AscendStoreKVConnectorWorkerMetadata
+from ..rpc import (
+    AffinityExecutor,
+    InlineExecutor,
+    MPServer,
+    MPServerBusyError,
+    Route,
+)
+from ..service import ServiceBusyError
+from .manager import KVCacheServiceManager
+from .protocol import (
     ACK_RESPONSE,
     KVCacheMethod,
     decode_build_connector_meta_request,
@@ -26,22 +35,13 @@ from .kv_cache_protocol import (
     scheduler_affinity_key,
     worker_affinity_key,
 )
-from .kv_cache_service import KVCacheServiceManager
 from .registration import (
     SchedulerFactory,
     SchedulerRegistration,
     WorkerFactory,
     WorkerRegistration,
 )
-from .request_view import ConnectorOutputView
-from .rpc import (
-    AffinityExecutor,
-    InlineExecutor,
-    MPServer,
-    MPServerBusyError,
-    Route,
-)
-from .service import ServiceBusyError
+from .view import ConnectorOutputView
 
 _MAX_PENDING_REQUESTS = 64
 

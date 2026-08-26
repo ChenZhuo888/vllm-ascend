@@ -21,11 +21,11 @@ from vllm.v1.request import Request
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreKVEvents
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendStoreKVConnectorWorkerMetadata
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache_memory import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
     ExportedKVCache,
     export_worker_kv_caches,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.request_view import WorkerKVCacheSpec
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
