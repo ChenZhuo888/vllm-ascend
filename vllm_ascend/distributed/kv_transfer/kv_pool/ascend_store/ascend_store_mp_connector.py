@@ -295,6 +295,10 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
             raise TypeError(f"Expected AscendConnectorMetadata, got {type(metadata).__name__}")
         return self._kv_cache_client.get_finished(finished_req_ids, metadata)
 
+    def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
+        self._require_worker_role("build_connector_worker_meta")
+        return self._kv_cache_client.build_connector_worker_meta()
+
     def shutdown(self) -> None:
         try:
             self._kv_cache_client.close()

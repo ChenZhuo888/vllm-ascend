@@ -5,7 +5,10 @@ import pytest
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendConnectorMetadata,
+    AscendStoreKVConnectorWorkerMetadata,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.client import _RegistrationState
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.error import (
@@ -18,6 +21,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
     WorkerRegistration,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
+    encode_build_connector_worker_meta_response,
     encode_get_finished_response,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
@@ -139,6 +143,27 @@ def test_worker_get_finished_degrades_to_empty_sets_when_busy() -> None:
         client = _configure_mock_worker_client(client_class, MPServerBusyError("busy"))
 
         assert client.get_finished(set(), AscendConnectorMetadata(set(), set())) == (set(), set())
+
+
+def test_worker_build_connector_meta_uses_worker_rpc() -> None:
+    metadata = AscendStoreKVConnectorWorkerMetadata({7: 1})
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(
+            client_class,
+            [list(encode_build_connector_worker_meta_response(metadata))],
+        )
+
+        assert client.build_connector_worker_meta() == metadata
+
+        request = client_class.return_value.request
+        assert request.call_args.args[0].value == "BUILD_CONNECTOR_WORKER_META"
+
+
+def test_worker_build_connector_meta_degrades_to_none_when_busy() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, MPServerBusyError("busy"))
+
+        assert client.build_connector_worker_meta() is None
 
 
 def test_update_state_after_alloc_degrades_silently_on_timeout() -> None:

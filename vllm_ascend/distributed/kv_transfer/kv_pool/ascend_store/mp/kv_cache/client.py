@@ -14,7 +14,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 
-from ...metadata import AscendConnectorMetadata
+from ...metadata import AscendConnectorMetadata, AscendStoreKVConnectorWorkerMetadata
 from ..rpc import (
     MPClient,
     MPRemoteError,
@@ -32,11 +32,13 @@ from .protocol import (
     KVCacheMethod,
     decode_ack_response,
     decode_build_connector_meta_response,
+    decode_build_connector_worker_meta_response,
     decode_get_finished_response,
     decode_lookup_response,
     decode_request_finished_response,
     decode_update_connector_output_response,
     encode_build_connector_meta_request,
+    encode_build_connector_worker_meta_request,
     encode_get_finished_request,
     encode_lookup_request,
     encode_register_kv_caches_request,
@@ -391,6 +393,17 @@ class KVCacheClient:
             timeout_ms,
         )
         return decode_get_finished_response(responses) if responses is not None else (set(), set())
+
+    def build_connector_worker_meta(
+        self,
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> AscendStoreKVConnectorWorkerMetadata | None:
+        responses = self._worker_rpc(
+            KVCacheMethod.BUILD_CONNECTOR_WORKER_META,
+            encode_build_connector_worker_meta_request,
+            timeout_ms,
+        )
+        return decode_build_connector_worker_meta_response(responses) if responses is not None else None
 
     def lookup(
         self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS

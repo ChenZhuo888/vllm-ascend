@@ -4,6 +4,7 @@ import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
+    AscendStoreKVConnectorWorkerMetadata,
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
@@ -12,6 +13,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     decode_ack_response,
     decode_build_connector_meta_request,
     decode_build_connector_meta_response,
+    decode_build_connector_worker_meta_request,
+    decode_build_connector_worker_meta_response,
     decode_get_finished_request,
     decode_get_finished_response,
     decode_lookup_request,
@@ -29,6 +32,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     decode_worker_session,
     encode_build_connector_meta_request,
     encode_build_connector_meta_response,
+    encode_build_connector_worker_meta_request,
+    encode_build_connector_worker_meta_response,
     encode_get_finished_request,
     encode_get_finished_response,
     encode_lookup_request,
@@ -215,6 +220,27 @@ def test_get_finished_round_trip() -> None:
     assert decoded_metadata.delayed_free_req_ids == {"saving-0"}
     response = encode_get_finished_response({"saving-0"}, {"loading-0"})
     assert decode_get_finished_response(response) == ({"saving-0"}, {"loading-0"})
+
+
+def test_build_connector_worker_meta_round_trip() -> None:
+    registration = WorkerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        session_id="worker-session",
+    )
+
+    payloads = encode_build_connector_worker_meta_request(registration)
+
+    assert worker_affinity_key(b"client", payloads) == registration.identity
+    assert decode_build_connector_worker_meta_request(payloads) == (
+        registration.identity,
+        registration.session_id,
+    )
+    metadata = AscendStoreKVConnectorWorkerMetadata({7: 1, 9: 1})
+    assert (
+        decode_build_connector_worker_meta_response(encode_build_connector_worker_meta_response(metadata)) == metadata
+    )
+    assert decode_build_connector_worker_meta_response(encode_build_connector_worker_meta_response(None)) is None
 
 
 def test_lookup_request_preserves_required_fields_and_response_round_trip() -> None:

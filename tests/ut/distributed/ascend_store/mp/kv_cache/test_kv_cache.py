@@ -10,7 +10,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendConnectorMetadata,
+    AscendStoreKVConnectorWorkerMetadata,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheMethod, KVCacheServer
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     encode_lookup_response,
@@ -66,6 +69,10 @@ class _FakeWorker:
         metadata: AscendConnectorMetadata,
     ) -> tuple[set[str], set[str]]:
         return finished_req_ids & metadata.delayed_free_req_ids, finished_req_ids & metadata.loading_req_ids
+
+    @staticmethod
+    def build_connector_worker_meta() -> AscendStoreKVConnectorWorkerMetadata:
+        return AscendStoreKVConnectorWorkerMetadata({7: 1})
 
 
 class _FakeScheduler:
@@ -492,6 +499,23 @@ def test_worker_get_finished_round_trip() -> None:
             {"saving-0"},
             {"loading-0"},
         )
+    finally:
+        client.close()
+        _stop_server(process)
+
+
+def test_worker_build_connector_meta_round_trip() -> None:
+    process, endpoint = _start_server()
+    client = KVCacheClient(endpoint)
+
+    try:
+        _wait_until_connected(client)
+        assert client.register_worker(_make_vllm_config(), kv_cache_config=None)
+
+        metadata = client.build_connector_worker_meta()
+
+        assert isinstance(metadata, AscendStoreKVConnectorWorkerMetadata)
+        assert metadata.completed_events == {7: 1}
     finally:
         client.close()
         _stop_server(process)

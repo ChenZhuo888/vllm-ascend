@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.request import Request
 
-from ...metadata import AscendConnectorMetadata
+from ...metadata import AscendConnectorMetadata, AscendStoreKVConnectorWorkerMetadata
 from ..rpc import TaskExecutor
 from ..service import ServiceLifecycleManager
 from .error import ServiceNotRegisteredError
@@ -179,6 +179,16 @@ class KVCacheServiceManager:
         if worker is None:
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
         return worker.get_finished(finished_req_ids, metadata)
+
+    def build_connector_worker_meta(
+        self,
+        identity: WorkerIdentity,
+        session_id: str,
+    ) -> AscendStoreKVConnectorWorkerMetadata | None:
+        worker = self._workers.get_for_session(identity, session_id)
+        if worker is None:
+            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        return worker.build_connector_worker_meta()
 
     def lookup(
         self,

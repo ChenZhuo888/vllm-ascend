@@ -6,7 +6,11 @@ import torch
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata, ReqMeta
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    AscendConnectorMetadata,
+    AscendStoreKVConnectorWorkerMetadata,
+    ReqMeta,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_mp_connector import (
     AscendStoreMPConnector,
     AscendStoreMPConnectorMetadata,
@@ -189,6 +193,19 @@ def test_worker_get_finished_returns_empty_sets_for_degraded_metadata() -> None:
         assert connector.get_finished({"request-0"}) == (set(), set())
 
     client_class.return_value.get_finished.assert_not_called()
+
+
+def test_worker_build_connector_meta_delegates_to_client() -> None:
+    config = _make_vllm_config()
+    metadata = AscendStoreKVConnectorWorkerMetadata({7: 1})
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.build_connector_worker_meta.return_value = metadata
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+
+        assert connector.build_connector_worker_meta() is metadata
+
+    client_class.return_value.build_connector_worker_meta.assert_called_once_with()
 
 
 def test_worker_keeps_exported_cache_alive_until_shutdown() -> None:

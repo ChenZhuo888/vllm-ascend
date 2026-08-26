@@ -11,7 +11,7 @@ from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
 
-from ...metadata import AscendConnectorMetadata
+from ...metadata import AscendConnectorMetadata, AscendStoreKVConnectorWorkerMetadata
 from ..rpc import MPProtocolError
 from .registration import (
     SchedulerIdentity,
@@ -55,6 +55,7 @@ class KVCacheMethod(str, enum.Enum):
     UPDATE_CONNECTOR_OUTPUT = "UPDATE_CONNECTOR_OUTPUT"
     WAIT_FOR_SAVE = "WAIT_FOR_SAVE"
     GET_FINISHED = "GET_FINISHED"
+    BUILD_CONNECTOR_WORKER_META = "BUILD_CONNECTOR_WORKER_META"
 
 
 @dataclass
@@ -244,6 +245,36 @@ def decode_get_finished_response(responses: Sequence[bytes]) -> tuple[set[str], 
         "done_recving",
     )
     return _decode_text_set(done_sending, "done_sending"), _decode_text_set(done_recving, "done_recving")
+
+
+def encode_build_connector_worker_meta_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
+    return _encode_worker_request(registration, {}, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
+
+
+def decode_build_connector_worker_meta_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
+    method = KVCacheMethod.BUILD_CONNECTOR_WORKER_META
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    if body:
+        raise MPProtocolError(f"{method.value} body must be empty")
+    return identity, session_id
+
+
+def encode_build_connector_worker_meta_response(
+    metadata: AscendStoreKVConnectorWorkerMetadata | None,
+) -> tuple[bytes, ...]:
+    if metadata is not None and not isinstance(metadata, AscendStoreKVConnectorWorkerMetadata):
+        raise TypeError(f"metadata must be AscendStoreKVConnectorWorkerMetadata or None, got {type(metadata).__name__}")
+    return _encode_response(KVCacheMethod.BUILD_CONNECTOR_WORKER_META, {"metadata": metadata})
+
+
+def decode_build_connector_worker_meta_response(
+    responses: Sequence[bytes],
+) -> AscendStoreKVConnectorWorkerMetadata | None:
+    body = _decode_response(responses, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
+    (metadata,) = _body_fields(body, "BUILD_CONNECTOR_WORKER_META response", "metadata")
+    if metadata is not None:
+        _require_type(metadata, AscendStoreKVConnectorWorkerMetadata, "metadata")
+    return metadata
 
 
 def scheduler_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
