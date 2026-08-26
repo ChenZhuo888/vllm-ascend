@@ -35,7 +35,10 @@ class MPMooncakeBackend(MooncakeBackend):
                 for ptr, length in zip(ptrs, lengths):
                     result = transfer_engine.register_memory(ptr, length)
                     if result != 0:
-                        raise RuntimeError(f"Mooncake memory registration failed with code {result}")
+                        raise RuntimeError(
+                            f"Mooncake memory registration failed with code {result}: "
+                            f"address=0x{ptr:x}, length={length}"
+                        )
                     registered.append(ptr)
             except BaseException:
                 for ptr in reversed(registered):
