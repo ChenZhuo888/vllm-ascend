@@ -1,5 +1,7 @@
 import contextlib
+import json
 import multiprocessing
+import socket
 import threading
 import time
 import traceback
@@ -19,6 +21,7 @@ _MESSAGE_TIMEOUT_S = 60.0
 _PROCESS_EXIT_TIMEOUT_S = 10.0
 _PRODUCER_RELEASE_TIMEOUT_S = 90.0
 _CLIENT_CONNECT_TIMEOUT_S = 30.0
+_MOONCAKE_START_TIMEOUT_S = 30.0
 _SERVER_URL = "tcp://127.0.0.1:*"
 
 
@@ -333,7 +336,7 @@ def _request_server_stop(server, connection: Connection) -> None:
 
 def _run_kv_cache_server(
     endpoint_connection: Connection,
-    observation_connection: Connection,
+    observation_connection: Connection | None,
     control_connection: Connection,
 ) -> None:
     server = None
@@ -341,14 +344,12 @@ def _run_kv_cache_server(
     try:
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheServer
 
-        server = KVCacheServer(
-            _SERVER_URL,
-            max_workers=2,
-            worker_factory=partial(
-                _create_observed_worker,
-                observation_connection=observation_connection,
-            ),
+        worker_factory = (
+            partial(_create_observed_worker, observation_connection=observation_connection)
+            if observation_connection is not None
+            else None
         )
+        server = KVCacheServer(_SERVER_URL, max_workers=2, worker_factory=worker_factory)
         control_thread = threading.Thread(
             target=_request_server_stop,
             args=(server, control_connection),
@@ -363,8 +364,9 @@ def _run_kv_cache_server(
         error = traceback.format_exc()
         with contextlib.suppress(BrokenPipeError, EOFError, OSError):
             endpoint_connection.send(("error", error))
-        with contextlib.suppress(BrokenPipeError, EOFError, OSError):
-            observation_connection.send(("server_error", error))
+        if observation_connection is not None:
+            with contextlib.suppress(BrokenPipeError, EOFError, OSError):
+                observation_connection.send(("server_error", error))
         raise
     finally:
         if server is not None and not server.close():
@@ -372,8 +374,22 @@ def _run_kv_cache_server(
         if control_thread is not None:
             control_thread.join(_PROCESS_EXIT_TIMEOUT_S)
         endpoint_connection.close()
-        observation_connection.close()
+        if observation_connection is not None:
+            observation_connection.close()
         control_connection.close()
+
+
+def _wait_for_mooncake_master(process, port: int) -> None:
+    deadline = time.monotonic() + _MOONCAKE_START_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"mooncake_master exited with code {process.returncode}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise TimeoutError("Timed out waiting for mooncake_master")
 
 
 def _receive(connection: Connection, process_name: str):
@@ -614,4 +630,152 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
         raise failure
     if server_forced:
         pytest.fail("KV cache server did not stop after releasing its Worker mapping")
+    assert server_exitcode == 0
+
+
+def test_real_mooncake_backend_store_and_retrieve(tmp_path, monkeypatch) -> None:
+    import torch
+    import torch_npu  # noqa: F401
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+    from vllm.utils.network_utils import get_open_port
+
+    from tests.e2e.conftest import MooncakeLauncher
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_mp_connector import (
+        AscendStoreMPConnector,
+    )
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+        AscendConnectorMetadata,
+        LoadSpec,
+        ReqMeta,
+    )
+
+    if not torch.npu.is_available():
+        raise RuntimeError("NPU is not available in the Worker process")
+
+    context = multiprocessing.get_context("spawn")
+    endpoint_connection, endpoint_child_connection = context.Pipe()
+    control_connection, control_child_connection = context.Pipe()
+    server = None
+    connector = None
+    failure: BaseException | None = None
+    server_exitcode = None
+    server_forced = False
+
+    master_port = get_open_port()
+    metrics_port = get_open_port()
+    with MooncakeLauncher(master_port, metrics_port) as launcher:
+        _wait_for_mooncake_master(launcher.process, master_port)
+        config_path = tmp_path / "mooncake.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "metadata_server": "P2PHANDSHAKE",
+                    "protocol": "ascend",
+                    "device_name": "",
+                    "master_server_address": f"127.0.0.1:{master_port}",
+                    "global_segment_size": "1GB",
+                    "local_buffer_size": "64MB",
+                    "preferred_segment": False,
+                    "prefer_alloc_in_same_node": True,
+                }
+            )
+        )
+        monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(config_path))
+        monkeypatch.setenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0")
+        monkeypatch.delenv("MOONCAKE_MASTER", raising=False)
+        monkeypatch.delenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", raising=False)
+
+        server = context.Process(
+            target=_run_kv_cache_server,
+            args=(endpoint_child_connection, None, control_child_connection),
+            name="kv-cache-mooncake-server",
+        )
+        server.start()
+        endpoint_child_connection.close()
+        control_child_connection.close()
+        try:
+            server_status, server_result = _receive(endpoint_connection, "KV cache server")
+            if server_status != "ready":
+                raise RuntimeError(f"KV cache server failed to start:\n{server_result}")
+
+            torch.npu.set_device(0)
+            connector = AscendStoreMPConnector(
+                _make_worker_config(server_result),
+                KVConnectorRole.WORKER,
+                kv_cache_config=None,
+            )
+            _wait_until_connected(connector._kv_cache_client)
+            _wait_until_registered(connector._kv_cache_client)
+
+            first_layer = torch.full((4, 4), 13, dtype=torch.float16, device="npu")
+            second_layer = torch.full((4, 4), 17, dtype=torch.float16, device="npu")
+            torch.npu.synchronize()
+            connector.register_kv_caches(
+                {
+                    "model.layers.0.attn": first_layer,
+                    "model.layers.1.attn": second_layer,
+                }
+            )
+            _wait_for_active_export(connector, generation=1)
+
+            store_metadata = AscendConnectorMetadata(
+                set(),
+                set(),
+                delayed_free_req_ids={"store-request"},
+            )
+            store_metadata.add_request(
+                ReqMeta(
+                    "store-request",
+                    token_len_chunk=16,
+                    block_ids=[1],
+                    block_hashes=["real-mooncake-hash"],
+                    can_save=True,
+                )
+            )
+            connector.bind_connector_metadata(store_metadata)
+            connector.wait_for_save()
+            assert connector.get_finished({"store-request"}) == ({"store-request"}, set())
+            connector.clear_connector_metadata()
+
+            first_layer.zero_()
+            second_layer.zero_()
+            torch.npu.synchronize()
+
+            load_metadata = AscendConnectorMetadata(set(), set())
+            load_metadata.add_request(
+                ReqMeta(
+                    "load-request",
+                    token_len_chunk=16,
+                    block_ids=[1],
+                    block_hashes=["real-mooncake-hash"],
+                    load_spec=LoadSpec(0, 16, True),
+                )
+            )
+            connector.bind_connector_metadata(load_metadata)
+            connector.start_load_kv(None)
+            torch.npu.synchronize()
+
+            expected_first_layer = torch.zeros((4, 4), dtype=torch.float16)
+            expected_first_layer[1].fill_(13)
+            expected_second_layer = torch.zeros((4, 4), dtype=torch.float16)
+            expected_second_layer[1].fill_(17)
+            assert torch.equal(first_layer.cpu(), expected_first_layer)
+            assert torch.equal(second_layer.cpu(), expected_second_layer)
+            assert connector.get_block_ids_with_load_errors() == set()
+            connector.clear_connector_metadata()
+        except BaseException as exc:
+            failure = exc
+        finally:
+            endpoint_connection.close()
+            if connector is not None:
+                connector.shutdown()
+            with contextlib.suppress(BrokenPipeError, EOFError, OSError):
+                control_connection.send("stop")
+            control_connection.close()
+            server_exitcode, server_forced = _stop_process(server)
+
+    if failure is not None:
+        raise failure
+    if server_forced:
+        pytest.fail("KV cache server did not stop after closing the Mooncake Worker")
     assert server_exitcode == 0
