@@ -24,7 +24,7 @@ def test_mp_memcache_backend_unregisters_owned_buffers_before_close() -> None:
     store.register_buffer.return_value = 0
     store.unregister_buffer.return_value = 0
     with patch.object(MemcacheBackend, "_setup_store", return_value=store):
-        backend = MPMemcacheBackend(MagicMock(), local_rank=2)
+        backend = MPMemcacheBackend(MagicMock(), device_index=2)
 
     backend.register_buffer([10, 20], [4, 8])
     backend.close()
@@ -39,7 +39,7 @@ def test_mp_memcache_backend_retries_only_failed_buffer_unregistration() -> None
     store.register_buffer.return_value = 0
     store.unregister_buffer.side_effect = [0, -1, 0]
     with patch.object(MemcacheBackend, "_setup_store", return_value=store):
-        backend = MPMemcacheBackend(MagicMock(), local_rank=2)
+        backend = MPMemcacheBackend(MagicMock(), device_index=2)
 
     backend.register_buffer([10, 20], [4, 8])
     with pytest.raises(RuntimeError, match="unregistration failed"):
@@ -55,7 +55,7 @@ def test_mp_mooncake_backend_registers_and_unregisters_each_worker_region() -> N
     transfer_engine.unregister_memory.return_value = 0
     global_te.get_transfer_engine.return_value = transfer_engine
     backend = object.__new__(MPMooncakeBackend)
-    backend.local_rank = 1
+    backend.device_index = 1
     backend._use_fabric_mem = False
     backend._mp_registered_ptrs = []
     backend.store = MagicMock()
@@ -73,7 +73,7 @@ def test_mp_mooncake_backend_rolls_back_failed_memory_registration() -> None:
     transfer_engine.unregister_memory.return_value = 0
     global_te.get_transfer_engine.return_value = transfer_engine
     backend = object.__new__(MPMooncakeBackend)
-    backend.local_rank = 1
+    backend.device_index = 1
     backend._use_fabric_mem = False
     backend._mp_registered_ptrs = []
     backend.store = MagicMock()
@@ -91,7 +91,7 @@ def test_mp_mooncake_backend_retries_only_failed_memory_unregistration() -> None
     transfer_engine.unregister_memory.side_effect = [0, -1, 0]
     global_te.get_transfer_engine.return_value = transfer_engine
     backend = object.__new__(MPMooncakeBackend)
-    backend.local_rank = 1
+    backend.device_index = 1
     backend._use_fabric_mem = False
     backend._mp_registered_ptrs = []
     backend.store = MagicMock()

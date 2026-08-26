@@ -8,9 +8,9 @@ from .....backend.memcache_backend import MemcacheBackend
 class MPMemcacheBackend(MemcacheBackend):
     """Add explicit buffer and store cleanup to the original backend."""
 
-    def __init__(self, parallel_config: Any, local_rank: int, lazy_init: bool = False):
+    def __init__(self, parallel_config: Any, device_index: int, lazy_init: bool = False):
         self._mp_registered_buffers: list[tuple[int, int]] = []
-        super().__init__(parallel_config, local_rank=local_rank, lazy_init=lazy_init)
+        super().__init__(parallel_config, local_rank=device_index, lazy_init=lazy_init)
 
     def register_buffer(self, ptrs: list[int], sizes: list[int]) -> None:
         if self._mp_registered_buffers or self._pending_buffers is not None:

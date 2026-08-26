@@ -10,13 +10,13 @@ from .....backend.yuanrong_backend import YuanrongBackend
 class MPYuanrongBackend(YuanrongBackend):
     """Use YuanRong modes that do not leave process-owned registrations behind."""
 
-    def __init__(self, parallel_config: Any, local_rank: int, lazy_init: bool = False):
+    def __init__(self, parallel_config: Any, device_index: int, lazy_init: bool = False):
         del lazy_init
-        self.local_rank = local_rank
+        self.device_index = device_index
         super().__init__(parallel_config)
 
     def set_device(self) -> None:
-        torch.npu.set_device(self.local_rank)
+        torch.npu.set_device(self.device_index)
 
     def register_buffer(self, ptrs: list[int], lengths: list[int]) -> None:
         if self._needs_dev_mem_pregister:

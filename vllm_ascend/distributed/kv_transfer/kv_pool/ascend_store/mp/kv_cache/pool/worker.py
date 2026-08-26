@@ -93,7 +93,7 @@ class MPKVPoolWorker(KVPoolWorker):
     def _init_parallelism_info(self, model_config, parallel_config) -> None:
         # The server process has no distributed group to query, so the same
         # rank fields are derived arithmetically from the registered rank.
-        self.local_rank = 0
+        self.device_index: int | None = None
         use_mla = getattr(model_config, "use_mla", False)
         self.use_mla = isinstance(use_mla, bool) and use_mla
         self.use_sparse = hasattr(model_config.hf_text_config, "index_topk")
@@ -204,13 +204,13 @@ class MPKVPoolWorker(KVPoolWorker):
         self._imported_kv_cache = imported
         self.kv_cache_spec = spec
         self.kv_caches = imported.tensors
-        if imported.device_index is not None:
-            self.local_rank = imported.device_index
+        self.device_index = imported.device_index
 
     def _clear_generation(self) -> None:
         self._imported_kv_cache = None
         self.kv_cache_spec = None
         self.kv_caches = {}
+        self.device_index = None
 
     def _activate_backend(self, device_index: int | None) -> None:
         if self._store_is_external:

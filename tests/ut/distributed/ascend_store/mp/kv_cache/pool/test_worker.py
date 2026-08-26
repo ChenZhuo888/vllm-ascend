@@ -111,6 +111,7 @@ def test_mp_worker_uses_registered_rank() -> None:
 def test_mp_worker_initializes_parent_cpu_state() -> None:
     worker = _make_worker([1, 1])
 
+    assert worker.device_index is None
     assert worker.kv_send_thread is None
     assert worker.kv_recv_thread is None
     assert worker.physical_layer_to_group_layers == {}
@@ -128,7 +129,7 @@ def test_mp_worker_maps_cache_once_and_releases_it_on_close() -> None:
 
     assert worker.kv_cache_spec == exported.spec
     assert torch.equal(worker.kv_caches["layer.0"][0], torch.arange(8))
-    assert worker.local_rank == 3
+    assert worker.device_index == 3
     importer.assert_called_once_with(exported.spec)
     store.register_buffer.assert_called_once()
 
@@ -136,6 +137,7 @@ def test_mp_worker_maps_cache_once_and_releases_it_on_close() -> None:
 
     assert worker.kv_cache_spec is None
     assert worker.kv_caches == {}
+    assert worker.device_index is None
     store.unregister_buffer.assert_called_once_with()
     store.close.assert_not_called()
 

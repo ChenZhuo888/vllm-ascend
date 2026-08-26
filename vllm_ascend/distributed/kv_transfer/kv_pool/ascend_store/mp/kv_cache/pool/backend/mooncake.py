@@ -13,13 +13,13 @@ from .....backend.mooncake_backend import MooncakeBackend
 class MPMooncakeBackend(MooncakeBackend):
     """Register every Worker generation instead of using the process-wide one-shot path."""
 
-    def __init__(self, parallel_config: Any, local_rank: int, lazy_init: bool = False):
-        self.local_rank = local_rank
+    def __init__(self, parallel_config: Any, device_index: int, lazy_init: bool = False):
+        self.device_index = device_index
         self._mp_registered_ptrs: list[int] = []
         super().__init__(parallel_config, lazy_init=lazy_init)
 
     def set_device(self) -> None:
-        torch.npu.set_device(self.local_rank)
+        torch.npu.set_device(self.device_index)
 
     def register_buffer(self, ptrs: list[int], lengths: list[int]) -> None:
         if self._use_fabric_mem:
@@ -29,7 +29,7 @@ class MPMooncakeBackend(MooncakeBackend):
 
         self.set_device()
         transfer_engine = global_te.get_transfer_engine(get_ip(), device_name=None)
-        location = f"npu:{self.local_rank}"
+        location = f"npu:{self.device_index}"
         registered: list[int] = []
         with global_te.register_buffer_lock:
             try:
