@@ -22,6 +22,8 @@ _PROCESS_EXIT_TIMEOUT_S = 10.0
 _PRODUCER_RELEASE_TIMEOUT_S = 90.0
 _CLIENT_CONNECT_TIMEOUT_S = 30.0
 _MOONCAKE_START_TIMEOUT_S = 30.0
+_MOONCAKE_MEMORY_ALIGNMENT_BYTES = 2 * 1024 * 1024
+_MOONCAKE_TEST_NUM_BLOCKS = 4
 _SERVER_URL = "tcp://127.0.0.1:*"
 
 
@@ -392,6 +394,29 @@ def _wait_for_mooncake_master(process, port: int) -> None:
     raise TimeoutError("Timed out waiting for mooncake_master")
 
 
+def _allocate_mooncake_test_caches():
+    import torch
+
+    element_size = torch.empty((), dtype=torch.float16).element_size()
+    elements_per_layer = _MOONCAKE_MEMORY_ALIGNMENT_BYTES // element_size
+    allocation = torch.empty(elements_per_layer * 3, dtype=torch.float16, device="npu")
+    alignment_offset = (-allocation.data_ptr()) % _MOONCAKE_MEMORY_ALIGNMENT_BYTES
+    aligned_offset = alignment_offset // element_size
+    cache_storage = allocation[aligned_offset : aligned_offset + 2 * elements_per_layer]
+
+    # Ascend Transport rejects the tiny synthetic buffers normally used by
+    # unit tests; real model KV caches naturally satisfy its 2 MiB alignment.
+    assert cache_storage.data_ptr() % _MOONCAKE_MEMORY_ALIGNMENT_BYTES == 0
+    assert cache_storage.numel() * element_size % _MOONCAKE_MEMORY_ALIGNMENT_BYTES == 0
+
+    block_elements = elements_per_layer // _MOONCAKE_TEST_NUM_BLOCKS
+    first_layer = cache_storage[:elements_per_layer].view(_MOONCAKE_TEST_NUM_BLOCKS, block_elements)
+    second_layer = cache_storage[elements_per_layer:].view(_MOONCAKE_TEST_NUM_BLOCKS, block_elements)
+    first_layer.fill_(13)
+    second_layer.fill_(17)
+    return first_layer, second_layer
+
+
 def _receive(connection: Connection, process_name: str):
     if not connection.poll(_MESSAGE_TIMEOUT_S):
         raise TimeoutError(f"Timed out waiting for the {process_name} process")
@@ -681,7 +706,6 @@ def test_real_mooncake_backend_store_and_retrieve(tmp_path, monkeypatch) -> None
             )
         )
         monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(config_path))
-        monkeypatch.setenv("ASCEND_ENABLE_USE_FABRIC_MEM", "0")
         monkeypatch.delenv("MOONCAKE_MASTER", raising=False)
         monkeypatch.delenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", raising=False)
 
@@ -707,8 +731,7 @@ def test_real_mooncake_backend_store_and_retrieve(tmp_path, monkeypatch) -> None
             _wait_until_connected(connector._kv_cache_client)
             _wait_until_registered(connector._kv_cache_client)
 
-            first_layer = torch.full((4, 4), 13, dtype=torch.float16, device="npu")
-            second_layer = torch.full((4, 4), 17, dtype=torch.float16, device="npu")
+            first_layer, second_layer = _allocate_mooncake_test_caches()
             torch.npu.synchronize()
             connector.register_kv_caches(
                 {
@@ -755,9 +778,9 @@ def test_real_mooncake_backend_store_and_retrieve(tmp_path, monkeypatch) -> None
             connector.start_load_kv(None)
             torch.npu.synchronize()
 
-            expected_first_layer = torch.zeros((4, 4), dtype=torch.float16)
+            expected_first_layer = torch.zeros_like(first_layer, device="cpu")
             expected_first_layer[1].fill_(13)
-            expected_second_layer = torch.zeros((4, 4), dtype=torch.float16)
+            expected_second_layer = torch.zeros_like(second_layer, device="cpu")
             expected_second_layer[1].fill_(17)
             assert torch.equal(first_layer.cpu(), expected_first_layer)
             assert torch.equal(second_layer.cpu(), expected_second_layer)

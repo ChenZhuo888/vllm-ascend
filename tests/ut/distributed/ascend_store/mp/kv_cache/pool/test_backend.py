@@ -67,6 +67,24 @@ def test_mp_mooncake_backend_registers_and_unregisters_each_worker_region() -> N
     assert transfer_engine.unregister_memory.call_args_list == [((20,),), ((10,),)]
 
 
+def test_mp_mooncake_backend_rolls_back_failed_memory_registration() -> None:
+    transfer_engine = MagicMock()
+    transfer_engine.register_memory.side_effect = [0, -1]
+    transfer_engine.unregister_memory.return_value = 0
+    global_te.get_transfer_engine.return_value = transfer_engine
+    backend = object.__new__(MPMooncakeBackend)
+    backend.local_rank = 1
+    backend._use_fabric_mem = False
+    backend._mp_registered_ptrs = []
+    backend.store = MagicMock()
+
+    with pytest.raises(RuntimeError, match="code -1: address=0x14, length=8"):
+        backend.register_buffer([10, 20], [4, 8])
+
+    transfer_engine.unregister_memory.assert_called_once_with(10)
+    assert backend._mp_registered_ptrs == []
+
+
 def test_mp_mooncake_backend_retries_only_failed_memory_unregistration() -> None:
     transfer_engine = MagicMock()
     transfer_engine.register_memory.return_value = 0
