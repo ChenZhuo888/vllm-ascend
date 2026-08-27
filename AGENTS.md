@@ -417,3 +417,110 @@ Before merging, verify:
 - [vLLM Hardware Plugin RFC](https://github.com/vllm-project/vllm/issues/11162)
 - [Documentation](https://docs.vllm.ai/projects/ascend/en/latest/)
 - [Contributors Guide](https://docs.vllm.ai/projects/ascend/en/latest/community/contributors.html)
+
+---
+
+## AscendStore MP Engineering Principles
+
+These rules apply to changes under
+`vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/mp`.
+
+### Priorities
+
+1. Correctness and behavioral compatibility come first.
+2. Code is written primarily for human maintainers. Prefer clear,
+   unsurprising code over clever implementations.
+3. Preserve existing in-process AscendStore behavior. MP implementations
+   should adapt process-boundary differences through inheritance, composition,
+   or adapters whenever practical.
+4. Implement current requirements only. Do not introduce abstractions or
+   features solely for hypothetical future needs.
+
+### Architecture Boundaries
+
+- RPC infrastructure owns transport, framing, routing, deadlines, execution,
+  server health, shutdown, and transport-level errors. It must not understand
+  KVCache business semantics.
+- KVCache components own service registration, visibility, lifecycle
+  coordination, degradation policy, and Lookup, Store, and Retrieve
+  orchestration.
+- Scheduler and Worker implementations should reuse the original
+  `KVPoolScheduler` and `KVPoolWorker` semantics as much as possible.
+- Backend adapters own Mooncake, Memcache, YuanRong, NPU IPC, and other
+  backend-specific resource behavior.
+- The vLLM connector translates between vLLM callbacks and KVCache operations.
+  It must not absorb server-side orchestration or backend implementation
+  details.
+- Dependencies must point inward toward stable contracts. Business changes
+  should not require modifying RPC infrastructure.
+
+### Human-Readable Code
+
+- A main method should read like a coherent narrative and expose the complete
+  control flow.
+- Prefer a wide-tree call structure: orchestration returns to a clear root
+  method after each meaningful operation.
+- Avoid deep chains of one-line forwarding methods. A helper is justified only
+  when it owns a meaningful concern, invariant, reusable operation, or
+  complexity.
+- Each mutable state, lifecycle transition, retry policy, and failure policy
+  must have one clear owner.
+- Use precise domain names. Avoid generic names such as `Manager`, `Service`,
+  `Context`, or `Handler` unless the object genuinely owns that complete
+  responsibility.
+- Comments should explain why a decision, invariant, ordering constraint, or
+  workaround exists. Do not restate what the code already says.
+- Keep formatting compact and compatible with PyCharm and Ruff. Avoid
+  arbitrary or poetic line wrapping.
+
+### Design Discipline
+
+- Apply DDD lightly: use domain language and explicit boundaries, but do not
+  mechanically introduce entities, repositories, factories, or domain
+  services.
+- Apply SOLID as judgment, not ceremony:
+  - A component should have one reason to change, not necessarily one method.
+  - Introduce an abstraction only when a real boundary or variation exists.
+  - Keep interfaces narrow and shaped around their consumers.
+  - Isolate external SDKs and unstable dependencies behind adapters.
+- Small, obvious duplication is sometimes preferable to another layer of
+  indirection.
+- Do not create a class merely to hold functions or rename calls.
+- Locks, conditions, events, queues, states, and background threads require a
+  concrete concurrency responsibility. Do not add them defensively without an
+  identified race or ownership requirement.
+
+### Refactoring Rules
+
+- Before changing architecture, identify the current call chain, state owner,
+  invariants, failure behavior, concurrency model, and actual extension points.
+- Separate structural refactoring from behavioral changes whenever possible.
+- A structural refactor must preserve protocol layout, serialization behavior,
+  task granularity, threading, queues, locks, resource ownership, failure
+  semantics, and hot-path behavior unless the change is explicitly agreed
+  upon.
+- Make changes incrementally and keep every intermediate state understandable
+  and reviewable.
+- Update affected tests in the same change. Do not leave temporary handlers,
+  compatibility branches, or test-only behavior behind unintentionally.
+- Do not modify unrelated files or broaden the change boundary without
+  explaining why it is necessary.
+- Do not commit automatically unless explicitly requested. After each
+  completed change, provide a Conventional Commit message with a clear summary
+  and rationale.
+
+### Verification
+
+- Unit tests should cover behavior, boundaries, and important failure modes
+  rather than internal implementation details.
+- Real NPU and backend behavior must ultimately be verified by E2E tests.
+  Mooncake is the primary functional baseline; backend-specific differences
+  require their own targeted validation.
+- Preserve useful error context across process boundaries. Runtime behavior
+  and degradation policy must remain compatible with the in-process
+  implementation while failures remain traceable.
+- Performance optimization follows functional and architectural correctness,
+  but refactoring must not introduce avoidable serialization, synchronization,
+  copying, or scheduling overhead.
+- If the required environment is unavailable, state which verification was not
+  run instead of claiming success.
