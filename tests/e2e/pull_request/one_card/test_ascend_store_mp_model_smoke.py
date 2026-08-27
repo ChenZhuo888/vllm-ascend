@@ -8,7 +8,6 @@ test proves lookup degrades instead of failing when no server is available.
 """
 
 import contextlib
-import gc
 import json
 import logging
 import multiprocessing
@@ -159,7 +158,8 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch, use_layerwise
     import torch_npu  # noqa: F401
     from vllm.utils.network_utils import get_open_port
 
-    from tests.e2e.conftest import MooncakeLauncher
+    from tests.e2e.conftest import MooncakeLauncher, cleanup_dist_env_and_memory
+    from vllm_ascend.ascend_config import clear_ascend_config
 
     model_path = _model_path()
     if model_path is None:
@@ -245,7 +245,8 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch, use_layerwise
                     if failure is None:
                         failure = exc
                 llm = None
-                gc.collect()
+                clear_ascend_config()
+                cleanup_dist_env_and_memory()
             endpoint_connection.close()
             endpoint_child_connection.close()
             control_child_connection.close()
@@ -265,6 +266,9 @@ def test_real_model_degrades_when_server_unavailable(monkeypatch) -> None:
     import torch
     import torch_npu  # noqa: F401
 
+    from tests.e2e.conftest import cleanup_dist_env_and_memory
+    from vllm_ascend.ascend_config import clear_ascend_config
+
     model_path = _model_path()
     if model_path is None:
         pytest.skip(f"Set {_MODEL_ENV} to a local model path to run this smoke test")
@@ -281,4 +285,5 @@ def test_real_model_degrades_when_server_unavailable(monkeypatch) -> None:
     finally:
         llm.llm_engine.engine_core.shutdown()
         del llm
-        gc.collect()
+        clear_ascend_config()
+        cleanup_dist_env_and_memory()
