@@ -134,14 +134,14 @@ def test_worker_layerwise_calls_have_no_default_deadline() -> None:
         assert calls[1].kwargs["timeout_ms"] is None
 
 
-def test_scheduler_lookup_accepts_no_deadline() -> None:
+def test_scheduler_lookup_uses_default_deadline() -> None:
     with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
         client = _configure_mock_client(client_class, [list(encode_lookup_response(16, False))])
 
-        assert client.lookup(REQUEST, 0, timeout_ms=None) == (16, False)
+        assert client.lookup(REQUEST, 0) == (16, False)
 
         request = client_class.return_value.request
-        assert request.call_args.kwargs["timeout_ms"] is None
+        assert request.call_args.kwargs["timeout_ms"] == 5000
 
 
 def test_worker_get_finished_uses_bounded_worker_rpc() -> None:

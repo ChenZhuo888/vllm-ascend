@@ -473,7 +473,7 @@ class KVCacheClient:
         self,
         request: Request,
         num_computed_tokens: int,
-        timeout_ms: int | None = _DEFAULT_TIMEOUT_MS,
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> tuple[int, bool]:
         responses = self._scheduler_rpc(
             KVCacheMethod.LOOKUP,
