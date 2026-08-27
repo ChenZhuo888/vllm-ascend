@@ -98,7 +98,13 @@ def _run_smoke_server(endpoint_connection: Connection, control_connection: Conne
             file_handler.close()
 
 
-def _build_llm(model_path: str, server_url: str, monkeypatch, use_layerwise: bool = False):
+def _build_llm(
+    model_path: str,
+    server_url: str,
+    monkeypatch,
+    use_layerwise: bool = False,
+    backend: str = "mooncake",
+):
     from vllm import LLM
     from vllm.config import KVTransferConfig
 
@@ -112,7 +118,7 @@ def _build_llm(model_path: str, server_url: str, monkeypatch, use_layerwise: boo
         kv_connector="AscendStoreMPConnector",
         kv_role="kv_both",
         kv_connector_extra_config={
-            "backend": "mooncake",
+            "backend": backend,
             "kv_cache_server_url": server_url,
             "use_layerwise": use_layerwise,
         },

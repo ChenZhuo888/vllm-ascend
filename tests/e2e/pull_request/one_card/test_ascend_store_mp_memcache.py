@@ -1,7 +1,8 @@
-"""Real Memcache E2E for the non-layerwise AscendStore MP backend."""
+"""Real Memcache E2E for the AscendStore MP backend."""
 
 import contextlib
 import multiprocessing
+import os
 import socket
 import time
 from multiprocessing.process import BaseProcess
@@ -20,9 +21,20 @@ from tests.e2e.pull_request.one_card.test_ascend_store_mp_ipc import (
     _wait_until_connected,
     _wait_until_registered,
 )
+from tests.e2e.pull_request.one_card.test_ascend_store_mp_model_smoke import (
+    _HIT_LOG_PATTERN,
+    _PROMPT,
+    _build_llm,
+    _generate_once,
+    _model_path,
+    _run_smoke_server,
+    _wait_for_prefix_cache_reset,
+)
 
 _MEMCACHE_START_TIMEOUT_S = 30.0
 _MEMCACHE_STOP_TIMEOUT_S = 10.0
+_MEMCACHE_GVA_LEASE_TTL_MS = 30_000
+_MEMCACHE_GVA_WORLD_SIZE = 256
 
 
 def _require_memcache() -> None:
@@ -38,24 +50,24 @@ def _write_memcache_configs(
     meta_port: int,
     config_store_port: int,
     metrics_port: int,
+    protocol: str = "host_shm",
+    world_size: int = 1,
+    lease_ttl_ms: int | None = None,
 ) -> tuple[Path, Path]:
     log_path = tmp_path / "memcache-logs"
     log_path.mkdir()
     meta_config_path = tmp_path / "mmc-meta.conf"
     local_config_path = tmp_path / "mmc-local.conf"
-    meta_config_path.write_text(
-        "\n".join(
-            (
-                f"ock.mmc.meta_service_url = tcp://127.0.0.1:{meta_port}",
-                f"ock.mmc.meta_service.config_store_url = tcp://127.0.0.1:{config_store_port}",
-                f"ock.mmc.meta_service.metrics_url = http://127.0.0.1:{metrics_port}",
-                "ock.mmc.log_level = error",
-                f"ock.mmc.log_path = {log_path}",
-                "",
-            )
-        ),
-        encoding="utf-8",
-    )
+    meta_config = [
+        f"ock.mmc.meta_service_url = tcp://127.0.0.1:{meta_port}",
+        f"ock.mmc.meta_service.config_store_url = tcp://127.0.0.1:{config_store_port}",
+        f"ock.mmc.meta_service.metrics_url = http://127.0.0.1:{metrics_port}",
+        "ock.mmc.log_level = error",
+        f"ock.mmc.log_path = {log_path}",
+    ]
+    if lease_ttl_ms is not None:
+        meta_config.insert(3, f"ock.mmc.meta.lease_ttl_ms = {lease_ttl_ms}")
+    meta_config_path.write_text("\n".join((*meta_config, "")), encoding="utf-8")
     local_config_path.write_text(
         "\n".join(
             (
@@ -63,8 +75,8 @@ def _write_memcache_configs(
                 f"ock.mmc.local_service.config_store_url = tcp://127.0.0.1:{config_store_port}",
                 "ock.mmc.log_level = error",
                 f"ock.mmc.log_path = {log_path}",
-                "ock.mmc.local_service.world_size = 1",
-                "ock.mmc.local_service.protocol = host_shm",
+                f"ock.mmc.local_service.world_size = {world_size}",
+                f"ock.mmc.local_service.protocol = {protocol}",
                 "ock.mmc.local_service.dram.size = 1GB",
                 "",
             )
@@ -138,6 +150,7 @@ def test_real_memcache_backend_store_and_retrieve(tmp_path: Path, monkeypatch: p
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
     from vllm.utils.network_utils import get_open_port
 
+    from tests.e2e.conftest import cleanup_dist_env_and_memory
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_mp_connector import (
         AscendStoreMPConnector,
     )
@@ -157,6 +170,8 @@ def test_real_memcache_backend_store_and_retrieve(tmp_path: Path, monkeypatch: p
     meta_service = None
     server = None
     connector = None
+    first_layer = None
+    second_layer = None
     failure: BaseException | None = None
     server_exitcode = None
     server_forced = False
@@ -272,6 +287,7 @@ def test_real_memcache_backend_store_and_retrieve(tmp_path: Path, monkeypatch: p
         except BaseException as exc:
             if failure is None:
                 failure = exc
+        connector = None
         if server is not None:
             with contextlib.suppress(BrokenPipeError, EOFError, OSError):
                 control_connection.send("stop")
@@ -281,11 +297,139 @@ def test_real_memcache_backend_store_and_retrieve(tmp_path: Path, monkeypatch: p
             server_exitcode, server_forced = _stop_process(server)
         finally:
             meta_service_running = _stop_memcache_meta_service(meta_service)
+        first_layer = None
+        second_layer = None
+        cleanup_dist_env_and_memory()
 
     if failure is not None:
         raise failure
     if server_forced:
         pytest.fail("KV cache server did not stop after closing the Memcache Worker")
+    assert server_exitcode == 0
+    if not meta_service_running:
+        pytest.fail("Memcache MetaService exited before test cleanup")
+
+
+def test_real_model_memcache_gva_layerwise_hit_and_retrieve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+    import torch_npu  # noqa: F401
+    from vllm.utils.network_utils import get_open_port
+
+    from tests.e2e.conftest import cleanup_dist_env_and_memory
+    from vllm_ascend.ascend_config import clear_ascend_config
+
+    _require_memcache()
+    model_path = _model_path()
+    if model_path is None:
+        pytest.skip("Set ASCEND_STORE_MP_SMOKE_MODEL to a local model path to run this smoke test")
+    if not torch.npu.is_available():
+        pytest.skip("NPU is not available")
+    if os.getenv("PYTHONHASHSEED") != "0":
+        pytest.fail("PYTHONHASHSEED=0 must be set before pytest starts for Memcache key consistency")
+
+    context = multiprocessing.get_context("spawn")
+    endpoint_connection, endpoint_child_connection = context.Pipe()
+    control_connection, control_child_connection = context.Pipe()
+    server_log = tmp_path / "kv_cache_server.log"
+    meta_service = None
+    server = None
+    llm = None
+    npu_initialized = False
+    failure: BaseException | None = None
+    server_exitcode = None
+    server_forced = False
+    meta_service_running = False
+
+    meta_port = get_open_port()
+    config_store_port = get_open_port()
+    metrics_port = get_open_port()
+    meta_config_path, local_config_path = _write_memcache_configs(
+        tmp_path,
+        meta_port,
+        config_store_port,
+        metrics_port,
+        protocol="device_sdma",
+        world_size=_MEMCACHE_GVA_WORLD_SIZE,
+        lease_ttl_ms=_MEMCACHE_GVA_LEASE_TTL_MS,
+    )
+    monkeypatch.setenv("MMC_META_CONFIG_PATH", str(meta_config_path))
+    monkeypatch.setenv("MMC_LOCAL_CONFIG_PATH", str(local_config_path))
+
+    try:
+        meta_service = context.Process(
+            target=_run_memcache_meta_service,
+            name="memcache-gva-meta-service",
+        )
+        meta_service.start()
+        _wait_for_memcache_meta_service(meta_service, meta_port)
+
+        server = context.Process(
+            target=_run_smoke_server,
+            args=(endpoint_child_connection, control_child_connection, str(server_log)),
+            name="kv-cache-memcache-gva-server",
+        )
+        server.start()
+        endpoint_child_connection.close()
+        control_child_connection.close()
+        server_status, server_result = _receive(endpoint_connection, "KV cache server")
+        if server_status != "ready":
+            raise RuntimeError(f"KV cache server failed to start:\n{server_result}")
+
+        torch.npu.set_device(0)
+        npu_initialized = True
+        llm = _build_llm(
+            model_path,
+            server_result,
+            monkeypatch,
+            use_layerwise=True,
+            backend="memcache",
+        )
+        block_size = llm.llm_engine.vllm_config.cache_config.block_size
+        prompt_token_count = len(llm.get_tokenizer().encode(_PROMPT))
+        assert prompt_token_count >= 2 * block_size, (
+            f"Smoke prompt has {prompt_token_count} tokens, but at least {2 * block_size} are required"
+        )
+
+        first_output = _generate_once(llm)
+        assert first_output.strip(), "First generation produced empty output"
+        _wait_for_prefix_cache_reset(llm)
+        second_output = _generate_once(llm)
+
+        assert second_output == first_output, "Retrieved KV changed the greedy output"
+        hits = [int(value) for value in _HIT_LOG_PATTERN.findall(server_log.read_text())]
+        assert hits and max(hits) > 0, "No external Memcache KV pool hit was recorded by the server"
+    except BaseException as exc:
+        failure = exc
+    finally:
+        if llm is not None:
+            try:
+                llm.llm_engine.engine_core.shutdown()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+            llm = None
+        if npu_initialized:
+            clear_ascend_config()
+            cleanup_dist_env_and_memory()
+        endpoint_connection.close()
+        endpoint_child_connection.close()
+        control_child_connection.close()
+        if server is not None:
+            with contextlib.suppress(BrokenPipeError, EOFError, OSError):
+                control_connection.send("stop")
+        control_connection.close()
+        try:
+            server_exitcode, server_forced = _stop_process(server)
+        finally:
+            meta_service_running = _stop_memcache_meta_service(meta_service)
+
+    if failure is not None:
+        raise failure
+    if server_forced:
+        pytest.fail("KV cache server did not stop gracefully after the Memcache GVA smoke run")
     assert server_exitcode == 0
     if not meta_service_running:
         pytest.fail("Memcache MetaService exited before test cleanup")

@@ -192,8 +192,13 @@ def test_gva_config_is_scoped_to_memcache_layerwise_connector():
         kv_connector="AscendStoreConnector",
         kv_connector_extra_config={"backend": "mooncake", "use_layerwise": True},
     )
+    mp_config = SimpleNamespace(
+        kv_connector="AscendStoreMPConnector",
+        kv_connector_extra_config=ascend_store_config,
+    )
 
     assert get_gva_layerwise_config(multi_config) is ascend_store_config
+    assert get_gva_layerwise_config(mp_config) is ascend_store_config
     assert get_gva_layerwise_config(unsupported) is None
 
 

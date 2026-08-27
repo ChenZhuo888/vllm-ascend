@@ -61,6 +61,11 @@ def _make_kv_cache_config() -> MagicMock:
     return config
 
 
+@pytest.mark.parametrize(("use_layerwise", "expected"), [(False, False), (True, True)])
+def test_connector_requires_piecewise_for_layerwise_mode(use_layerwise: bool, expected: bool) -> None:
+    assert AscendStoreMPConnector.requires_piecewise_for_cudagraph({"use_layerwise": use_layerwise}) is expected
+
+
 @pytest.mark.parametrize("role", [KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER])
 def test_connector_registers_its_role(role: KVConnectorRole) -> None:
     config = _make_vllm_config()

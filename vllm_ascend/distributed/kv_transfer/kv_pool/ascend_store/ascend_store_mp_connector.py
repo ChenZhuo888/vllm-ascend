@@ -54,6 +54,10 @@ def _get_kv_cache_server_url(vllm_config: VllmConfig) -> str:
 
 
 class AscendStoreMPConnector(KVConnectorBase_V1):
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        return extra_config.get("use_layerwise", False)
+
     def __init__(
         self,
         vllm_config: VllmConfig,
