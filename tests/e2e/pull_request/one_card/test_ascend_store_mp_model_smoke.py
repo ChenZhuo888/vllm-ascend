@@ -132,10 +132,10 @@ def _build_llm(
     )
 
 
-def _generate_once(llm) -> str:
+def _generate_once(llm, prompt: str = _PROMPT) -> str:
     from vllm import SamplingParams
 
-    outputs = llm.generate([_PROMPT], SamplingParams(temperature=0, max_tokens=32))
+    outputs = llm.generate([prompt], SamplingParams(temperature=0, max_tokens=32))
     return outputs[0].outputs[0].text
 
 
