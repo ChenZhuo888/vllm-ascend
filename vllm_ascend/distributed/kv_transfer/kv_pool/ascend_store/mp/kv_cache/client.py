@@ -470,7 +470,10 @@ class KVCacheClient:
         return decode_get_block_ids_with_load_errors_response(responses) if responses is not None else None
 
     def lookup(
-        self, request: Request, num_computed_tokens: int, timeout_ms: int = _DEFAULT_TIMEOUT_MS
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        timeout_ms: int | None = _DEFAULT_TIMEOUT_MS,
     ) -> tuple[int, bool]:
         responses = self._scheduler_rpc(
             KVCacheMethod.LOOKUP,
@@ -539,7 +542,7 @@ class KVCacheClient:
         self,
         method: KVCacheMethod,
         encode: Callable[[SchedulerRegistration], tuple[bytes, ...]],
-        timeout_ms: int,
+        timeout_ms: int | None,
     ) -> list[bytes] | None:
         self._raise_if_superseded()
         registration = self._get_scheduler_registration()

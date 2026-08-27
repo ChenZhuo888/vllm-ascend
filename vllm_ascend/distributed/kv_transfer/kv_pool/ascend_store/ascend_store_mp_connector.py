@@ -117,6 +117,8 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         self._require_scheduler_role("get_num_new_matched_tokens")
+        if self.use_layerwise:
+            return self._kv_cache_client.lookup(request, num_computed_tokens, timeout_ms=None)
         return self._kv_cache_client.lookup(request, num_computed_tokens)
 
     def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int) -> None:

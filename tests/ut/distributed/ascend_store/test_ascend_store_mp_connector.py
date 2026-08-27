@@ -95,6 +95,20 @@ def test_scheduler_lookup_delegates_to_kv_cache_client() -> None:
         client_class.return_value.lookup.assert_called_once_with(request, 32)
 
 
+def test_scheduler_layerwise_lookup_has_no_business_deadline() -> None:
+    config = _make_vllm_config()
+    config.kv_transfer_config.kv_connector_extra_config["use_layerwise"] = True
+    request = MagicMock()
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.lookup.return_value = (16, False)
+        connector = AscendStoreMPConnector(config, KVConnectorRole.SCHEDULER, _make_kv_cache_config())
+
+        assert connector.get_num_new_matched_tokens(request, 32) == (16, False)
+
+    client_class.return_value.lookup.assert_called_once_with(request, 32, timeout_ms=None)
+
+
 def test_worker_cannot_call_scheduler_lookup() -> None:
     config = _make_vllm_config()
 

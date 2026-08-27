@@ -26,6 +26,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     encode_get_block_ids_with_load_errors_response,
     encode_get_finished_response,
     encode_get_kv_events_response,
+    encode_lookup_response,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
@@ -131,6 +132,16 @@ def test_worker_layerwise_calls_have_no_default_deadline() -> None:
         assert calls[1].args[0].value == "SAVE_KV_LAYER"
         assert calls[0].kwargs["timeout_ms"] is None
         assert calls[1].kwargs["timeout_ms"] is None
+
+
+def test_scheduler_lookup_accepts_no_deadline() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_client(client_class, [list(encode_lookup_response(16, False))])
+
+        assert client.lookup(REQUEST, 0, timeout_ms=None) == (16, False)
+
+        request = client_class.return_value.request
+        assert request.call_args.kwargs["timeout_ms"] is None
 
 
 def test_worker_get_finished_uses_bounded_worker_rpc() -> None:
