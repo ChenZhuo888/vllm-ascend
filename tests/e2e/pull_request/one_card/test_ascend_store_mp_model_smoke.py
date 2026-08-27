@@ -235,6 +235,17 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch, use_layerwise
         except BaseException as exc:
             failure = exc
         finally:
+            if llm is not None:
+                try:
+                    # Worker connectors are process-global in vLLM and are
+                    # cleared only by EngineCore shutdown. Keep the server
+                    # alive until both connector roles have unregistered.
+                    llm.llm_engine.engine_core.shutdown()
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                llm = None
+                gc.collect()
             endpoint_connection.close()
             endpoint_child_connection.close()
             control_child_connection.close()
@@ -242,8 +253,6 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch, use_layerwise
                 control_connection.send("stop")
             control_connection.close()
             server_exitcode, server_forced = _stop_process(server)
-            llm = None
-            gc.collect()
 
     if failure is not None:
         raise failure
@@ -266,8 +275,10 @@ def test_real_model_degrades_when_server_unavailable(monkeypatch) -> None:
     # instead of failing engine startup or generation.
     torch.npu.set_device(0)
     llm = _build_llm(model_path, "tcp://127.0.0.1:1", monkeypatch)
-    output = _generate_once(llm)
-
-    assert output.strip(), "Generation produced empty output while degraded"
-    del llm
-    gc.collect()
+    try:
+        output = _generate_once(llm)
+        assert output.strip(), "Generation produced empty output while degraded"
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+        del llm
+        gc.collect()
