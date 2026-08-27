@@ -440,7 +440,9 @@ def test_server_returns_handler_base_exception_without_leaking_request() -> None
         assert identity == b"client"
         assert method == UPPERCASE_METHOD
         assert status is ResponseStatus.ERROR
-        assert responses == (b"KeyboardInterrupt: handler interrupted",)
+        assert responses[0] == b"KeyboardInterrupt: handler interrupted"
+        assert b"Traceback (most recent call last)" in responses[1]
+        assert b'raise KeyboardInterrupt("handler interrupted")' in responses[1]
 
         server._response_backlog.append(response)
         socket = server._socket
@@ -466,7 +468,9 @@ def test_server_returns_executor_failure() -> None:
         _, method, status, responses = decode_response(response_frames)
         assert method == UPPERCASE_METHOD
         assert status is ResponseStatus.ERROR
-        assert responses == (b"RuntimeError: executor failed",)
+        assert responses[0] == b"RuntimeError: executor failed"
+        assert b"Traceback (most recent call last)" in responses[1]
+        assert b"future.result()" in responses[1]
     finally:
         server.abort()
 
@@ -748,8 +752,14 @@ def test_server_uses_injected_handlers():
 
         assert client.request(UPPERCASE_METHOD, [b"hello ascend store"]) == [b"HELLO ASCEND STORE"]
 
-        with pytest.raises(MPRemoteError, match="Payloads must be an iterable of bytes"):
+        with pytest.raises(MPRemoteError, match="Payloads must be an iterable of bytes") as exc_info:
             client.request(INVALID_RESPONSE_METHOD)
+        assert exc_info.value.remote_method == INVALID_RESPONSE_METHOD
+        assert exc_info.value.remote_request_id is not None
+        assert exc_info.value.remote_traceback is not None
+        assert "_execute_handler" in exc_info.value.remote_traceback
+        assert "_normalize_payloads" in exc_info.value.remote_traceback
+        assert "Remote traceback:" in str(exc_info.value)
 
         first_worker = client.request(AFFINITY_METHOD, [b"0"])
         assert client.request(AFFINITY_METHOD, [b"0"]) == first_worker

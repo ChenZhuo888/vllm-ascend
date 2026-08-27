@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -124,14 +125,40 @@ def test_worker_layerwise_calls_have_no_default_deadline() -> None:
         client = _configure_mock_worker_client(client_class, [[b"OK"], [b"OK"]])
         event = NPUEventSpec("host-0", b"event-handle")
 
-        assert client.wait_for_layer_load()
-        assert client.save_kv_layer(event)
+        client.wait_for_layer_load()
+        client.save_kv_layer(event)
 
         calls = client_class.return_value.request.call_args_list
         assert calls[0].args[0].value == "WAIT_FOR_LAYER_LOAD"
         assert calls[1].args[0].value == "SAVE_KV_LAYER"
         assert calls[0].kwargs["timeout_ms"] is None
         assert calls[1].kwargs["timeout_ms"] is None
+
+
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [
+        ("wait_for_layer_load", ()),
+        ("save_kv_layer", (NPUEventSpec("host-0", b"event-handle"),)),
+    ],
+)
+@pytest.mark.parametrize(
+    "error",
+    [
+        MPRequestTimeoutError("layer RPC timed out"),
+        MPServerBusyError("server is busy"),
+        MPServerUnavailableError("transport disconnected"),
+    ],
+)
+def test_worker_layerwise_calls_preserve_infrastructure_errors(method_name, args, error) -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, error)
+
+        with pytest.raises(type(error), match=str(error)) as exc_info:
+            getattr(client, method_name)(*args)
+
+        assert exc_info.value is error
+        assert client.is_registered is isinstance(error, MPServerBusyError)
 
 
 def test_scheduler_lookup_uses_default_deadline() -> None:
@@ -281,6 +308,18 @@ def test_all_business_methods_return_their_degraded_values_when_busy() -> None:
         assert client.build_connector_meta(SCHEDULER_OUTPUT, {}) is None
         assert client.request_finished("r1", [7]) == (False, None)
         assert client.update_connector_output({7: 1}) == []
+
+
+def test_degraded_rpc_logs_the_root_error_once(caplog) -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_client(client_class, MPRequestTimeoutError("lookup timed out in transport"))
+
+        with caplog.at_level(logging.WARNING, logger=CLIENT_MODULE):
+            assert client.lookup(REQUEST, 0) == (0, False)
+            assert client.lookup(REQUEST, 0) == (0, False)
+
+    messages = [record.getMessage() for record in caplog.records if "KV cache RPC" in record.getMessage()]
+    assert messages == ["KV cache RPC LOOKUP degraded. type=MPRequestTimeoutError, error=lookup timed out in transport"]
 
 
 @pytest.mark.parametrize("error", [MPRequestTimeoutError("t"), MPServerUnavailableError("u")])

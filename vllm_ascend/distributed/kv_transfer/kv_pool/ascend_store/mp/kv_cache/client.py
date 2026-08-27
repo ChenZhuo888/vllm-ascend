@@ -102,6 +102,7 @@ class KVCacheClient:
         self._worker_kv_cache_registration: _WorkerKVCacheRegistration | None = None
         self._session_id = uuid.uuid4().hex
         self._registration_state = _RegistrationState.UNCONFIGURED
+        self._last_reported_degradation: tuple[type[BaseException], str] | None = None
         self._closed = False
 
     def __enter__(self) -> "KVCacheClient":
@@ -181,6 +182,7 @@ class KVCacheClient:
             return
 
         decode_ack_response(responses, method)
+        self._clear_reported_degradation()
 
     def _start_lease_loop(self) -> None:
         with self._client_lifecycle_lock:
@@ -220,6 +222,18 @@ class KVCacheClient:
                 self._lease_thread = None
 
     def _try_register(self) -> bool:
+        try:
+            return self._register()
+        except (
+            MPRequestTimeoutError,
+            MPServerBusyError,
+            MPServerUnavailableError,
+            ServiceNotRegisteredError,
+        ) as exc:
+            self._report_degradation("REGISTER_SERVICE", exc)
+            return False
+
+    def _register(self) -> bool:
         with self._registration_attempt_lock:
             with self._client_lifecycle_lock:
                 if self._closed:
@@ -244,7 +258,7 @@ class KVCacheClient:
 
             if not self._rpc_client.is_transport_connected:
                 self._mark_unregistered()
-                return False
+                raise MPServerUnavailableError("MP client transport is unavailable")
 
             try:
                 responses = self._send_service_request(method, payloads, _REGISTRATION_TIMEOUT_MS)
@@ -258,14 +272,9 @@ class KVCacheClient:
                     decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
                     if worker_kv_cache_registration.on_registered is not None:
                         worker_kv_cache_registration.on_registered(worker_kv_cache_registration.spec)
-            except (
-                MPRequestTimeoutError,
-                MPServerBusyError,
-                MPServerUnavailableError,
-                ServiceNotRegisteredError,
-            ):
+            except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError, ServiceNotRegisteredError):
                 self._mark_unregistered()
-                return False
+                raise
             except ServiceSessionExpiredError:
                 self._mark_superseded()
                 raise
@@ -273,6 +282,7 @@ class KVCacheClient:
                 self._mark_unregistered()
                 raise
 
+            self._clear_reported_degradation()
             with self._client_lifecycle_lock:
                 if self._registration is not configured_registration:
                     return False
@@ -315,6 +325,25 @@ class KVCacheClient:
                 raise ServiceSessionExpiredError(message) from exc
             raise
 
+    def _report_degradation(self, method: KVCacheMethod | str, error: BaseException) -> None:
+        signature = type(error), str(error)
+        with self._client_lifecycle_lock:
+            if self._last_reported_degradation == signature:
+                return
+            self._last_reported_degradation = signature
+
+        method_name = method.value if isinstance(method, KVCacheMethod) else method
+        logger.warning(
+            "KV cache RPC %s degraded. type=%s, error=%s",
+            method_name,
+            type(error).__name__,
+            error,
+        )
+
+    def _clear_reported_degradation(self) -> None:
+        with self._client_lifecycle_lock:
+            self._last_reported_degradation = None
+
     def _get_scheduler_registration(self) -> SchedulerRegistration:
         with self._client_lifecycle_lock:
             configured_registration = self._registration
@@ -351,7 +380,7 @@ class KVCacheClient:
             if not self.is_registered:
                 return self._try_register()
 
-            responses = self._worker_rpc(
+            responses = self._try_worker_rpc(
                 KVCacheMethod.REGISTER_KV_CACHES,
                 lambda _registration: payloads,
                 timeout_ms,
@@ -379,7 +408,7 @@ class KVCacheClient:
         timeout_ms: int | None = None,
     ) -> bool:
         """Wait without a default deadline so the source Event outlives accepted Store work."""
-        responses = self._worker_rpc(
+        responses = self._try_worker_rpc(
             KVCacheMethod.WAIT_FOR_SAVE,
             lambda registration: encode_wait_for_save_request(registration, metadata, event_spec),
             timeout_ms,
@@ -395,7 +424,7 @@ class KVCacheClient:
         metadata: AscendConnectorMetadata,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> tuple[set[str], set[str]]:
-        responses = self._worker_rpc(
+        responses = self._try_worker_rpc(
             KVCacheMethod.GET_FINISHED,
             lambda registration: encode_get_finished_request(registration, finished_req_ids, metadata),
             timeout_ms,
@@ -406,7 +435,7 @@ class KVCacheClient:
         self,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> AscendStoreKVConnectorWorkerMetadata | None:
-        responses = self._worker_rpc(
+        responses = self._try_worker_rpc(
             KVCacheMethod.BUILD_CONNECTOR_WORKER_META,
             encode_build_connector_worker_meta_request,
             timeout_ms,
@@ -414,7 +443,7 @@ class KVCacheClient:
         return decode_build_connector_worker_meta_response(responses) if responses is not None else None
 
     def get_kv_events(self, timeout_ms: int = _DEFAULT_TIMEOUT_MS) -> list[BlockStored]:
-        responses = self._worker_rpc(
+        responses = self._try_worker_rpc(
             KVCacheMethod.GET_KV_EVENTS,
             encode_get_kv_events_request,
             timeout_ms,
@@ -426,7 +455,7 @@ class KVCacheClient:
         metadata: AscendConnectorMetadata,
         timeout_ms: int | None = None,
     ) -> bool:
-        responses = self._worker_rpc(
+        responses = self._try_worker_rpc(
             KVCacheMethod.START_LOAD_KV,
             lambda registration: encode_start_load_kv_request(registration, metadata),
             timeout_ms,
@@ -436,33 +465,27 @@ class KVCacheClient:
         decode_ack_response(responses, KVCacheMethod.START_LOAD_KV)
         return True
 
-    def wait_for_layer_load(self, timeout_ms: int | None = None) -> bool:
+    def wait_for_layer_load(self, timeout_ms: int | None = None) -> None:
         responses = self._worker_rpc(
             KVCacheMethod.WAIT_FOR_LAYER_LOAD,
             encode_wait_for_layer_load_request,
             timeout_ms,
         )
-        if responses is None:
-            return False
         decode_ack_response(responses, KVCacheMethod.WAIT_FOR_LAYER_LOAD)
-        return True
 
-    def save_kv_layer(self, event_spec: NPUEventSpec, timeout_ms: int | None = None) -> bool:
+    def save_kv_layer(self, event_spec: NPUEventSpec, timeout_ms: int | None = None) -> None:
         responses = self._worker_rpc(
             KVCacheMethod.SAVE_KV_LAYER,
             lambda registration: encode_save_kv_layer_request(registration, event_spec),
             timeout_ms,
         )
-        if responses is None:
-            return False
         decode_ack_response(responses, KVCacheMethod.SAVE_KV_LAYER)
-        return True
 
     def get_block_ids_with_load_errors(
         self,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> set[int] | None:
-        responses = self._worker_rpc(
+        responses = self._try_worker_rpc(
             KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS,
             encode_get_block_ids_with_load_errors_request,
             timeout_ms,
@@ -475,7 +498,7 @@ class KVCacheClient:
         num_computed_tokens: int,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> tuple[int, bool]:
-        responses = self._scheduler_rpc(
+        responses = self._try_scheduler_rpc(
             KVCacheMethod.LOOKUP,
             lambda registration: encode_lookup_request(registration, request, num_computed_tokens),
             timeout_ms,
@@ -489,7 +512,7 @@ class KVCacheClient:
         num_external_tokens: int,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> None:
-        responses = self._scheduler_rpc(
+        responses = self._try_scheduler_rpc(
             KVCacheMethod.UPDATE_STATE_AFTER_ALLOC,
             lambda registration: encode_update_state_after_alloc(registration, request, blocks, num_external_tokens),
             timeout_ms,
@@ -504,7 +527,7 @@ class KVCacheClient:
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> tuple | None:
         """Return (metadata, touch_block_ids) or None when degraded."""
-        responses = self._scheduler_rpc(
+        responses = self._try_scheduler_rpc(
             KVCacheMethod.BUILD_CONNECTOR_META,
             lambda registration: encode_build_connector_meta_request(registration, scheduler_output, new_token_ids),
             timeout_ms,
@@ -518,7 +541,7 @@ class KVCacheClient:
         all_groups: bool = False,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> tuple[bool, dict | None]:
-        responses = self._scheduler_rpc(
+        responses = self._try_scheduler_rpc(
             KVCacheMethod.REQUEST_FINISHED,
             lambda registration: encode_request_finished(registration, request_id, block_ids, all_groups),
             timeout_ms,
@@ -531,7 +554,7 @@ class KVCacheClient:
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
     ) -> list[int]:
         """Report worker completion counts; return block ids to free locally."""
-        responses = self._scheduler_rpc(
+        responses = self._try_scheduler_rpc(
             KVCacheMethod.UPDATE_CONNECTOR_OUTPUT,
             lambda registration: encode_update_connector_output(registration, completed_events),
             timeout_ms,
@@ -543,42 +566,76 @@ class KVCacheClient:
         method: KVCacheMethod,
         encode: Callable[[SchedulerRegistration], tuple[bytes, ...]],
         timeout_ms: int | None,
-    ) -> list[bytes] | None:
+    ) -> list[bytes]:
         self._raise_if_superseded()
         registration = self._get_scheduler_registration()
         payloads = encode(registration)
         return self._request_registered_service(method, payloads, timeout_ms)
+
+    def _try_scheduler_rpc(
+        self,
+        method: KVCacheMethod,
+        encode: Callable[[SchedulerRegistration], tuple[bytes, ...]],
+        timeout_ms: int | None,
+    ) -> list[bytes] | None:
+        try:
+            return self._scheduler_rpc(method, encode, timeout_ms)
+        except (
+            MPRequestTimeoutError,
+            MPServerBusyError,
+            MPServerUnavailableError,
+            ServiceNotRegisteredError,
+        ) as exc:
+            self._report_degradation(method, exc)
+            return None
 
     def _worker_rpc(
         self,
         method: KVCacheMethod,
         encode: Callable[[WorkerRegistration], tuple[bytes, ...]],
         timeout_ms: int | None,
-    ) -> list[bytes] | None:
+    ) -> list[bytes]:
         self._raise_if_superseded()
         registration = self._get_worker_registration()
         payloads = encode(registration)
         return self._request_registered_service(method, payloads, timeout_ms)
+
+    def _try_worker_rpc(
+        self,
+        method: KVCacheMethod,
+        encode: Callable[[WorkerRegistration], tuple[bytes, ...]],
+        timeout_ms: int | None,
+    ) -> list[bytes] | None:
+        try:
+            return self._worker_rpc(method, encode, timeout_ms)
+        except (
+            MPRequestTimeoutError,
+            MPServerBusyError,
+            MPServerUnavailableError,
+            ServiceNotRegisteredError,
+        ) as exc:
+            self._report_degradation(method, exc)
+            return None
 
     def _request_registered_service(
         self,
         method: KVCacheMethod,
         payloads: tuple[bytes, ...],
         timeout_ms: int | None,
-    ) -> list[bytes] | None:
-        if not self.is_registered and not self._try_register():
-            return None
+    ) -> list[bytes]:
+        if not self.is_registered and not self._register():
+            raise MPServerUnavailableError("KV cache service registration is unavailable")
 
         try:
-            return self._send_service_request(method, payloads, timeout_ms)
-        except MPServerBusyError:
-            return None
+            responses = self._send_service_request(method, payloads, timeout_ms)
         except (MPRequestTimeoutError, MPServerUnavailableError, ServiceNotRegisteredError):
             self._mark_unregistered()
-            return None
+            raise
         except ServiceSessionExpiredError:
             self._mark_superseded()
             raise
+        self._clear_reported_degradation()
+        return responses
 
     def _unregister(self) -> None:
         with self._client_lifecycle_lock:

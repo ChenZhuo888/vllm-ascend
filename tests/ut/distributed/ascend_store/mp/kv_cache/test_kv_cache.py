@@ -609,8 +609,8 @@ def test_worker_layerwise_calls_round_trip() -> None:
         _wait_until_connected(client)
         assert client.register_worker(_make_vllm_config(), kv_cache_config=None)
         assert client.start_load_kv(AscendConnectorMetadata(set(), set()))
-        assert client.wait_for_layer_load()
-        assert client.save_kv_layer(NPUEventSpec("host-0", b"event-handle"))
+        client.wait_for_layer_load()
+        client.save_kv_layer(NPUEventSpec("host-0", b"event-handle"))
     finally:
         client.close()
         _stop_server(process)

@@ -9,6 +9,7 @@ import queue
 import socket
 import threading
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable, Hashable, Iterable
 from concurrent.futures import Future
@@ -385,11 +386,15 @@ class MPServer:
     @staticmethod
     def _encode_error_response(identity: bytes, request_id: bytes, method: str, exc: BaseException) -> ServerResponse:
         status = ResponseStatus.BUSY if isinstance(exc, MPServerBusyError) else ResponseStatus.ERROR
+        error_payloads = [f"{type(exc).__name__}: {exc}".encode()]
+        if exc.__traceback__ is not None:
+            remote_traceback = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            error_payloads.append(remote_traceback.encode(errors="replace"))
         response_frames = encode_response(
             request_id,
             method,
             status,
-            (f"{type(exc).__name__}: {exc}".encode(),),
+            error_payloads,
         )
         return identity, *response_frames
 
@@ -415,6 +420,13 @@ class MPServer:
             response_frames = encode_response(request_id, method, ResponseStatus.OK, handler(payloads))
             return identity, *response_frames
         except BaseException as exc:
+            logger.error(
+                "MP RPC handler failed. method=%s identity=%r request_id=%r",
+                method,
+                identity,
+                request_id,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
             return self._encode_error_response(identity, request_id, method, exc)
 
     def _notify_response_ready(self) -> None:

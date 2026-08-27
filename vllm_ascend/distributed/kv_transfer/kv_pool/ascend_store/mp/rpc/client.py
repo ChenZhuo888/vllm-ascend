@@ -245,12 +245,18 @@ class MPClient:
 
         if status is not ResponseStatus.OK:
             message = responses[0].decode(errors="replace") if responses else "Unknown server error"
+            remote_traceback = responses[1].decode(errors="replace") if len(responses) > 1 else None
             if status is ResponseStatus.BUSY:
                 error = MPServerBusyError(message)
             elif status is ResponseStatus.ABORTED:
                 error = MPServerAbortedError(message)
             else:
-                error = MPRemoteError(message)
+                error = MPRemoteError(
+                    message,
+                    method=response_method,
+                    request_id=request_id,
+                    remote_traceback=remote_traceback,
+                )
             pending.future.set_exception(error)
             return
 

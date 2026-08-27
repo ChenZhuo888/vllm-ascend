@@ -71,6 +71,7 @@ class _MPTransferThreadMixin:
             self.name,
             type(error).__name__,
             error,
+            exc_info=(type(error), error, error.__traceback__),
         )
 
 

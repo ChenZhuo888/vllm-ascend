@@ -4,6 +4,7 @@ import threading
 from functools import partial
 from typing import cast
 
+from vllm.logger import logger
 from vllm.v1.request import Request
 
 from ...metadata import AscendStoreKVConnectorWorkerMetadata
@@ -255,6 +256,7 @@ class KVCacheServer:
             self._service.start_lease_maintenance()
             self._rpc_server.run()
         except BaseException:
+            logger.exception("KVCacheServer stopped after a fatal error")
             self.abort()
             raise
         else:

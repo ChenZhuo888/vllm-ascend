@@ -21,6 +21,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory
     export_worker_kv_caches,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import KVCacheStorageSpec
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import MPServerUnavailableError
 
 # isort: on
 
@@ -95,8 +96,6 @@ def test_scheduler_lookup_delegates_to_kv_cache_client(use_layerwise: bool) -> N
 
         assert result == (16, False)
         client_class.return_value.lookup.assert_called_once_with(request, 32)
-
-
 
 
 def test_worker_cannot_call_scheduler_lookup() -> None:
@@ -182,8 +181,6 @@ def test_worker_layerwise_delegates_load_and_save_per_layer() -> None:
         patch(f"{CONNECTOR_MODULE}.record_npu_event", return_value=exported_event),
     ):
         client_class.return_value.start_load_kv.return_value = True
-        client_class.return_value.wait_for_layer_load.return_value = True
-        client_class.return_value.save_kv_layer.return_value = True
         connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
         connector.bind_connector_metadata(metadata)
 
@@ -194,6 +191,41 @@ def test_worker_layerwise_delegates_load_and_save_per_layer() -> None:
     client_class.return_value.start_load_kv.assert_called_once_with(metadata)
     client_class.return_value.wait_for_layer_load.assert_called_once_with()
     client_class.return_value.save_kv_layer.assert_called_once_with(exported_event.spec)
+    exported_event.close.assert_called_once_with()
+
+
+def test_worker_layerwise_load_preserves_rpc_error() -> None:
+    config = _make_vllm_config()
+    config.kv_transfer_config.kv_connector_extra_config["use_layerwise"] = True
+    error = MPServerUnavailableError("transport disconnected")
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        client_class.return_value.wait_for_layer_load.side_effect = error
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+
+        with pytest.raises(MPServerUnavailableError, match="transport disconnected") as exc_info:
+            connector.wait_for_layer_load("model.layers.0.self_attn")
+
+    assert exc_info.value is error
+
+
+def test_worker_layerwise_save_preserves_rpc_error_and_releases_event() -> None:
+    config = _make_vllm_config()
+    config.kv_transfer_config.kv_connector_extra_config["use_layerwise"] = True
+    error = MPServerUnavailableError("transport disconnected")
+    exported_event = MagicMock()
+
+    with (
+        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
+        patch(f"{CONNECTOR_MODULE}.record_npu_event", return_value=exported_event),
+    ):
+        client_class.return_value.save_kv_layer.side_effect = error
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+
+        with pytest.raises(MPServerUnavailableError, match="transport disconnected") as exc_info:
+            connector.save_kv_layer("model.layers.0.self_attn", MagicMock(), MagicMock())
+
+    assert exc_info.value is error
     exported_event.close.assert_called_once_with()
 
 

@@ -271,8 +271,7 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         if not self.use_layerwise:
             return
         self._require_worker_role("wait_for_layer_load")
-        if not self._kv_cache_client.wait_for_layer_load():
-            raise RuntimeError(f"KVCacheServer became unavailable while loading layer {layer_name!r}")
+        self._kv_cache_client.wait_for_layer_load()
 
     def save_kv_layer(
         self,
