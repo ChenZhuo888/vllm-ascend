@@ -60,6 +60,8 @@ class KVCacheMethod(str, enum.Enum):
     BUILD_CONNECTOR_WORKER_META = "BUILD_CONNECTOR_WORKER_META"
     GET_KV_EVENTS = "GET_KV_EVENTS"
     START_LOAD_KV = "START_LOAD_KV"
+    WAIT_FOR_LAYER_LOAD = "WAIT_FOR_LAYER_LOAD"
+    SAVE_KV_LAYER = "SAVE_KV_LAYER"
     GET_BLOCK_IDS_WITH_LOAD_ERRORS = "GET_BLOCK_IDS_WITH_LOAD_ERRORS"
 
 
@@ -334,6 +336,33 @@ def decode_start_load_kv_request(
     (metadata,) = _body_fields(body, method.value, "metadata")
     _require_type(metadata, AscendConnectorMetadata, "metadata")
     return identity, session_id, metadata
+
+
+def encode_wait_for_layer_load_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
+    return _encode_empty_worker_request(registration, KVCacheMethod.WAIT_FOR_LAYER_LOAD)
+
+
+def decode_wait_for_layer_load_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
+    return _decode_empty_worker_request(payloads, KVCacheMethod.WAIT_FOR_LAYER_LOAD)
+
+
+def encode_save_kv_layer_request(
+    registration: WorkerRegistration,
+    event_spec: NPUEventSpec,
+) -> tuple[bytes, ...]:
+    if not isinstance(event_spec, NPUEventSpec):
+        raise TypeError(f"event_spec must be NPUEventSpec, got {type(event_spec).__name__}")
+    return _encode_worker_request(registration, {"event_spec": event_spec}, KVCacheMethod.SAVE_KV_LAYER)
+
+
+def decode_save_kv_layer_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str, NPUEventSpec]:
+    method = KVCacheMethod.SAVE_KV_LAYER
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    (event_spec,) = _body_fields(body, method.value, "event_spec")
+    _require_type(event_spec, NPUEventSpec, "event_spec")
+    return identity, session_id, event_spec
 
 
 def encode_get_block_ids_with_load_errors_request(registration: WorkerRegistration) -> tuple[bytes, ...]:

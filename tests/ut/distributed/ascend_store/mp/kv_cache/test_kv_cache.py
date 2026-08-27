@@ -97,6 +97,14 @@ class _FakeWorker:
             if request.load_spec is not None and request.load_spec.can_load:
                 self._invalid_block_ids.update(request.block_ids)
 
+    @staticmethod
+    def wait_for_layer_load() -> None:
+        return None
+
+    @staticmethod
+    def save_kv_layer_from_event(event: NPUEventSpec) -> None:
+        assert isinstance(event, NPUEventSpec)
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         block_ids = self._invalid_block_ids
         self._invalid_block_ids = set()
@@ -588,6 +596,21 @@ def test_worker_start_load_and_load_errors_round_trip() -> None:
         assert client.start_load_kv(metadata)
         assert client.get_block_ids_with_load_errors() == {7}
         assert client.get_block_ids_with_load_errors() == set()
+    finally:
+        client.close()
+        _stop_server(process)
+
+
+def test_worker_layerwise_calls_round_trip() -> None:
+    process, endpoint = _start_server()
+    client = KVCacheClient(endpoint)
+
+    try:
+        _wait_until_connected(client)
+        assert client.register_worker(_make_vllm_config(), kv_cache_config=None)
+        assert client.start_load_kv(AscendConnectorMetadata(set(), set()))
+        assert client.wait_for_layer_load()
+        assert client.save_kv_layer(NPUEventSpec("host-0", b"event-handle"))
     finally:
         client.close()
         _stop_server(process)

@@ -118,6 +118,21 @@ def test_worker_wait_for_save_has_no_default_deadline() -> None:
         assert request.call_args.kwargs["timeout_ms"] is None
 
 
+def test_worker_layerwise_calls_have_no_default_deadline() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, [[b"OK"], [b"OK"]])
+        event = NPUEventSpec("host-0", b"event-handle")
+
+        assert client.wait_for_layer_load()
+        assert client.save_kv_layer(event)
+
+        calls = client_class.return_value.request.call_args_list
+        assert calls[0].args[0].value == "WAIT_FOR_LAYER_LOAD"
+        assert calls[1].args[0].value == "SAVE_KV_LAYER"
+        assert calls[0].kwargs["timeout_ms"] is None
+        assert calls[1].kwargs["timeout_ms"] is None
+
+
 def test_worker_get_finished_uses_bounded_worker_rpc() -> None:
     with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
         client = _configure_mock_worker_client(

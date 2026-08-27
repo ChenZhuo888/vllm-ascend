@@ -49,10 +49,12 @@ from .protocol import (
     encode_register_kv_caches_request,
     encode_registration_request,
     encode_request_finished,
+    encode_save_kv_layer_request,
     encode_scheduler_session,
     encode_start_load_kv_request,
     encode_update_connector_output,
     encode_update_state_after_alloc,
+    encode_wait_for_layer_load_request,
     encode_wait_for_save_request,
     encode_worker_session,
 )
@@ -432,6 +434,28 @@ class KVCacheClient:
         if responses is None:
             return False
         decode_ack_response(responses, KVCacheMethod.START_LOAD_KV)
+        return True
+
+    def wait_for_layer_load(self, timeout_ms: int | None = None) -> bool:
+        responses = self._worker_rpc(
+            KVCacheMethod.WAIT_FOR_LAYER_LOAD,
+            encode_wait_for_layer_load_request,
+            timeout_ms,
+        )
+        if responses is None:
+            return False
+        decode_ack_response(responses, KVCacheMethod.WAIT_FOR_LAYER_LOAD)
+        return True
+
+    def save_kv_layer(self, event_spec: NPUEventSpec, timeout_ms: int | None = None) -> bool:
+        responses = self._worker_rpc(
+            KVCacheMethod.SAVE_KV_LAYER,
+            lambda registration: encode_save_kv_layer_request(registration, event_spec),
+            timeout_ms,
+        )
+        if responses is None:
+            return False
+        decode_ack_response(responses, KVCacheMethod.SAVE_KV_LAYER)
         return True
 
     def get_block_ids_with_load_errors(

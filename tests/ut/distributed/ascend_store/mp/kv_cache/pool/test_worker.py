@@ -97,7 +97,6 @@ def test_mp_worker_reuses_original_kv_events() -> None:
 
 
 def test_mp_worker_reuses_original_retrieve_methods() -> None:
-    assert MPKVPoolWorker.start_load_kv is KVPoolWorker.start_load_kv
     assert MPKVPoolWorker.get_block_ids_with_load_errors is KVPoolWorker.get_block_ids_with_load_errors
 
 
@@ -370,3 +369,45 @@ def test_mp_worker_wait_for_save_imports_source_event() -> None:
     send_thread.add_stored_request.assert_called_once_with("request-0")
     send_thread.add_request.assert_called_once_with(request)
     send_thread.request_queue.join.assert_called_once_with()
+
+
+def test_mp_worker_layer_store_reuses_source_event() -> None:
+    worker = _make_worker([0, 0])
+    worker.kv_cache_spec = WorkerKVCacheSpec(
+        generation=1,
+        caches={"layer.0": ()},
+        storages=(
+            KVCacheStorageSpec(
+                size_bytes=1,
+                device_type="npu",
+                device_uuid="host-0",
+                handle_type="test",
+                handle_version=1,
+                handle=b"cache-handle",
+            ),
+        ),
+    )
+    worker.sync_save_events = [MagicMock()]
+    metadata = AscendConnectorMetadata(set(), set())
+    event_spec = NPUEventSpec("host-0", b"event-handle")
+    imported_event = MagicMock()
+
+    with (
+        patch.object(KVPoolWorker, "start_load_kv") as start_load,
+        patch.object(KVPoolWorker, "save_kv_layer") as save_layer,
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.worker.import_npu_event",
+            return_value=imported_event,
+        ) as import_event,
+    ):
+        worker.start_load_kv(metadata)
+        worker.save_kv_layer_from_event(event_spec)
+
+    start_load.assert_called_once_with(metadata)
+    import_event.assert_called_once_with(event_spec)
+    save_layer.assert_called_once_with(metadata)
+    source_event = worker.sync_save_events[0]
+    source_event.record()
+    source_event.synchronize()
+    imported_event.record.assert_not_called()
+    imported_event.synchronize.assert_called_once_with()

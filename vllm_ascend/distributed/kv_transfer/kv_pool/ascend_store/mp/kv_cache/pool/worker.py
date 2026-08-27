@@ -49,6 +49,21 @@ class _MissingWorkerBackend:
         return [0] * len(keys)
 
 
+class _ImportedNPUEvent:
+    """Preserve an event recorded by the vLLM Worker process."""
+
+    def __init__(self, event: Any):
+        self._event = event
+
+    def record(self) -> None:
+        # The source Worker already recorded this event on its attention
+        # stream. Recording it again in KVCacheServer would lose that order.
+        return None
+
+    def synchronize(self) -> None:
+        self._event.synchronize()
+
+
 WorkerBackendFactory = Callable[[object, int | None, bool], WorkerBackend]
 
 
@@ -78,6 +93,7 @@ class MPKVPoolWorker(KVPoolWorker):
         self._failed_imported_kv_cache: ImportedKVCache | None = None
         self._runtime_failure: BaseException | None = None
         self._runtime_active = False
+        self._current_connector_metadata: AscendConnectorMetadata | None = None
         self.kv_cache_spec: WorkerKVCacheSpec | None = None
         self.m_store: WorkerBackend = store if store is not None else _MissingWorkerBackend()
         use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
@@ -225,6 +241,25 @@ class MPKVPoolWorker(KVPoolWorker):
 
     def _create_backend(self, parallel_config, device_index: int | None, lazy_init: bool) -> WorkerBackend:
         return create_mp_backend(self.backend, parallel_config, device_index, lazy_init)
+
+    def start_load_kv(self, metadata: AscendConnectorMetadata) -> None:
+        self._current_connector_metadata = metadata
+        super().start_load_kv(metadata)
+
+    def save_kv_layer_from_event(self, event_spec: NPUEventSpec) -> None:
+        if self._current_connector_metadata is None:
+            raise RuntimeError("Layer Store requires start_load_kv for the current step")
+        if self.kv_cache_spec is None:
+            raise RuntimeError("Worker KV caches must be configured before layer Store")
+        device_uuids = {storage.device_uuid for storage in self.kv_cache_spec.storages}
+        if event_spec.device_uuid not in device_uuids:
+            raise ValueError(f"NPU event device {event_spec.device_uuid!r} does not match Worker KV caches")
+        if self.sync_save_events is None or self.current_layer >= len(self.sync_save_events):
+            raise RuntimeError(f"Invalid Layerwise Store position {self.current_layer}")
+
+        event = _ImportedNPUEvent(import_npu_event(event_spec))
+        self.sync_save_events[self.current_layer] = event  # type: ignore[assignment]
+        super().save_kv_layer(self._current_connector_metadata)
 
     def _start_kv_transfer_threads(self) -> None:
         if self._transfer_threads_started:
@@ -398,6 +433,7 @@ class MPKVPoolWorker(KVPoolWorker):
                 failed_imported.close()
             self._failed_imported_kv_cache = None
             self._runtime_failure = None
+            self._current_connector_metadata = None
             self._clear_generation()
 
     def _deactivate_runtime(self) -> None:

@@ -31,11 +31,13 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     decode_registration_request,
     decode_request_finished,
     decode_request_finished_response,
+    decode_save_kv_layer_request,
     decode_scheduler_session,
     decode_start_load_kv_request,
     decode_update_connector_output,
     decode_update_connector_output_response,
     decode_update_state_after_alloc,
+    decode_wait_for_layer_load_request,
     decode_wait_for_save_request,
     decode_worker_session,
     encode_build_connector_meta_request,
@@ -55,11 +57,13 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     encode_registration_request,
     encode_request_finished,
     encode_request_finished_response,
+    encode_save_kv_layer_request,
     encode_scheduler_session,
     encode_start_load_kv_request,
     encode_update_connector_output,
     encode_update_connector_output_response,
     encode_update_state_after_alloc,
+    encode_wait_for_layer_load_request,
     encode_wait_for_save_request,
     encode_worker_session,
     scheduler_affinity_key,
@@ -218,6 +222,30 @@ def test_wait_for_save_round_trip() -> None:
     assert decoded_metadata.requests[0].req_id == "request-0"
     assert decoded_metadata.requests[0].can_save is True
     assert decoded_event == event
+
+
+def test_layerwise_requests_round_trip() -> None:
+    registration = WorkerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        session_id="worker-session",
+    )
+    event = NPUEventSpec("host-0", b"event-handle")
+
+    wait_payloads = encode_wait_for_layer_load_request(registration)
+    save_payloads = encode_save_kv_layer_request(registration, event)
+
+    assert decode_wait_for_layer_load_request(wait_payloads) == (
+        registration.identity,
+        registration.session_id,
+    )
+    assert decode_save_kv_layer_request(save_payloads) == (
+        registration.identity,
+        registration.session_id,
+        event,
+    )
+    assert worker_affinity_key(b"client", wait_payloads) == registration.identity
+    assert worker_affinity_key(b"client", save_payloads) == registration.identity
 
 
 def test_get_finished_round_trip() -> None:

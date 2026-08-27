@@ -255,8 +255,6 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         self._require_worker_role("start_load_kv")
-        if self.use_layerwise:
-            raise NotImplementedError("AscendStoreMPConnector does not support layerwise Retrieve yet")
 
         metadata = self._get_connector_metadata()
         if isinstance(metadata, AscendStoreMPConnectorMetadata):
@@ -270,7 +268,11 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
             self._local_load_error_block_ids.update(load_block_ids)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        return None
+        if not self.use_layerwise:
+            return
+        self._require_worker_role("wait_for_layer_load")
+        if not self._kv_cache_client.wait_for_layer_load():
+            raise RuntimeError(f"KVCacheServer became unavailable while loading layer {layer_name!r}")
 
     def save_kv_layer(
         self,
@@ -279,7 +281,17 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         attn_metadata: AttentionMetadata,
         **kwargs: Any,
     ) -> None:
-        return None
+        if not self.use_layerwise:
+            return
+        self._require_worker_role("save_kv_layer")
+        if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
+            return
+
+        exported_event = record_npu_event()
+        try:
+            self._kv_cache_client.save_kv_layer(exported_event.spec)
+        finally:
+            exported_event.close()
 
     def wait_for_save(self) -> None:
         self._require_worker_role("wait_for_save")

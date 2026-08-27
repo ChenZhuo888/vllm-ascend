@@ -28,10 +28,12 @@ from .protocol import (
     decode_register_kv_caches_request,
     decode_registration_request,
     decode_request_finished,
+    decode_save_kv_layer_request,
     decode_scheduler_session,
     decode_start_load_kv_request,
     decode_update_connector_output,
     decode_update_state_after_alloc,
+    decode_wait_for_layer_load_request,
     decode_wait_for_save_request,
     decode_worker_session,
     encode_build_connector_meta_response,
@@ -105,6 +107,8 @@ class KVCacheServer:
                 ),
                 worker_route(KVCacheMethod.GET_KV_EVENTS, self._handle_get_kv_events),
                 worker_route(KVCacheMethod.START_LOAD_KV, self._handle_start_load_kv),
+                worker_route(KVCacheMethod.WAIT_FOR_LAYER_LOAD, self._handle_wait_for_layer_load),
+                worker_route(KVCacheMethod.SAVE_KV_LAYER, self._handle_save_kv_layer),
                 worker_route(
                     KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS,
                     self._handle_get_block_ids_with_load_errors,
@@ -178,6 +182,16 @@ class KVCacheServer:
     def _handle_start_load_kv(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id, metadata = decode_start_load_kv_request(payloads)
         self._service.start_load_kv(identity, session_id, metadata)
+        return (ACK_RESPONSE,)
+
+    def _handle_wait_for_layer_load(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id = decode_wait_for_layer_load_request(payloads)
+        self._service.wait_for_layer_load(identity, session_id)
+        return (ACK_RESPONSE,)
+
+    def _handle_save_kv_layer(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, event_spec = decode_save_kv_layer_request(payloads)
+        self._service.save_kv_layer(identity, session_id, event_spec)
         return (ACK_RESPONSE,)
 
     def _handle_get_block_ids_with_load_errors(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:

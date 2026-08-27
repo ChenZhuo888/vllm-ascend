@@ -167,6 +167,32 @@ def test_worker_wait_for_save_releases_source_event_when_rpc_fails() -> None:
     exported_event.close.assert_called_once_with()
 
 
+def test_worker_layerwise_delegates_load_and_save_per_layer() -> None:
+    config = _make_vllm_config()
+    config.kv_transfer_config.kv_connector_extra_config["use_layerwise"] = True
+    metadata = AscendConnectorMetadata(set(), set())
+    exported_event = MagicMock()
+
+    with (
+        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
+        patch(f"{CONNECTOR_MODULE}.record_npu_event", return_value=exported_event),
+    ):
+        client_class.return_value.start_load_kv.return_value = True
+        client_class.return_value.wait_for_layer_load.return_value = True
+        client_class.return_value.save_kv_layer.return_value = True
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.bind_connector_metadata(metadata)
+
+        connector.start_load_kv(MagicMock())
+        connector.wait_for_layer_load("model.layers.0.self_attn")
+        connector.save_kv_layer("model.layers.0.self_attn", MagicMock(), MagicMock())
+
+    client_class.return_value.start_load_kv.assert_called_once_with(metadata)
+    client_class.return_value.wait_for_layer_load.assert_called_once_with()
+    client_class.return_value.save_kv_layer.assert_called_once_with(exported_event.spec)
+    exported_event.close.assert_called_once_with()
+
+
 def test_worker_rejected_store_releases_delayed_request() -> None:
     config = _make_vllm_config()
     metadata = AscendConnectorMetadata(
@@ -329,21 +355,6 @@ def test_worker_load_error_query_failure_invalidates_pending_load_blocks() -> No
         connector.start_load_kv(MagicMock())
 
         assert connector.get_block_ids_with_load_errors() == {7, 8}
-
-
-def test_worker_start_load_rejects_layerwise_retrieve() -> None:
-    config = _make_vllm_config()
-    config.kv_transfer_config.kv_connector_extra_config = {
-        "kv_cache_server_url": SERVER_URL,
-        "use_layerwise": True,
-    }
-
-    with patch(f"{CONNECTOR_MODULE}.KVCacheClient"):
-        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
-        connector.bind_connector_metadata(_make_load_metadata())
-
-        with pytest.raises(NotImplementedError, match="layerwise Retrieve"):
-            connector.start_load_kv(MagicMock())
 
 
 def test_worker_keeps_exported_cache_alive_until_shutdown() -> None:

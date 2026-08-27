@@ -209,6 +209,21 @@ class KVCacheServiceManager:
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
         worker.start_load_kv(metadata)
 
+    def wait_for_layer_load(self, identity: WorkerIdentity, session_id: str) -> None:
+        worker = self._workers.get_for_session(identity, session_id)
+        if worker is None:
+            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        worker.wait_for_layer_load()
+
+    def save_kv_layer(self, identity: WorkerIdentity, session_id: str, event_spec: NPUEventSpec) -> None:
+        worker = self._workers.get_for_session(identity, session_id)
+        if worker is None:
+            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        handler = getattr(worker, "save_kv_layer_from_event", None)
+        if not callable(handler):
+            raise RuntimeError(f"Worker {identity!r} does not support cross-process layer Store")
+        handler(event_spec)
+
     def get_block_ids_with_load_errors(self, identity: WorkerIdentity, session_id: str) -> set[int]:
         worker = self._workers.get_for_session(identity, session_id)
         if worker is None:

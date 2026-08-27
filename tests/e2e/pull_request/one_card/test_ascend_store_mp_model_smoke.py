@@ -1,10 +1,10 @@
-"""Real-model smoke test for the AscendStore MP path.
+"""Real-model smoke tests for the AscendStore MP path.
 
-Boots a real vLLM engine with the MP connector and a real Mooncake backend:
-the first request stores KV through the KVCacheServer, the local prefix
-cache is then reset, and the second identical request must be served from an
-external lookup hit (retrieve) with identical greedy output. A separate test
-boots without any server to prove lookup degrades instead of failing.
+Boots real vLLM engines with the MP connector and a real Mooncake backend in
+bulk and layerwise modes. The first request stores KV through KVCacheServer,
+the local prefix cache is then reset, and the second identical request must be
+served from an external lookup hit with identical greedy output. A separate
+test proves lookup degrades instead of failing when no server is available.
 """
 
 import contextlib
@@ -99,7 +99,7 @@ def _run_smoke_server(endpoint_connection: Connection, control_connection: Conne
             file_handler.close()
 
 
-def _build_llm(model_path: str, server_url: str, monkeypatch):
+def _build_llm(model_path: str, server_url: str, monkeypatch, use_layerwise: bool = False):
     from vllm import LLM
     from vllm.config import KVTransferConfig
 
@@ -115,6 +115,7 @@ def _build_llm(model_path: str, server_url: str, monkeypatch):
         kv_connector_extra_config={
             "backend": "mooncake",
             "kv_cache_server_url": server_url,
+            "use_layerwise": use_layerwise,
         },
     )
     return LLM(
@@ -152,7 +153,8 @@ def _wait_for_prefix_cache_reset(llm) -> None:
         )
 
 
-def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("use_layerwise", [False, True], ids=["bulk", "layerwise"])
+def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch, use_layerwise: bool) -> None:
     import torch
     import torch_npu  # noqa: F401
     from vllm.utils.network_utils import get_open_port
@@ -212,7 +214,7 @@ def test_real_model_lookup_hit_and_retrieve(tmp_path, monkeypatch) -> None:
                 raise RuntimeError(f"KV cache server failed to start:\n{server_result}")
 
             torch.npu.set_device(0)
-            llm = _build_llm(model_path, server_result, monkeypatch)
+            llm = _build_llm(model_path, server_result, monkeypatch, use_layerwise)
             block_size = llm.llm_engine.vllm_config.cache_config.block_size
             prompt_token_count = len(llm.get_tokenizer().encode(_PROMPT))
             assert prompt_token_count >= 2 * block_size, (
