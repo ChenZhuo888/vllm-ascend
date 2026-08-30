@@ -111,6 +111,10 @@ class MPServer:
             Route(SystemMethod.ECHO, self._handle_echo, system_executor),
             *routes,
         )
+        # The route table serves request dispatch, while the executor collection
+        # is a separate ownership ledger because multiple routes may share one
+        # executor. Claim that ownership first so route validation failures can
+        # still shut down every referenced executor exactly once.
         self._executors = self._collect_executors(all_routes)
         try:
             self._routes = self._index_routes(all_routes)
