@@ -42,8 +42,11 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     a service owner use ``get_for_session``. Background expiration and manager
     shutdown use ``owner_close_handler`` when the service has an owner lane.
 
-    The lifecycle lock owns every per-identity state map. Expiration and
-    maintenance use separate locks only to serialize their long-running work.
+    The lifecycle lock owns every per-identity state map. One identity may be
+    present in at most one of registering, services, expiring, and recoverable;
+    retired sessions are independent history and may coexist with current state.
+    Expiration and maintenance use separate locks only to serialize their
+    long-running work.
     """
 
     def __init__(

@@ -85,7 +85,12 @@ class _ResponseEnvelope:
 
 
 class _ServerState(Enum):
-    """Lifecycle states for graceful and forced server shutdown."""
+    """Lifecycle states for graceful and forced server shutdown.
+
+    Graceful operation moves from READY to RUNNING, then through DRAINING and
+    DRAINED before CLOSED releases resources. Any nonterminal state may instead
+    move through ABORTING to ABORTED.
+    """
 
     READY = auto()
     RUNNING = auto()
@@ -135,8 +140,8 @@ class MPServer:
             self._shutdown_executors()
             raise
 
-        self._output_queue: queue.Queue[_ResponseEnvelope] = queue.Queue()
-        self._response_backlog: deque[_ResponseEnvelope] = deque()
+        self._completed_response_queue: queue.Queue[_ResponseEnvelope] = queue.Queue()
+        self._send_backlog: deque[_ResponseEnvelope] = deque()
         self._notify_writer.setblocking(False)
         self._notify_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -237,7 +242,7 @@ class MPServer:
             while not self._should_stop_run():
                 # Backpressure must drain queued responses before more requests
                 # are accepted, otherwise memory use can grow without bound.
-                expected_socket_events = zmq.POLLOUT if self._response_backlog else zmq.POLLIN
+                expected_socket_events = zmq.POLLOUT if self._send_backlog else zmq.POLLIN
                 if socket_events != expected_socket_events:
                     socket_events = expected_socket_events
                     poller.modify(self._socket, socket_events)
@@ -245,13 +250,13 @@ class MPServer:
                 events = dict(poller.poll())
 
                 if self._notify_reader.fileno() in events:
-                    self._receive_response_notification()
+                    self._process_run_notification()
                     self._send_responses()
 
                 socket_event = events.get(self._socket, 0)
                 if socket_event & zmq.POLLOUT:
                     self._send_responses()
-                if socket_event & zmq.POLLIN and not self._response_backlog:
+                if socket_event & zmq.POLLIN and not self._send_backlog:
                     self._receive_and_dispatch_request()
         except BaseException:
             self.abort()
@@ -302,7 +307,7 @@ class MPServer:
             self._state = _ServerState.DRAINING
             run_active = self._run_thread is not None
         if run_active:
-            self._notify_response_ready()
+            self._wake_run_loop()
         return True
 
     def wait_until_stopped(self, timeout: float | None = None) -> bool:
@@ -351,13 +356,13 @@ class MPServer:
             self._state = _ServerState.ABORTING
             requests = tuple(self._accepted_requests.values())
             for request in requests:
-                self._output_queue.put(
+                self._completed_response_queue.put(
                     _ResponseEnvelope(self._encode_abort_response(request), request.key, is_abort_response=True)
                 )
             run_active = self._run_thread is not None
 
         self._shutdown_executors(wait=False, cancel_futures=True)
-        self._notify_response_ready()
+        self._wake_run_loop()
         if not run_active:
             self._release_resources(
                 _ServerState.ABORTED,
@@ -560,8 +565,8 @@ class MPServer:
                 return
             if self._state is _ServerState.ABORTING or self._state is _ServerState.ABORTED:
                 return
-            self._output_queue.put(_ResponseEnvelope(response, request_key))
-        self._notify_response_ready()
+            self._completed_response_queue.put(_ResponseEnvelope(response, request_key))
+        self._wake_run_loop()
 
     # ==============================
     # Response delivery and backpressure
@@ -570,7 +575,7 @@ class MPServer:
     # Executor threads publish immutable envelopes. The run thread retains any
     # response rejected by non-blocking send and pauses admission until it drains.
 
-    def _notify_response_ready(self) -> None:
+    def _wake_run_loop(self) -> None:
         with self._notify_lock:
             try:
                 self._notify_writer.send(b"\x01")
@@ -588,41 +593,41 @@ class MPServer:
                     logger.exception("Failed to notify MP server response loop")
 
     def _publish_response(self, response: ServerResponse) -> None:
-        self._output_queue.put(_ResponseEnvelope(response))
-        self._notify_response_ready()
+        self._completed_response_queue.put(_ResponseEnvelope(response))
+        self._wake_run_loop()
 
-    def _receive_response_notification(self) -> None:
+    def _process_run_notification(self) -> None:
         self._notify_reader.recv(4096)
 
         while True:
             try:
-                response = self._output_queue.get_nowait()
+                response = self._completed_response_queue.get_nowait()
             except queue.Empty:
                 return
-            self._response_backlog.append(response)
+            self._send_backlog.append(response)
 
     def _send_responses(self) -> None:
         # Responses belong to work the server has already accepted. NOBLOCK
         # keeps the run loop responsive; Again leaves the head queued for the
         # next POLLOUT notification instead of dropping an owed response.
-        while self._response_backlog:
-            response = self._response_backlog[0]
+        while self._send_backlog:
+            response = self._send_backlog[0]
             if response.request_key is None:
                 try:
                     self._socket.send_multipart(response.frames, flags=zmq.NOBLOCK)
                 except zmq.Again:
                     return
-                self._response_backlog.popleft()
+                self._send_backlog.popleft()
                 continue
 
             with self._state_condition:
                 if response.request_key not in self._accepted_requests:
-                    self._response_backlog.popleft()
+                    self._send_backlog.popleft()
                     continue
                 # Once abort owns a request, any normal response queued earlier
                 # must yield to the abort response without completing the request.
                 if self._state is _ServerState.ABORTING and not response.is_abort_response:
-                    self._response_backlog.popleft()
+                    self._send_backlog.popleft()
                     continue
 
                 try:
@@ -630,7 +635,7 @@ class MPServer:
                 except zmq.Again:
                     return
                 del self._accepted_requests[response.request_key]
-                self._response_backlog.popleft()
+                self._send_backlog.popleft()
 
     # ==============================
     # Terminal resource release

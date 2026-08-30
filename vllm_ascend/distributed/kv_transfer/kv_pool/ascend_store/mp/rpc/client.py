@@ -63,7 +63,12 @@ class _PendingRequest:
 
 
 class _ClientLifecycleState(Enum):
-    """Lifecycle of the I/O thread and its transport resources."""
+    """Lifecycle of the I/O thread and its transport resources.
+
+    Normal transport moves from STARTING to DISCONNECTED and then between
+    DISCONNECTED and CONNECTED. Any live state may fail or begin closing;
+    closing joins the I/O owner before publishing CLOSED.
+    """
 
     STARTING = auto()
     DISCONNECTED = auto()

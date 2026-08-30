@@ -425,7 +425,7 @@ def test_server_rejects_requests_after_stop_is_requested() -> None:
         server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, (b"request",))
 
         handler.assert_not_called()
-        identity, *response_frames = server._output_queue.get_nowait().frames
+        identity, *response_frames = server._completed_response_queue.get_nowait().frames
         _, method, status, responses = decode_response(response_frames)
         assert identity == b"client"
         assert method == UPPERCASE_METHOD
@@ -443,8 +443,8 @@ def test_server_reports_duplicate_in_flight_request() -> None:
         server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, ())
         server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, ())
 
-        server._output_queue.get_nowait()
-        identity, *response_frames = server._output_queue.get_nowait().frames
+        server._completed_response_queue.get_nowait()
+        identity, *response_frames = server._completed_response_queue.get_nowait().frames
         _, method, status, responses = decode_response(response_frames)
         assert handler.call_count == 1
         assert identity == b"client"
@@ -464,7 +464,7 @@ def test_server_returns_handler_base_exception_without_leaking_request() -> None
     try:
         server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, ())
 
-        response = server._output_queue.get_nowait()
+        response = server._completed_response_queue.get_nowait()
         identity, *response_frames = response.frames
         _, method, status, responses = decode_response(response_frames)
         assert identity == b"client"
@@ -474,7 +474,7 @@ def test_server_returns_handler_base_exception_without_leaking_request() -> None
         assert b"Traceback (most recent call last)" in responses[1]
         assert b'raise KeyboardInterrupt("handler interrupted")' in responses[1]
 
-        server._response_backlog.append(response)
+        server._send_backlog.append(response)
         socket = server._socket
         server._socket = MagicMock()
         server._send_responses()
@@ -494,7 +494,7 @@ def test_server_returns_executor_failure() -> None:
     try:
         server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, (b"request",))
 
-        _, *response_frames = server._output_queue.get_nowait().frames
+        _, *response_frames = server._completed_response_queue.get_nowait().frames
         _, method, status, responses = decode_response(response_frames)
         assert method == UPPERCASE_METHOD
         assert status is ResponseStatus.ERROR
@@ -673,13 +673,13 @@ def test_server_backpressure_retains_response_without_blocking() -> None:
     server = MPServer.__new__(MPServer)
     response = (b"client", b"request-0", b"TEST")
     response_envelope = SimpleNamespace(frames=response, request_key=None)
-    server._response_backlog = deque((response_envelope,))
+    server._send_backlog = deque((response_envelope,))
     server._socket = MagicMock()
     server._socket.send_multipart.side_effect = zmq.Again()
 
     server._send_responses()
 
-    assert server._response_backlog == deque((response_envelope,))
+    assert server._send_backlog == deque((response_envelope,))
 
 
 def test_server_close_rejects_request_without_deadline() -> None:
