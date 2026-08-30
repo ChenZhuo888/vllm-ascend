@@ -24,7 +24,7 @@ class TaskExecutor(Protocol):
     """Submit work with optional affinity and blocking admission."""
 
     def submit(
-            self, fn: Callable[[], _ResultT], key: Hashable | None = None, block: bool = False
+        self, fn: Callable[[], _ResultT], key: Hashable | None = None, block: bool = False
     ) -> Future[_ResultT]: ...
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None: ...

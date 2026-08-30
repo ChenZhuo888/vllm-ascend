@@ -406,6 +406,16 @@ def test_server_constructor_closes_executor_after_route_validation_failure() -> 
     executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
 
 
+def test_server_constructor_closes_valid_executor_when_another_route_is_malformed() -> None:
+    executor = MagicMock()
+    routes = (Route(UPPERCASE_METHOD, _uppercase_handler, executor), object())
+
+    with pytest.raises(TypeError, match="routes must contain Route instances"):
+        MPServer("tcp://127.0.0.1:*", routes)
+
+    executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+
+
 def test_server_rejects_requests_after_stop_is_requested() -> None:
     handler = MagicMock(return_value=(b"response",))
     server = MPServer("tcp://127.0.0.1:*", routes=(Route(UPPERCASE_METHOD, handler, InlineExecutor()),))
@@ -423,6 +433,26 @@ def test_server_rejects_requests_after_stop_is_requested() -> None:
         assert responses == (b"MPServerBusyError: MP server is stopping",)
     finally:
         server.close()
+
+
+def test_server_reports_duplicate_in_flight_request() -> None:
+    handler = MagicMock(return_value=(b"response",))
+    server = MPServer("tcp://127.0.0.1:*", routes=(Route(UPPERCASE_METHOD, handler, InlineExecutor()),))
+
+    try:
+        server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, ())
+        server._dispatch_request(b"client", b"request-0", UPPERCASE_METHOD, ())
+
+        server._output_queue.get_nowait()
+        identity, *response_frames = server._output_queue.get_nowait().frames
+        _, method, status, responses = decode_response(response_frames)
+        assert handler.call_count == 1
+        assert identity == b"client"
+        assert method == UPPERCASE_METHOD
+        assert status is ResponseStatus.BUSY
+        assert responses == (b"MPServerBusyError: Duplicate in-flight MP request",)
+    finally:
+        server.abort()
 
 
 def test_server_returns_handler_base_exception_without_leaking_request() -> None:
@@ -609,6 +639,33 @@ def test_client_backpressure_does_not_leave_an_unsent_request_pending() -> None:
 
     with pytest.raises(MPServerBusyError, match="outbound transport is busy"):
         future.result()
+    assert client._pending_requests == {}
+
+
+def test_client_transport_send_failure_completes_current_request() -> None:
+    client = MPClient.__new__(MPClient)
+    client._outbound_queue = queue.Queue()
+    client._pending_requests = {}
+    future = Future()
+    client._outbound_queue.put(
+        SimpleNamespace(
+            request_id=b"request-0",
+            method="TEST",
+            frames=(b"request-0", b"TEST"),
+            future=future,
+            deadline_ns=None,
+        )
+    )
+    transport_error = RuntimeError("transport send failed")
+    zmq_socket = MagicMock()
+    zmq_socket.send_multipart.side_effect = transport_error
+
+    with pytest.raises(MPServerUnavailableError, match="I/O thread is unavailable") as exc_info:
+        client._process_outbound(zmq_socket)
+
+    assert future.exception() is exc_info.value
+    assert exc_info.value.__cause__ is transport_error
+    assert client._outbound_queue.empty()
     assert client._pending_requests == {}
 
 

@@ -96,6 +96,14 @@ class _ServerState(Enum):
     CLOSED = auto()
 
 
+class _AdmissionResult(Enum):
+    """Outcome of claiming one request in the server lifecycle."""
+
+    ACCEPTED = auto()
+    STOPPING = auto()
+    DUPLICATE = auto()
+
+
 class MPServer:
     """Serve RPC routes and own their executors until the server is closed.
 
@@ -180,6 +188,10 @@ class MPServer:
     def _collect_executors(routes: Iterable[Route]) -> tuple[TaskExecutor, ...]:
         executors = {}
         for route in routes:
+            # Route validation runs after ownership is claimed so every valid
+            # executor can still be shut down when another entry is malformed.
+            if not isinstance(route, Route):
+                continue
             executors.setdefault(id(route.executor), route.executor)
         return tuple(executors.values())
 
@@ -240,7 +252,7 @@ class MPServer:
                 if socket_event & zmq.POLLOUT:
                     self._send_responses()
                 if socket_event & zmq.POLLIN and not self._response_backlog:
-                    self._receive_request()
+                    self._receive_and_dispatch_request()
         except BaseException:
             self.abort()
             raise
@@ -425,7 +437,7 @@ class MPServer:
     # The run thread admits and dispatches requests. Executors run handlers and
     # publish completion back through the response queue and notification socket.
 
-    def _receive_request(self) -> None:
+    def _receive_and_dispatch_request(self) -> None:
         frames = self._socket.recv_multipart()
         if len(frames) < 4:
             logger.warning(
@@ -453,8 +465,19 @@ class MPServer:
         deadline_ns: int | None = None,
     ) -> None:
         request = _AcceptedRequest(identity, request_id, method, deadline_ns)
-        if not self._try_accept_request(request):
+        admission = self._try_accept_request(request)
+        if admission is _AdmissionResult.STOPPING:
             self._reject_stopping_request(identity, request_id, method)
+            return
+        if admission is _AdmissionResult.DUPLICATE:
+            self._publish_response(
+                self._encode_error_response(
+                    identity,
+                    request_id,
+                    method,
+                    MPServerBusyError("Duplicate in-flight MP request"),
+                )
+            )
             return
 
         route = self._routes.get(method)
@@ -480,14 +503,14 @@ class MPServer:
 
         future.add_done_callback(partial(self._on_execution_done, request))
 
-    def _try_accept_request(self, request: _AcceptedRequest) -> bool:
+    def _try_accept_request(self, request: _AcceptedRequest) -> _AdmissionResult:
         with self._state_condition:
             if self._state is not _ServerState.READY and self._state is not _ServerState.RUNNING:
-                return False
+                return _AdmissionResult.STOPPING
             if request.key in self._accepted_requests:
-                return False
+                return _AdmissionResult.DUPLICATE
             self._accepted_requests[request.key] = request
-            return True
+            return _AdmissionResult.ACCEPTED
 
     def _reject_stopping_request(self, identity: bytes, request_id: bytes, method: str) -> None:
         with self._state_condition:
@@ -583,6 +606,9 @@ class MPServer:
             pass
 
     def _send_responses(self) -> None:
+        # Responses belong to work the server has already accepted. NOBLOCK
+        # keeps the run loop responsive; Again leaves the head queued for the
+        # next POLLOUT notification instead of dropping an owed response.
         while self._response_backlog:
             response = self._response_backlog[0]
             if response.request_key is None:

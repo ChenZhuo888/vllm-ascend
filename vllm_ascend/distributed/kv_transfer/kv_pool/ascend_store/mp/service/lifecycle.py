@@ -212,13 +212,15 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         service: ServiceT | None,
         exc: BaseException,
     ) -> None:
+        owns_flight = False
         with self._lock:
             if self._registering.get(identity) is flight:
                 del self._registering[identity]
+                owns_flight = True
 
         if service is not None:
             self._close_service_safely(service)
-        if not flight.future.done():
+        if owns_flight:
             flight.future.set_exception(exc)
 
     # ==============================
@@ -376,6 +378,8 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
 
     # Closing rejects new lifecycle work before joining maintenance. Entries are
     # detached under lock and then closed on their owner lanes without holding it.
+    # Once detached, a service is terminal: background and shutdown cleanup is
+    # best-effort and never retries because backend close need not be idempotent.
 
     def close(self) -> None:
         with self._lock:
@@ -387,11 +391,18 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         with self._expiration_lock, self._lock:
             services = [(identity, entry.service) for identity, entry in self._services.items()]
             services.extend((identity, entry.service) for identity, entry in self._expiring.items())
+            registration_flights = tuple(self._registering.values())
             self._services.clear()
             self._registering.clear()
             self._expiring.clear()
             self._recoverable_sessions.clear()
             self._retired_sessions.clear()
+
+        # Closing the manager makes every shared registration wait terminal,
+        # even though a factory already running outside the lock cannot be
+        # cancelled and will clean up its result when it eventually returns.
+        for flight in registration_flights:
+            flight.future.set_exception(RuntimeError(f"{self._service_name} lifecycle manager is closed"))
 
         for identity, service in services:
             self._close_on_owner_safely(identity, service)

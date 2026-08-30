@@ -231,12 +231,13 @@ class MPClient:
                     self._process_monitor_event(zmq_socket, monitor_socket)
                 self._expire_pending_requests()
         except Exception as exc:
+            failure = self._as_server_unavailable(exc)
             with self._client_lifecycle_condition:
                 self._io_error = exc
                 if self._lifecycle_state is not _ClientLifecycleState.CLOSING:
                     self._lifecycle_state = _ClientLifecycleState.FAILED
                 self._client_lifecycle_condition.notify_all()
-            self._fail_pending(exc)
+            self._fail_pending(failure)
         finally:
             with self._client_lifecycle_condition:
                 if self._lifecycle_state is _ClientLifecycleState.CONNECTED:
@@ -272,8 +273,19 @@ class MPClient:
                 try:
                     zmq_socket.send_multipart(request.frames, flags=zmq.NOBLOCK)
                 except zmq.Again:
+                    # Non-blocking send reports transport backpressure through
+                    # Again. The server has not accepted this request, so fail
+                    # it as busy instead of blocking the client I/O loop.
                     request.future.set_exception(MPServerBusyError("MP client outbound transport is busy"))
                     continue
+                except Exception as exc:
+                    # Removing a request from the outbound queue and publishing
+                    # it as pending is one ownership handoff. If transport send
+                    # fails between those states, this thread still owns and
+                    # must complete the request before the I/O loop terminates.
+                    failure = self._as_server_unavailable(exc)
+                    request.future.set_exception(failure)
+                    raise failure from exc
 
                 self._pending_requests[request.request_id] = _PendingRequest(
                     request.method, request.future, request.deadline_ns
@@ -325,6 +337,15 @@ class MPClient:
             return
 
         pending.future.set_result(list(responses))
+
+    @staticmethod
+    def _as_server_unavailable(exc: Exception) -> MPServerUnavailableError:
+        """Expose a failed client I/O loop through the degradable RPC contract."""
+        if isinstance(exc, MPServerUnavailableError):
+            return exc
+        failure = MPServerUnavailableError("MP client I/O thread is unavailable")
+        failure.__cause__ = exc
+        return failure
 
     def _drain_inbound(self, zmq_socket: zmq.Socket) -> None:
         while zmq_socket.poll(timeout=0, flags=zmq.POLLIN):

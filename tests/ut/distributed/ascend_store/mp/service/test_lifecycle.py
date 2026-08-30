@@ -39,6 +39,12 @@ class _BlockingCloseService(_FakeService):
             raise TimeoutError("Timed out waiting to release service close")
 
 
+class _FailingCloseService(_FakeService):
+    def close(self) -> None:
+        super().close()
+        raise RuntimeError("service close failed")
+
+
 def _create_manager(
     clock=lambda: 0.0,
     lease_timeout_s: float = 10.0,
@@ -100,6 +106,47 @@ def test_identical_concurrent_registration_shares_factory_result() -> None:
     assert created == [first_service]
 
 
+def test_manager_close_terminates_shared_registration_wait() -> None:
+    factory_started = threading.Event()
+    release_factory = threading.Event()
+    wait_started = threading.Event()
+    created = []
+
+    def factory() -> _FakeService:
+        service = _FakeService()
+        created.append(service)
+        factory_started.set()
+        assert release_factory.wait(5), "Service factory was not released"
+        return service
+
+    manager = _create_manager()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        creator = executor.submit(manager.register, "service-0", "session-0", b"config", factory)
+        assert factory_started.wait(5), "Service factory did not start"
+
+        flight = manager._registering["service-0"]
+        wait_for_result = flight.future.result
+
+        def observe_wait():
+            wait_started.set()
+            return wait_for_result()
+
+        with patch.object(flight.future, "result", side_effect=observe_wait):
+            waiter = executor.submit(manager.register, "service-0", "session-0", b"config", factory)
+            assert wait_started.wait(5), "Concurrent registration did not wait on the shared flight"
+
+            manager.close()
+            with pytest.raises(RuntimeError, match="lifecycle manager is closed"):
+                waiter.result(timeout=5)
+
+            release_factory.set()
+            with pytest.raises(RuntimeError, match="lifecycle manager is closed"):
+                creator.result(timeout=5)
+
+    assert len(created) == 1
+    assert created[0].close_count == 1
+
+
 def test_registration_conflict_and_retired_session_are_rejected() -> None:
     manager = _create_manager()
     manager.register("service-0", "session-0", b"config", _FakeService)
@@ -126,6 +173,21 @@ def test_expired_session_recovers_only_with_the_same_fingerprint() -> None:
 
     second_service = manager.register("service-0", "session-0", b"config", _FakeService)
     assert second_service is not first_service
+
+
+def test_expiration_does_not_retain_service_after_close_failure() -> None:
+    now = [0.0]
+    manager = _create_manager(lambda: now[0])
+    failed_service = manager.register("service-0", "session-0", b"config", _FailingCloseService)
+
+    now[0] = 11.0
+    assert manager.expire_leases() == 1
+    assert failed_service.close_count == 1
+    assert manager.count == 0
+
+    replacement = manager.register("service-0", "session-0", b"config", _FakeService)
+    assert replacement is not failed_service
+    manager.close()
 
 
 def test_expiration_uses_the_owner_close_handler() -> None:
