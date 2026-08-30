@@ -123,7 +123,7 @@ class MPServer:
         # is a separate ownership ledger because multiple routes may share one
         # executor. Claim that ownership first so route validation failures can
         # still shut down every referenced executor exactly once.
-        self._executors = self._collect_executors(all_routes)
+        self._executors = self._collect_owned_executors(all_routes)
         try:
             self._routes = self._index_routes(all_routes)
         except BaseException:
@@ -174,7 +174,7 @@ class MPServer:
         self.close()
 
     @staticmethod
-    def _index_routes(route_definitions: Iterable[Route]) -> dict[str, Route]:
+    def _index_routes(route_definitions: Iterable[object]) -> dict[str, Route]:
         indexed_routes = {}
         for route in route_definitions:
             if not isinstance(route, Route):
@@ -185,7 +185,7 @@ class MPServer:
         return indexed_routes
 
     @staticmethod
-    def _collect_executors(routes: Iterable[Route]) -> tuple[TaskExecutor, ...]:
+    def _collect_owned_executors(routes: Iterable[object]) -> tuple[TaskExecutor, ...]:
         executors = {}
         for route in routes:
             # Route validation runs after ownership is claimed so every valid
@@ -491,11 +491,6 @@ class MPServer:
         try:
             callback = partial(self._execute_handler, identity, request_id, method, payloads, route.handler)
             key = None if route.key_factory is None else route.key_factory(identity, payloads)
-        except BaseException as exc:
-            self._complete_execution(request.key, self._encode_error_response(identity, request_id, method, exc))
-            return
-
-        try:
             future = route.executor.submit(callback, key)
         except BaseException as exc:
             self._complete_execution(request.key, self._encode_error_response(identity, request_id, method, exc))
@@ -599,11 +594,12 @@ class MPServer:
     def _receive_response_notification(self) -> None:
         self._notify_reader.recv(4096)
 
-        try:
-            while True:
-                self._response_backlog.append(self._output_queue.get_nowait())
-        except queue.Empty:
-            pass
+        while True:
+            try:
+                response = self._output_queue.get_nowait()
+            except queue.Empty:
+                return
+            self._response_backlog.append(response)
 
     def _send_responses(self) -> None:
         # Responses belong to work the server has already accepted. NOBLOCK

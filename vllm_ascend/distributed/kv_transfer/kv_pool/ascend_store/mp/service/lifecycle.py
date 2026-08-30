@@ -212,15 +212,15 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         service: ServiceT | None,
         exc: BaseException,
     ) -> None:
-        owns_flight = False
+        should_complete_flight = False
         with self._lock:
             if self._registering.get(identity) is flight:
                 del self._registering[identity]
-                owns_flight = True
+                should_complete_flight = True
 
         if service is not None:
             self._close_service_safely(service)
-        if owns_flight:
+        if should_complete_flight:
             flight.future.set_exception(exc)
 
     # ==============================

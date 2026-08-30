@@ -158,6 +158,8 @@ class AffinityExecutor:
 
         try:
             with self._state_lock:
+                # Shutdown may win while submit waits for capacity, so admission
+                # must recheck the lifecycle state after that blocking point.
                 if self._closed:
                     raise RuntimeError("Affinity executor is closed")
                 worker_index = hash(key) % len(self._queues)
