@@ -5,6 +5,13 @@ from collections.abc import Iterable, Sequence
 
 from .error import MPProtocolError
 
+# ==============================
+# Wire vocabulary
+# ==============================
+
+# RPC transports multipart byte frames. These enums define the only built-in
+# method and response semantics understood by the transport layer.
+
 MultipartMessage = tuple[bytes, ...]
 
 
@@ -20,44 +27,12 @@ class ResponseStatus(str, enum.Enum):
     ABORTED = "ABORTED"
 
 
-def normalize_method(method: str) -> str:
-    if not isinstance(method, str):
-        raise TypeError(f"method must be a string, got {type(method).__name__}")
+# ==============================
+# Request and response framing
+# ==============================
 
-    method_name = method.value if isinstance(method, enum.Enum) else method
-    if not method_name:
-        raise ValueError("method must not be empty")
-    return method_name
-
-
-def encode_method(method: str) -> bytes:
-    return normalize_method(method).encode()
-
-
-def decode_method(data: bytes) -> str:
-    _validate_frame(data, "method")
-
-    try:
-        method = data.decode()
-    except UnicodeDecodeError as exc:
-        raise MPProtocolError("Method frame is not valid UTF-8") from exc
-
-    if not method:
-        raise MPProtocolError("Method frame must not be empty")
-    return method
-
-
-def encode_response_status(status: ResponseStatus) -> bytes:
-    return status.value.encode()
-
-
-def decode_response_status(data: bytes) -> ResponseStatus:
-    _validate_frame(data, "response status")
-
-    try:
-        return ResponseStatus(data.decode())
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise MPProtocolError(f"Invalid response status: {data!r}") from exc
+# Framing stays independent of business payloads. Callers own the meaning of
+# every payload frame after the transport envelope has been decoded.
 
 
 def encode_request(
@@ -103,6 +78,54 @@ def decode_response(
         decode_response_status(status_frame),
         _normalize_payloads(payloads),
     )
+
+
+# ==============================
+# Primitive frame codecs and validation
+# ==============================
+
+# Encoding validates caller-owned values eagerly. Decoding converts malformed
+# peer input into MPProtocolError so transport failures have one error boundary.
+
+
+def normalize_method(method: str) -> str:
+    if not isinstance(method, str):
+        raise TypeError(f"method must be a string, got {type(method).__name__}")
+
+    method_name = method.value if isinstance(method, enum.Enum) else method
+    if not method_name:
+        raise ValueError("method must not be empty")
+    return method_name
+
+
+def encode_method(method: str) -> bytes:
+    return normalize_method(method).encode()
+
+
+def decode_method(data: bytes) -> str:
+    _validate_frame(data, "method")
+
+    try:
+        method = data.decode()
+    except UnicodeDecodeError as exc:
+        raise MPProtocolError("Method frame is not valid UTF-8") from exc
+
+    if not method:
+        raise MPProtocolError("Method frame must not be empty")
+    return method
+
+
+def encode_response_status(status: ResponseStatus) -> bytes:
+    return status.value.encode()
+
+
+def decode_response_status(data: bytes) -> ResponseStatus:
+    _validate_frame(data, "response status")
+
+    try:
+        return ResponseStatus(data.decode())
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise MPProtocolError(f"Invalid response status: {data!r}") from exc
 
 
 def _normalize_payloads(payloads: Iterable[bytes]) -> tuple[bytes, ...]:

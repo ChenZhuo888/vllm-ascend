@@ -161,6 +161,46 @@ class MPServer:
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
 
+    @staticmethod
+    def _index_routes(route_definitions: Iterable[Route]) -> dict[str, Route]:
+        indexed_routes = {}
+        for route in route_definitions:
+            if not isinstance(route, Route):
+                raise TypeError(f"routes must contain Route instances, got {type(route).__name__}")
+            if route.method in indexed_routes:
+                raise ValueError(f"Duplicate RPC method: {route.method}")
+            indexed_routes[route.method] = route
+        return indexed_routes
+
+    @staticmethod
+    def _collect_executors(routes: Iterable[Route]) -> tuple[TaskExecutor, ...]:
+        executors = {}
+        for route in routes:
+            executors.setdefault(id(route.executor), route.executor)
+        return tuple(executors.values())
+
+    @staticmethod
+    def _bind(zmq_socket: zmq.Socket, bind_url: str) -> str:
+        if bind_url.endswith(":*"):
+            base_url = bind_url[:-2]
+            port = zmq_socket.bind_to_random_port(base_url)
+            return f"{base_url}:{port}"
+
+        zmq_socket.bind(bind_url)
+        return bind_url
+
+    # ==============================
+    # Server lifecycle
+    # ==============================
+
+    # The run thread exclusively owns ROUTER I/O. Public lifecycle methods only
+    # publish state transitions and wake that owner to drain or abort work.
+
+    def _should_stop_run(self) -> bool:
+        with self._state_condition:
+            stopping = self._state is _ServerState.DRAINING or self._state is _ServerState.ABORTING
+            return stopping and not self._accepted_requests
+
     def run(self) -> None:
         with self._state_condition:
             if self._state in {_ServerState.ABORTED, _ServerState.CLOSED}:
@@ -330,46 +370,12 @@ class MPServer:
         with self._state_condition:
             return self._state is _ServerState.CLOSED
 
-    @staticmethod
-    def _index_routes(route_definitions: Iterable[Route]) -> dict[str, Route]:
-        indexed_routes = {}
-        for route in route_definitions:
-            if not isinstance(route, Route):
-                raise TypeError(f"routes must contain Route instances, got {type(route).__name__}")
-            if route.method in indexed_routes:
-                raise ValueError(f"Duplicate RPC method: {route.method}")
-            indexed_routes[route.method] = route
-        return indexed_routes
+    # ==============================
+    # System routes and response encoding
+    # ==============================
 
-    @staticmethod
-    def _collect_executors(routes: Iterable[Route]) -> tuple[TaskExecutor, ...]:
-        executors = {}
-        for route in routes:
-            executors.setdefault(id(route.executor), route.executor)
-        return tuple(executors.values())
-
-    def _shutdown_executors(self, wait: bool = True, cancel_futures: bool = True) -> None:
-        for executor in self._executors:
-            try:
-                executor.shutdown(wait=wait, cancel_futures=cancel_futures)
-            except Exception:
-                logger.exception("Failed to shut down MP server executor")
-
-    def _close_transport(self, linger_ms: int) -> None:
-        if self._transport_closed:
-            return
-        self._transport_closed = True
-        self._socket.close(linger=linger_ms)
-
-    @staticmethod
-    def _bind(zmq_socket: zmq.Socket, bind_url: str) -> str:
-        if bind_url.endswith(":*"):
-            base_url = bind_url[:-2]
-            port = zmq_socket.bind_to_random_port(base_url)
-            return f"{base_url}:{port}"
-
-        zmq_socket.bind(bind_url)
-        return bind_url
+    # PING and ECHO are transport-owned health methods. All handler outcomes are
+    # encoded here so worker threads never access the ROUTER socket directly.
 
     @staticmethod
     def _handle_ping(payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
@@ -408,91 +414,31 @@ class MPServer:
         )
         return request.identity, *response_frames
 
-    def _execute_handler(
-        self,
-        identity: bytes,
-        request_id: bytes,
-        method: str,
-        payloads: tuple[bytes, ...],
-        handler: RequestHandler,
-    ) -> ServerResponse:
-        try:
-            response_frames = encode_response(request_id, method, ResponseStatus.OK, handler(payloads))
-            return identity, *response_frames
-        except BaseException as exc:
-            logger.error(
-                "MP RPC handler failed. method=%s identity=%r request_id=%r",
-                method,
-                identity,
-                request_id,
-                exc_info=(type(exc), exc, exc.__traceback__),
+    # ==============================
+    # Request admission and execution
+    # ==============================
+
+    # The run thread admits and dispatches requests. Executors run handlers and
+    # publish completion back through the response queue and notification socket.
+
+    def _receive_request(self) -> None:
+        frames = self._socket.recv_multipart()
+        if len(frames) < 4:
+            logger.warning(
+                "Discarding malformed request: expected "
+                "[identity, request_id, method, deadline, *payloads], got %d frames",
+                len(frames),
             )
-            return self._encode_error_response(identity, request_id, method, exc)
-
-    def _notify_response_ready(self) -> None:
-        with self._notify_lock:
-            try:
-                self._notify_writer.send(b"\x01")
-            except BlockingIOError:
-                # A full notification socket already guarantees a poll wakeup.
-                pass
-            except OSError:
-                with self._state_condition:
-                    stopped = self._state in {
-                        _ServerState.ABORTING,
-                        _ServerState.ABORTED,
-                        _ServerState.CLOSED,
-                    }
-                if not stopped:
-                    logger.exception("Failed to notify MP server response loop")
-
-    def _publish_response(self, response: ServerResponse) -> None:
-        self._output_queue.put(_ResponseEnvelope(response))
-        self._notify_response_ready()
-
-    def _complete_execution(self, request_key: _RequestKey, response: ServerResponse) -> None:
-        with self._state_condition:
-            if request_key not in self._accepted_requests:
-                return
-            if self._state is _ServerState.ABORTING or self._state is _ServerState.ABORTED:
-                return
-            self._output_queue.put(_ResponseEnvelope(response, request_key))
-        self._notify_response_ready()
-
-    def _on_execution_done(self, request: _AcceptedRequest, future: Future[ServerResponse]) -> None:
-        if future.cancelled():
-            response = self._encode_error_response(
-                request.identity,
-                request.request_id,
-                request.method,
-                RuntimeError("Request execution was cancelled"),
-            )
-            self._complete_execution(request.key, response)
             return
 
+        identity, *request_frames = frames
         try:
-            response = future.result()
-        except BaseException as exc:
-            logger.exception("Failed to process MP server request")
-            response = self._encode_error_response(request.identity, request.request_id, request.method, exc)
-        self._complete_execution(request.key, response)
+            request_id, method, deadline_ns, payloads = decode_request(request_frames)
+        except Exception:
+            logger.exception("Discarding malformed MP server request")
+            return
 
-    def _try_accept_request(self, request: _AcceptedRequest) -> bool:
-        with self._state_condition:
-            if self._state is not _ServerState.READY and self._state is not _ServerState.RUNNING:
-                return False
-            if request.key in self._accepted_requests:
-                return False
-            self._accepted_requests[request.key] = request
-            return True
-
-    def _reject_stopping_request(self, identity: bytes, request_id: bytes, method: str) -> None:
-        with self._state_condition:
-            if self._state is _ServerState.ABORTING or self._state is _ServerState.ABORTED:
-                return
-        self._publish_response(
-            self._encode_error_response(identity, request_id, method, MPServerBusyError("MP server is stopping"))
-        )
+        self._dispatch_request(identity, request_id, method, payloads, deadline_ns)
 
     def _dispatch_request(
         self,
@@ -530,24 +476,98 @@ class MPServer:
 
         future.add_done_callback(partial(self._on_execution_done, request))
 
-    def _receive_request(self) -> None:
-        frames = self._socket.recv_multipart()
-        if len(frames) < 4:
-            logger.warning(
-                "Discarding malformed request: expected "
-                "[identity, request_id, method, deadline, *payloads], got %d frames",
-                len(frames),
-            )
-            return
+    def _try_accept_request(self, request: _AcceptedRequest) -> bool:
+        with self._state_condition:
+            if self._state is not _ServerState.READY and self._state is not _ServerState.RUNNING:
+                return False
+            if request.key in self._accepted_requests:
+                return False
+            self._accepted_requests[request.key] = request
+            return True
 
-        identity, *request_frames = frames
+    def _reject_stopping_request(self, identity: bytes, request_id: bytes, method: str) -> None:
+        with self._state_condition:
+            if self._state is _ServerState.ABORTING or self._state is _ServerState.ABORTED:
+                return
+        self._publish_response(
+            self._encode_error_response(identity, request_id, method, MPServerBusyError("MP server is stopping"))
+        )
+
+    def _execute_handler(
+        self,
+        identity: bytes,
+        request_id: bytes,
+        method: str,
+        payloads: tuple[bytes, ...],
+        handler: RequestHandler,
+    ) -> ServerResponse:
         try:
-            request_id, method, deadline_ns, payloads = decode_request(request_frames)
-        except Exception:
-            logger.exception("Discarding malformed MP server request")
+            response_frames = encode_response(request_id, method, ResponseStatus.OK, handler(payloads))
+            return identity, *response_frames
+        except BaseException as exc:
+            logger.error(
+                "MP RPC handler failed. method=%s identity=%r request_id=%r",
+                method,
+                identity,
+                request_id,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            return self._encode_error_response(identity, request_id, method, exc)
+
+    def _on_execution_done(self, request: _AcceptedRequest, future: Future[ServerResponse]) -> None:
+        if future.cancelled():
+            response = self._encode_error_response(
+                request.identity,
+                request.request_id,
+                request.method,
+                RuntimeError("Request execution was cancelled"),
+            )
+            self._complete_execution(request.key, response)
             return
 
-        self._dispatch_request(identity, request_id, method, payloads, deadline_ns)
+        try:
+            response = future.result()
+        except BaseException as exc:
+            logger.exception("Failed to process MP server request")
+            response = self._encode_error_response(request.identity, request.request_id, request.method, exc)
+        self._complete_execution(request.key, response)
+
+    def _complete_execution(self, request_key: _RequestKey, response: ServerResponse) -> None:
+        with self._state_condition:
+            if request_key not in self._accepted_requests:
+                return
+            if self._state is _ServerState.ABORTING or self._state is _ServerState.ABORTED:
+                return
+            self._output_queue.put(_ResponseEnvelope(response, request_key))
+        self._notify_response_ready()
+
+    # ==============================
+    # Response delivery and backpressure
+    # ==============================
+
+    # Executor threads publish immutable envelopes. The run thread retains any
+    # response rejected by non-blocking send and pauses admission until it drains.
+
+    def _notify_response_ready(self) -> None:
+        with self._notify_lock:
+            try:
+                self._notify_writer.send(b"\x01")
+            except BlockingIOError:
+                # A full notification socket already guarantees a poll wakeup.
+                pass
+            except OSError:
+                with self._state_condition:
+                    stopped = self._state in {
+                        _ServerState.ABORTING,
+                        _ServerState.ABORTED,
+                        _ServerState.CLOSED,
+                    }
+                if not stopped:
+                    logger.exception("Failed to notify MP server response loop")
+
+    def _publish_response(self, response: ServerResponse) -> None:
+        self._output_queue.put(_ResponseEnvelope(response))
+        self._notify_response_ready()
 
     def _receive_response_notification(self) -> None:
         self._notify_reader.recv(4096)
@@ -586,10 +606,25 @@ class MPServer:
                 del self._accepted_requests[response.request_key]
                 self._response_backlog.popleft()
 
-    def _should_stop_run(self) -> bool:
-        with self._state_condition:
-            stopping = self._state is _ServerState.DRAINING or self._state is _ServerState.ABORTING
-            return stopping and not self._accepted_requests
+    # ==============================
+    # Terminal resource release
+    # ==============================
+
+    # Terminal paths serialize executor and transport shutdown. Notification
+    # sockets outlive executor callbacks, and the ZMQ context always closes last.
+
+    def _shutdown_executors(self, wait: bool = True, cancel_futures: bool = True) -> None:
+        for executor in self._executors:
+            try:
+                executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+            except Exception:
+                logger.exception("Failed to shut down MP server executor")
+
+    def _close_transport(self, linger_ms: int) -> None:
+        if self._transport_closed:
+            return
+        self._transport_closed = True
+        self._socket.close(linger=linger_ms)
 
     def _release_resources(
         self,

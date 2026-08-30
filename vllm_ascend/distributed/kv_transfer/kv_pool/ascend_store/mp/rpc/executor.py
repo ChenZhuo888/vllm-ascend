@@ -10,14 +10,21 @@ from typing import Generic, Protocol, TypeVar
 from .error import MPServerBusyError
 
 _ResultT = TypeVar("_ResultT")
-_STOP = object()
+
+
+# ==============================
+# Execution contract
+# ==============================
+
+# MPServer owns executor lifetime through this narrow contract. Individual
+# executors decide admission and ordering without knowing RPC route semantics.
 
 
 class TaskExecutor(Protocol):
     """Submit work with optional affinity and blocking admission."""
 
     def submit(
-        self, fn: Callable[[], _ResultT], key: Hashable | None = None, block: bool = False
+            self, fn: Callable[[], _ResultT], key: Hashable | None = None, block: bool = False
     ) -> Future[_ResultT]: ...
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None: ...
@@ -28,6 +35,14 @@ def _validate_limits(max_workers: int, max_pending_tasks: int) -> None:
         raise ValueError("max_workers must be greater than 0")
     if max_pending_tasks < 0:
         raise ValueError("max_pending_tasks must not be negative")
+
+
+# ==============================
+# Inline executor
+# ==============================
+
+# System routes use the I/O thread directly because their handlers are bounded
+# and do not need queueing or affinity.
 
 
 class InlineExecutor:
@@ -51,6 +66,14 @@ class InlineExecutor:
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
         pass
+
+
+# ==============================
+# Bounded parallel executor
+# ==============================
+
+# Capacity includes running and pending work, so admission remains bounded even
+# though ThreadPoolExecutor itself uses an unbounded internal queue.
 
 
 class BoundedThreadPoolExecutor:
@@ -81,6 +104,17 @@ class BoundedThreadPoolExecutor:
 
     def _release_capacity(self, _future: Future[_ResultT]) -> None:
         self._capacity.release()
+
+
+# ==============================
+# Key-affinity executor
+# ==============================
+
+# A stable key-to-worker mapping serializes one owner's tasks while allowing
+# unrelated owners to make progress on different threads.
+
+
+_STOP = object()
 
 
 @dataclass(frozen=True)

@@ -74,6 +74,8 @@ class _ClientLifecycleState(Enum):
 
 
 class MPClient:
+    """Thread-safe RPC facade backed by one DEALER-owning I/O thread."""
+
     def __init__(self, server_url: str):
         self._context = zmq.Context()
         self._server_url = server_url
@@ -100,6 +102,13 @@ class MPClient:
         if io_error is not None:
             self.close()
             raise RuntimeError("Failed to start MP client I/O thread") from io_error
+
+    # ==============================
+    # Public API
+    # ==============================
+
+    # Application threads use this surface without touching transport-owned
+    # state. Requests cross to the I/O thread through the outbound queue.
 
     def __enter__(self) -> "MPClient":
         return self
@@ -137,18 +146,6 @@ class MPClient:
             if self._lifecycle_state is _ClientLifecycleState.FAILED:
                 raise MPServerUnavailableError("MP client I/O thread is unavailable") from self._io_error
             raise RuntimeError(f"Unexpected MP client lifecycle state: {self._lifecycle_state.name}")
-
-    @staticmethod
-    def _deadline_from_timeout(timeout_ms: int | None) -> int | None:
-        if timeout_ms is None:
-            return None
-        if timeout_ms <= 0:
-            raise ValueError(f"timeout_ms must be greater than 0, got {timeout_ms}")
-        return time.monotonic_ns() + timeout_ms * 1_000_000
-
-    def _notify_io_thread(self) -> None:
-        with contextlib.suppress(BlockingIOError):
-            self._notify_writer.send(b"\x01")
 
     def submit_request(
         self,
@@ -190,10 +187,77 @@ class MPClient:
     def echo(self, payload: bytes, timeout_ms: int = 5000) -> bytes:
         return self.request(SystemMethod.ECHO, [payload], timeout_ms=timeout_ms)[0]
 
+    # ==============================
+    # I/O thread
+    # ==============================
+
+    # This thread exclusively owns the DEALER socket and pending-request map. It
+    # sends queued frames, completes responses, observes connection changes, and
+    # expires deadlines without exposing transport state to application threads.
+
+    def _io_loop(self) -> None:
+        zmq_socket = None
+        monitor_socket = None
+        try:
+            zmq_socket = self._context.socket(zmq.DEALER)
+            monitor_socket = zmq_socket.get_monitor_socket(events=zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED)
+            zmq_socket.connect(self._server_url)
+
+            poller = zmq.Poller()
+            poller.register(zmq_socket, zmq.POLLIN)
+            poller.register(monitor_socket, zmq.POLLIN)
+            poller.register(self._notify_reader.fileno(), zmq.POLLIN)
+            with self._client_lifecycle_condition:
+                if self._lifecycle_state is _ClientLifecycleState.STARTING:
+                    self._lifecycle_state = _ClientLifecycleState.DISCONNECTED
+                    self._client_lifecycle_condition.notify()
+
+            while True:
+                timeout_ms = self._next_poll_timeout_ms()
+                events = dict(poller.poll() if timeout_ms is None else poller.poll(timeout_ms))
+
+                if self._notify_reader.fileno() in events:
+                    self._notify_reader.recv(4096)
+                    with self._client_lifecycle_condition:
+                        closing = self._lifecycle_state is _ClientLifecycleState.CLOSING
+                    if closing:
+                        self._fail_pending(MPClientClosedError("MP client was closed"))
+                        break
+                    self._process_outbound(zmq_socket)
+
+                if zmq_socket in events:
+                    self._process_inbound(zmq_socket)
+                if monitor_socket in events:
+                    self._process_monitor_event(zmq_socket, monitor_socket)
+                self._expire_pending_requests()
+        except Exception as exc:
+            with self._client_lifecycle_condition:
+                self._io_error = exc
+                if self._lifecycle_state is not _ClientLifecycleState.CLOSING:
+                    self._lifecycle_state = _ClientLifecycleState.FAILED
+                self._client_lifecycle_condition.notify_all()
+            self._fail_pending(exc)
+        finally:
+            with self._client_lifecycle_condition:
+                if self._lifecycle_state is _ClientLifecycleState.CONNECTED:
+                    self._lifecycle_state = _ClientLifecycleState.DISCONNECTED
+            if monitor_socket is not None:
+                monitor_socket.close(linger=0)
+            if zmq_socket is not None:
+                zmq_socket.close(linger=0)
+            self._notify_reader.close()
+
     @staticmethod
-    def _set_request_timeout(method: str, future: Future[list[bytes]]) -> None:
-        if not future.done():
-            future.set_exception(MPRequestTimeoutError(f"Timed out waiting for response to {method}"))
+    def _deadline_from_timeout(timeout_ms: int | None) -> int | None:
+        if timeout_ms is None:
+            return None
+        if timeout_ms <= 0:
+            raise ValueError(f"timeout_ms must be greater than 0, got {timeout_ms}")
+        return time.monotonic_ns() + timeout_ms * 1_000_000
+
+    def _notify_io_thread(self) -> None:
+        with contextlib.suppress(BlockingIOError):
+            self._notify_writer.send(b"\x01")
 
     def _process_outbound(self, zmq_socket: zmq.Socket) -> None:
         try:
@@ -293,6 +357,11 @@ class MPClient:
         elif event == zmq.EVENT_CONNECTED:
             self._handle_transport_connected()
 
+    @staticmethod
+    def _set_request_timeout(method: str, future: Future[list[bytes]]) -> None:
+        if not future.done():
+            future.set_exception(MPRequestTimeoutError(f"Timed out waiting for response to {method}"))
+
     def _next_poll_timeout_ms(self) -> int | None:
         deadlines_ns = [
             request.deadline_ns for request in self._pending_requests.values() if request.deadline_ns is not None
@@ -314,58 +383,6 @@ class MPClient:
             request = self._pending_requests.pop(request_id)
             self._set_request_timeout(request.method, request.future)
 
-    def _io_loop(self) -> None:
-        zmq_socket = None
-        monitor_socket = None
-        try:
-            zmq_socket = self._context.socket(zmq.DEALER)
-            monitor_socket = zmq_socket.get_monitor_socket(events=zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED)
-            zmq_socket.connect(self._server_url)
-
-            poller = zmq.Poller()
-            poller.register(zmq_socket, zmq.POLLIN)
-            poller.register(monitor_socket, zmq.POLLIN)
-            poller.register(self._notify_reader.fileno(), zmq.POLLIN)
-            with self._client_lifecycle_condition:
-                if self._lifecycle_state is _ClientLifecycleState.STARTING:
-                    self._lifecycle_state = _ClientLifecycleState.DISCONNECTED
-                    self._client_lifecycle_condition.notify()
-
-            while True:
-                timeout_ms = self._next_poll_timeout_ms()
-                events = dict(poller.poll() if timeout_ms is None else poller.poll(timeout_ms))
-
-                if self._notify_reader.fileno() in events:
-                    self._notify_reader.recv(4096)
-                    with self._client_lifecycle_condition:
-                        closing = self._lifecycle_state is _ClientLifecycleState.CLOSING
-                    if closing:
-                        self._fail_pending(MPClientClosedError("MP client was closed"))
-                        break
-                    self._process_outbound(zmq_socket)
-
-                if zmq_socket in events:
-                    self._process_inbound(zmq_socket)
-                if monitor_socket in events:
-                    self._process_monitor_event(zmq_socket, monitor_socket)
-                self._expire_pending_requests()
-        except Exception as exc:
-            with self._client_lifecycle_condition:
-                self._io_error = exc
-                if self._lifecycle_state is not _ClientLifecycleState.CLOSING:
-                    self._lifecycle_state = _ClientLifecycleState.FAILED
-                self._client_lifecycle_condition.notify_all()
-            self._fail_pending(exc)
-        finally:
-            with self._client_lifecycle_condition:
-                if self._lifecycle_state is _ClientLifecycleState.CONNECTED:
-                    self._lifecycle_state = _ClientLifecycleState.DISCONNECTED
-            if monitor_socket is not None:
-                monitor_socket.close(linger=0)
-            if zmq_socket is not None:
-                zmq_socket.close(linger=0)
-            self._notify_reader.close()
-
     def _fail_pending(self, exc: Exception) -> None:
         while True:
             try:
@@ -379,6 +396,13 @@ class MPClient:
             if not request.future.done():
                 request.future.set_exception(exc)
         self._pending_requests.clear()
+
+    # ==============================
+    # Shutdown
+    # ==============================
+
+    # Closing first stops admission, then wakes and joins the I/O owner before
+    # terminating notification and ZMQ resources from the caller thread.
 
     def close(self) -> None:
         with self._client_lifecycle_condition:

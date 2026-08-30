@@ -41,6 +41,9 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     Internal orchestration uses ``find`` without renewing a lease. Requests from
     a service owner use ``get_for_session``. Background expiration and manager
     shutdown use ``owner_close_handler`` when the service has an owner lane.
+
+    The lifecycle lock owns every per-identity state map. Expiration and
+    maintenance use separate locks only to serialize their long-running work.
     """
 
     def __init__(
@@ -95,6 +98,14 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         with self._lock:
             return tuple((identity, entry.service) for identity, entry in self._services.items())
 
+    # ==============================
+    # Registration and publication
+    # ==============================
+
+    # Registration is single-flight per identity. Factories and service closure
+    # run outside the lifecycle lock, then publish only if the flight still owns
+    # that identity and the manager remains open.
+
     def register(
         self,
         identity: IdentityT,
@@ -139,144 +150,6 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         if wait_future is not None:
             return wait_future.result()
         return self._create_and_publish(identity, session_id, fingerprint, factory, flight, old_service)
-
-    def renew(self, identity: IdentityT, session_id: str) -> bool:
-        self._validate_session_id(session_id)
-        with self._lock:
-            self._raise_if_closed()
-            self._raise_if_retired(identity, session_id)
-            entry = self._services.get(identity)
-            if entry is None:
-                return False
-            self._validate_session(identity, session_id, entry.session_id)
-            entry.last_seen = self._clock()
-            return True
-
-    def find(self, identity: IdentityT) -> ServiceT | None:
-        """Return a service without validating or renewing its owner session."""
-        with self._lock:
-            self._raise_if_closed()
-            entry = self._services.get(identity)
-            return None if entry is None else entry.service
-
-    def get_for_session(self, identity: IdentityT, session_id: str) -> ServiceT | None:
-        """Validate the owner session, renew its lease, and return the service."""
-        self._validate_session_id(session_id)
-        with self._lock:
-            self._raise_if_closed()
-            self._raise_if_retired(identity, session_id)
-            entry = self._services.get(identity)
-            if entry is None:
-                return None
-            self._validate_session(identity, session_id, entry.session_id)
-            entry.last_seen = self._clock()
-            return entry.service
-
-    def unregister(self, identity: IdentityT, session_id: str) -> bool:
-        self._validate_session_id(session_id)
-        service = None
-
-        with self._lock:
-            self._raise_if_closed()
-            self._raise_if_retired(identity, session_id)
-
-            expiring = self._expiring.get(identity)
-            if expiring is not None:
-                self._validate_session(identity, session_id, expiring.session_id)
-                self._retire_session_locked(identity, session_id)
-                return True
-
-            recoverable = self._recoverable_sessions.get(identity)
-            if recoverable is not None:
-                self._validate_session(identity, session_id, recoverable.session_id)
-                del self._recoverable_sessions[identity]
-                self._retire_session_locked(identity, session_id)
-                return True
-
-            entry = self._services.get(identity)
-            if entry is None:
-                return False
-            self._validate_session(identity, session_id, entry.session_id)
-
-            del self._services[identity]
-            self._retire_session_locked(identity, session_id)
-            service = entry.service
-
-        self._close_service(service)
-        return True
-
-    def expire_leases(self) -> int:
-        with self._expiration_lock:
-            stale_before = self._clock() - self._lease_timeout_s
-            with self._lock:
-                if self._closed:
-                    return 0
-                expired_services = [
-                    (identity, entry) for identity, entry in self._services.items() if entry.last_seen <= stale_before
-                ]
-                for identity, entry in expired_services:
-                    del self._services[identity]
-                    self._expiring[identity] = entry
-
-            for identity, entry in expired_services:
-                self._close_on_owner_safely(identity, entry.service)
-                self._finish_expiration(identity, entry)
-            return len(expired_services)
-
-    def start_maintenance(self) -> None:
-        with self._lock:
-            self._raise_if_closed()
-            with self._maintenance_lock:
-                if self._maintenance_thread is not None and self._maintenance_thread.is_alive():
-                    return
-
-                self._maintenance_stop.clear()
-                self._maintenance_thread = threading.Thread(
-                    target=self._maintenance_loop, daemon=True, name=self._thread_name
-                )
-                self._maintenance_thread.start()
-
-    def stop_maintenance(self, wait: bool = True) -> None:
-        with self._maintenance_lock:
-            thread = self._maintenance_thread
-            if thread is None:
-                return
-            self._maintenance_stop.set()
-
-        if not wait:
-            return
-        if thread is not threading.current_thread():
-            thread.join()
-
-        with self._maintenance_lock:
-            if self._maintenance_thread is thread:
-                self._maintenance_thread = None
-
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-
-        self.stop_maintenance()
-        with self._expiration_lock, self._lock:
-            services = [(identity, entry.service) for identity, entry in self._services.items()]
-            services.extend((identity, entry.service) for identity, entry in self._expiring.items())
-            self._services.clear()
-            self._registering.clear()
-            self._expiring.clear()
-            self._recoverable_sessions.clear()
-            self._retired_sessions.clear()
-
-        for identity, service in services:
-            self._close_on_owner_safely(identity, service)
-
-    def _maintenance_loop(self) -> None:
-        while not self._maintenance_stop.wait(self._check_interval_s):
-            try:
-                self.expire_leases()
-            except Exception:
-                logger.exception("%s service lifecycle maintenance failed", self._service_name)
 
     def _prepare_recoverable_locked(self, identity: IdentityT, session_id: str, fingerprint: bytes) -> None:
         recoverable = self._recoverable_sessions.get(identity)
@@ -348,6 +221,107 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         if not flight.future.done():
             flight.future.set_exception(exc)
 
+    # ==============================
+    # Session access and release
+    # ==============================
+
+    # Owner requests validate and renew their session. Internal coordination uses
+    # find() deliberately so one service cannot extend another service's lease.
+
+    def renew(self, identity: IdentityT, session_id: str) -> bool:
+        self._validate_session_id(session_id)
+        with self._lock:
+            self._raise_if_closed()
+            self._raise_if_retired(identity, session_id)
+            entry = self._services.get(identity)
+            if entry is None:
+                return False
+            self._validate_session(identity, session_id, entry.session_id)
+            entry.last_seen = self._clock()
+            return True
+
+    def find(self, identity: IdentityT) -> ServiceT | None:
+        """Return a service without validating or renewing its owner session."""
+        with self._lock:
+            self._raise_if_closed()
+            entry = self._services.get(identity)
+            return None if entry is None else entry.service
+
+    def get_for_session(self, identity: IdentityT, session_id: str) -> ServiceT | None:
+        """Validate the owner session, renew its lease, and return the service."""
+        self._validate_session_id(session_id)
+        with self._lock:
+            self._raise_if_closed()
+            self._raise_if_retired(identity, session_id)
+            entry = self._services.get(identity)
+            if entry is None:
+                return None
+            self._validate_session(identity, session_id, entry.session_id)
+            entry.last_seen = self._clock()
+            return entry.service
+
+    def unregister(self, identity: IdentityT, session_id: str) -> bool:
+        self._validate_session_id(session_id)
+        service = None
+
+        with self._lock:
+            self._raise_if_closed()
+            self._raise_if_retired(identity, session_id)
+
+            expiring = self._expiring.get(identity)
+            if expiring is not None:
+                self._validate_session(identity, session_id, expiring.session_id)
+                self._retire_session_locked(identity, session_id)
+                return True
+
+            recoverable = self._recoverable_sessions.get(identity)
+            if recoverable is not None:
+                self._validate_session(identity, session_id, recoverable.session_id)
+                del self._recoverable_sessions[identity]
+                self._retire_session_locked(identity, session_id)
+                return True
+
+            entry = self._services.get(identity)
+            if entry is None:
+                return False
+            self._validate_session(identity, session_id, entry.session_id)
+
+            del self._services[identity]
+            self._retire_session_locked(identity, session_id)
+            service = entry.service
+
+        self._close_service(service)
+        return True
+
+    def _retire_session_locked(self, identity: IdentityT, session_id: str) -> None:
+        self._retired_sessions.setdefault(identity, set()).add(session_id)
+
+    # ==============================
+    # Lease expiration and maintenance
+    # ==============================
+
+    # Expiration claims entries under the lifecycle lock, closes them outside
+    # that lock on their owner lane, then publishes whether the session may recover.
+    # The maintenance thread only drives this same expiration path periodically.
+
+    def expire_leases(self) -> int:
+        with self._expiration_lock:
+            stale_before = self._clock() - self._lease_timeout_s
+            with self._lock:
+                if self._closed:
+                    return 0
+                expired_services = [
+                    (identity, entry) for identity, entry in self._services.items() if entry.last_seen <= stale_before
+                ]
+                for identity, entry in expired_services:
+                    del self._services[identity]
+                    self._expiring[identity] = entry
+
+            for identity, entry in expired_services:
+                self._close_on_owner_safely(identity, entry.service)
+                self._finish_expiration(identity, entry)
+            return len(expired_services)
+
     def _finish_expiration(self, identity: IdentityT, entry: _ServiceEntry[ServiceT]) -> None:
         with self._lock:
             if self._expiring.get(identity) is not entry:
@@ -356,8 +330,90 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
             if entry.session_id not in self._retired_sessions.get(identity, ()):
                 self._recoverable_sessions[identity] = _RecoverableSession(entry.session_id, entry.fingerprint)
 
-    def _retire_session_locked(self, identity: IdentityT, session_id: str) -> None:
-        self._retired_sessions.setdefault(identity, set()).add(session_id)
+    def start_maintenance(self) -> None:
+        with self._lock:
+            self._raise_if_closed()
+            with self._maintenance_lock:
+                if self._maintenance_thread is not None and self._maintenance_thread.is_alive():
+                    return
+
+                self._maintenance_stop.clear()
+                self._maintenance_thread = threading.Thread(
+                    target=self._maintenance_loop, daemon=True, name=self._thread_name
+                )
+                self._maintenance_thread.start()
+
+    def stop_maintenance(self, wait: bool = True) -> None:
+        with self._maintenance_lock:
+            thread = self._maintenance_thread
+            if thread is None:
+                return
+            self._maintenance_stop.set()
+
+        if not wait:
+            return
+        if thread is not threading.current_thread():
+            thread.join()
+
+        with self._maintenance_lock:
+            if self._maintenance_thread is thread:
+                self._maintenance_thread = None
+
+    def _maintenance_loop(self) -> None:
+        while not self._maintenance_stop.wait(self._check_interval_s):
+            try:
+                self.expire_leases()
+            except Exception:
+                logger.exception("%s service lifecycle maintenance failed", self._service_name)
+
+    # ==============================
+    # Shutdown and service closure
+    # ==============================
+
+    # Closing rejects new lifecycle work before joining maintenance. Entries are
+    # detached under lock and then closed on their owner lanes without holding it.
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+
+        self.stop_maintenance()
+        with self._expiration_lock, self._lock:
+            services = [(identity, entry.service) for identity, entry in self._services.items()]
+            services.extend((identity, entry.service) for identity, entry in self._expiring.items())
+            self._services.clear()
+            self._registering.clear()
+            self._expiring.clear()
+            self._recoverable_sessions.clear()
+            self._retired_sessions.clear()
+
+        for identity, service in services:
+            self._close_on_owner_safely(identity, service)
+
+    def _close_service_safely(self, service: ServiceT) -> None:
+        try:
+            self._close_service(service)
+        except Exception:
+            logger.exception("Failed to close %s service %r", self._service_name, service)
+
+    def _close_on_owner_safely(self, identity: IdentityT, service: ServiceT) -> None:
+        if self._owner_close_handler is None:
+            self._close_service_safely(service)
+            return
+
+        try:
+            self._owner_close_handler(identity, service)
+        except Exception:
+            logger.exception("Failed to close %s service %r on its owner", self._service_name, service)
+
+    # ==============================
+    # Lifecycle validation
+    # ==============================
+
+    # Caller mistakes raise local value errors. Peer-driven session and
+    # fingerprint conflicts use lifecycle errors that the business layer maps.
 
     def _raise_if_closed(self) -> None:
         if self._closed:
@@ -378,22 +434,6 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
             raise RegistrationConflictError(
                 f"{self._service_name} {identity!r} is already registered with different configuration"
             )
-
-    def _close_service_safely(self, service: ServiceT) -> None:
-        try:
-            self._close_service(service)
-        except Exception:
-            logger.exception("Failed to close %s service %r", self._service_name, service)
-
-    def _close_on_owner_safely(self, identity: IdentityT, service: ServiceT) -> None:
-        if self._owner_close_handler is None:
-            self._close_service_safely(service)
-            return
-
-        try:
-            self._owner_close_handler(identity, service)
-        except Exception:
-            logger.exception("Failed to close %s service %r on its owner", self._service_name, service)
 
     @staticmethod
     def _validate_session_id(session_id: str) -> None:
