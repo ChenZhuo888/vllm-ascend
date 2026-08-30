@@ -229,16 +229,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     # find() deliberately so one service cannot extend another service's lease.
 
     def renew(self, identity: IdentityT, session_id: str) -> bool:
-        self._validate_session_id(session_id)
-        with self._lock:
-            self._raise_if_closed()
-            self._raise_if_retired(identity, session_id)
-            entry = self._services.get(identity)
-            if entry is None:
-                return False
-            self._validate_session(identity, session_id, entry.session_id)
-            entry.last_seen = self._clock()
-            return True
+        return self._get_and_renew_entry(identity, session_id) is not None
 
     def find(self, identity: IdentityT) -> ServiceT | None:
         """Return a service without validating or renewing its owner session."""
@@ -249,6 +240,19 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
 
     def get_for_session(self, identity: IdentityT, session_id: str) -> ServiceT | None:
         """Validate the owner session, renew its lease, and return the service."""
+        entry = self._get_and_renew_entry(identity, session_id)
+        return None if entry is None else entry.service
+
+    def _get_and_renew_entry(
+        self,
+        identity: IdentityT,
+        session_id: str,
+    ) -> _ServiceEntry[ServiceT] | None:
+        """Validate, resolve, and renew an owner session atomically.
+
+        These steps stay in one method and share the lifecycle lock so expiration
+        cannot detach the service between session validation and lease renewal.
+        """
         self._validate_session_id(session_id)
         with self._lock:
             self._raise_if_closed()
@@ -258,7 +262,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
                 return None
             self._validate_session(identity, session_id, entry.session_id)
             entry.last_seen = self._clock()
-            return entry.service
+            return entry
 
     def unregister(self, identity: IdentityT, session_id: str) -> bool:
         self._validate_session_id(session_id)
@@ -409,7 +413,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
             logger.exception("Failed to close %s service %r on its owner", self._service_name, service)
 
     # ==============================
-    # Lifecycle validation
+    # Lifecycle guards
     # ==============================
 
     # Caller mistakes raise local value errors. Peer-driven session and
