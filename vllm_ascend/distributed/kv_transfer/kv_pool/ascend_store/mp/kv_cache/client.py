@@ -1,4 +1,4 @@
-"""Client-side KV cache service orchestration."""
+"""Client-side access to KV cache services."""
 
 import contextlib
 import logging
@@ -73,6 +73,8 @@ _ConfiguredRegistration = tuple[SchedulerRegistration | WorkerRegistration, tupl
 
 @dataclass(frozen=True)
 class _WorkerKVCacheRegistration:
+    """Latest Worker cache registration retained for service recovery."""
+
     spec: WorkerKVCacheSpec
     payloads: tuple[bytes, ...]
     on_registered: Callable[[WorkerKVCacheSpec], None] | None
@@ -89,7 +91,11 @@ class _RegistrationState(Enum):
 
 
 class KVCacheClient:
-    """Typed KV cache RPC client with recoverable service registration."""
+    """Expose typed KV cache RPCs through one recoverable service session.
+
+    The client owns service registration and lease recovery. It also decides
+    which remote failures are returned and which become cache misses or no-ops.
+    """
 
     def __init__(self, server_url: str):
         self._rpc_client = MPClient(server_url)
@@ -120,6 +126,15 @@ class KVCacheClient:
         with self._client_lifecycle_lock:
             return not self._closed and self._registration_state is _RegistrationState.REGISTERED
 
+    # ==============================
+    # Recoverable service registration
+    # ==============================
+
+    # A client owns one configured Scheduler or Worker session and reuses it
+    # across recoverable failures. Only one registration attempt runs at a time;
+    # if Worker cache information already exists, it must be registered again
+    # before the recovered session is reported as registered.
+
     def register_scheduler(
         self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig | None, page_size_bytes: int
     ) -> bool:
@@ -148,78 +163,46 @@ class KVCacheClient:
         self._start_lease_loop()
         return registered
 
-    def _maintain_lease(self) -> None:
+    def register_kv_caches(
+        self,
+        spec: WorkerKVCacheSpec,
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+        on_registered: Callable[[WorkerKVCacheSpec], None] | None = None,
+    ) -> bool:
+        """Register one cache generation and report when Server confirms it."""
+        self._raise_if_superseded()
+        registration = self._get_worker_registration()
+        payloads = encode_register_kv_caches_request(registration, spec)
+        cache_registration = _WorkerKVCacheRegistration(spec, payloads, on_registered)
         with self._client_lifecycle_lock:
-            if self._closed or self._registration is None or self._registration_state is _RegistrationState.SUPERSEDED:
-                return
-            registration = self._registration[0]
-            registered = self._registration_state is _RegistrationState.REGISTERED
+            previous_registration = self._worker_kv_cache_registration
+            self._worker_kv_cache_registration = cache_registration
 
-        if not registered:
-            with contextlib.suppress(ServiceSessionExpiredError):
-                self._try_register()
-            return
-
-        if isinstance(registration, SchedulerRegistration):
-            method = KVCacheMethod.RENEW_SCHEDULER
-            payloads = encode_scheduler_session(registration.identity, registration.session_id)
-        else:
-            method = KVCacheMethod.RENEW_WORKER
-            payloads = encode_worker_session(registration.identity, registration.session_id)
-
+        confirmed = False
         try:
-            responses = self._send_service_request(method, payloads, _LEASE_REQUEST_TIMEOUT_MS)
-        except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError):
-            self._mark_unregistered()
-            return
-        except ServiceNotRegisteredError:
-            self._mark_unregistered()
-            with contextlib.suppress(ServiceSessionExpiredError):
-                self._try_register()
-            return
-        except ServiceSessionExpiredError:
-            self._mark_superseded()
-            return
+            if not self.is_registered:
+                return self._try_register()
 
-        decode_ack_response(responses, method)
-        self._clear_reported_degradation()
-
-    def _start_lease_loop(self) -> None:
-        with self._client_lifecycle_lock:
-            if self._closed:
-                return
-
-            with self._lease_lock:
-                if self._lease_thread is not None and self._lease_thread.is_alive():
-                    return
-
-                self._lease_stop.clear()
-                self._lease_thread = threading.Thread(
-                    target=self._lease_loop, daemon=True, name="ascend-store-kv-lease"
-                )
-                self._lease_thread.start()
-
-    def _lease_loop(self) -> None:
-        interval_s = _LEASE_RENEW_INTERVAL_MS / 1000
-        while not self._lease_stop.wait(interval_s):
-            try:
-                self._maintain_lease()
-            except Exception:
-                logger.exception("KV cache service lease maintenance failed")
-
-    def _stop_lease_loop(self) -> None:
-        with self._lease_lock:
-            lease_thread = self._lease_thread
-            if lease_thread is None:
-                return
-            self._lease_stop.set()
-
-        if lease_thread is not threading.current_thread():
-            lease_thread.join()
-
-        with self._lease_lock:
-            if self._lease_thread is lease_thread:
-                self._lease_thread = None
+            responses = self._try_worker_rpc(
+                KVCacheMethod.REGISTER_KV_CACHES,
+                lambda _registration: payloads,
+                timeout_ms,
+            )
+            if responses is None:
+                # Service recovery registers the latest generation again.
+                self._mark_unregistered()
+                return False
+            decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
+            confirmed = True
+            if on_registered is not None:
+                on_registered(spec)
+            return True
+        except BaseException:
+            if not confirmed:
+                with self._client_lifecycle_lock:
+                    if self._worker_kv_cache_registration is cache_registration:
+                        self._worker_kv_cache_registration = previous_registration
+            raise
 
     def _try_register(self) -> bool:
         try:
@@ -294,112 +277,172 @@ class KVCacheClient:
                 self._registration_state = _RegistrationState.REGISTERED
                 return not self._closed
 
-    def _mark_unregistered(self) -> None:
-        with self._client_lifecycle_lock:
-            if self._registration_state is not _RegistrationState.SUPERSEDED:
-                self._registration_state = _RegistrationState.UNREGISTERED
+    # ==============================
+    # Lease-driven registration recovery
+    # ==============================
 
-    def _mark_superseded(self) -> None:
-        with self._client_lifecycle_lock:
-            self._registration_state = _RegistrationState.SUPERSEDED
+    # The lease thread both keeps a registered session alive and restores it
+    # after temporary loss. It retries the same configuration, but stops
+    # permanently when the server says another session has replaced this one.
 
-    def _raise_if_superseded(self) -> None:
+    def _start_lease_loop(self) -> None:
         with self._client_lifecycle_lock:
-            if self._registration_state is _RegistrationState.SUPERSEDED:
-                raise ServiceSessionExpiredError("KV cache service session has been superseded")
-
-    def _send_service_request(
-        self,
-        method: KVCacheMethod,
-        payloads: tuple[bytes, ...],
-        timeout_ms: int | None,
-    ) -> list[bytes]:
-        """Send one request and translate errors defined by the KV cache service."""
-        try:
-            return self._rpc_client.request(method, payloads, timeout_ms=timeout_ms)
-        except MPRemoteError as exc:
-            message = str(exc)
-            if message.startswith(SERVICE_NOT_REGISTERED_PREFIX):
-                raise ServiceNotRegisteredError(message) from exc
-            if message.startswith(STALE_SESSION_PREFIX):
-                raise ServiceSessionExpiredError(message) from exc
-            raise
-
-    def _report_degradation(self, method: KVCacheMethod | str, error: BaseException) -> None:
-        signature = type(error), str(error)
-        with self._client_lifecycle_lock:
-            if self._last_reported_degradation == signature:
+            if self._closed:
                 return
-            self._last_reported_degradation = signature
 
-        method_name = method.value if isinstance(method, KVCacheMethod) else method
-        logger.warning(
-            "KV cache RPC %s degraded. type=%s, error=%s",
-            method_name,
-            type(error).__name__,
-            error,
-        )
+            with self._lease_lock:
+                if self._lease_thread is not None and self._lease_thread.is_alive():
+                    return
 
-    def _clear_reported_degradation(self) -> None:
+                self._lease_stop.clear()
+                self._lease_thread = threading.Thread(
+                    target=self._lease_loop, daemon=True, name="ascend-store-kv-lease"
+                )
+                self._lease_thread.start()
+
+    def _lease_loop(self) -> None:
+        interval_s = _LEASE_RENEW_INTERVAL_MS / 1000
+        while not self._lease_stop.wait(interval_s):
+            try:
+                self._maintain_lease()
+            except Exception:
+                logger.exception("KV cache service lease maintenance failed")
+
+    def _maintain_lease(self) -> None:
         with self._client_lifecycle_lock:
-            self._last_reported_degradation = None
+            if self._closed or self._registration is None or self._registration_state is _RegistrationState.SUPERSEDED:
+                return
+            registration = self._registration[0]
+            registered = self._registration_state is _RegistrationState.REGISTERED
 
-    def _get_scheduler_registration(self) -> SchedulerRegistration:
-        with self._client_lifecycle_lock:
-            configured_registration = self._registration
+        if not registered:
+            with contextlib.suppress(ServiceSessionExpiredError):
+                self._try_register()
+            return
 
-        if configured_registration is None or not isinstance(configured_registration[0], SchedulerRegistration):
-            raise RuntimeError("KVCacheClient is not configured as a Scheduler client")
-        return configured_registration[0]
+        if isinstance(registration, SchedulerRegistration):
+            method = KVCacheMethod.RENEW_SCHEDULER
+            payloads = encode_scheduler_session(registration.identity, registration.session_id)
+        else:
+            method = KVCacheMethod.RENEW_WORKER
+            payloads = encode_worker_session(registration.identity, registration.session_id)
 
-    def _get_worker_registration(self) -> WorkerRegistration:
-        with self._client_lifecycle_lock:
-            configured_registration = self._registration
-
-        if configured_registration is None or not isinstance(configured_registration[0], WorkerRegistration):
-            raise RuntimeError("KVCacheClient is not configured as a Worker client")
-        return configured_registration[0]
-
-    def register_kv_caches(
-        self,
-        spec: WorkerKVCacheSpec,
-        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
-        on_registered: Callable[[WorkerKVCacheSpec], None] | None = None,
-    ) -> bool:
-        """Register one cache generation and report when Server confirms it."""
-        self._raise_if_superseded()
-        registration = self._get_worker_registration()
-        payloads = encode_register_kv_caches_request(registration, spec)
-        cache_registration = _WorkerKVCacheRegistration(spec, payloads, on_registered)
-        with self._client_lifecycle_lock:
-            previous_registration = self._worker_kv_cache_registration
-            self._worker_kv_cache_registration = cache_registration
-
-        confirmed = False
         try:
-            if not self.is_registered:
-                return self._try_register()
+            responses = self._send_service_request(method, payloads, _LEASE_REQUEST_TIMEOUT_MS)
+        except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError):
+            self._mark_unregistered()
+            return
+        except ServiceNotRegisteredError:
+            self._mark_unregistered()
+            with contextlib.suppress(ServiceSessionExpiredError):
+                self._try_register()
+            return
+        except ServiceSessionExpiredError:
+            self._mark_superseded()
+            return
 
-            responses = self._try_worker_rpc(
-                KVCacheMethod.REGISTER_KV_CACHES,
-                lambda _registration: payloads,
-                timeout_ms,
-            )
-            if responses is None:
-                # The lease loop retries the latest generation after recovery.
-                self._mark_unregistered()
-                return False
-            decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
-            confirmed = True
-            if on_registered is not None:
-                on_registered(spec)
-            return True
-        except BaseException:
-            if not confirmed:
-                with self._client_lifecycle_lock:
-                    if self._worker_kv_cache_registration is cache_registration:
-                        self._worker_kv_cache_registration = previous_registration
-            raise
+        decode_ack_response(responses, method)
+        self._clear_reported_degradation()
+
+    def _stop_lease_loop(self) -> None:
+        with self._lease_lock:
+            lease_thread = self._lease_thread
+            if lease_thread is None:
+                return
+            self._lease_stop.set()
+
+        if lease_thread is not threading.current_thread():
+            lease_thread.join()
+
+        with self._lease_lock:
+            if self._lease_thread is lease_thread:
+                self._lease_thread = None
+
+    # ==============================
+    # Scheduler service operations
+    # ==============================
+
+    # Scheduler methods follow the vLLM request lifecycle. Recoverable failures
+    # become cache misses or no-ops, allowing scheduling to continue correctly
+    # without the remote cache.
+
+    def lookup(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> tuple[int, bool]:
+        responses = self._try_scheduler_rpc(
+            KVCacheMethod.LOOKUP,
+            lambda registration: encode_lookup_request(registration, request, num_computed_tokens),
+            timeout_ms,
+        )
+        return decode_lookup_response(responses) if responses is not None else (0, False)
+
+    def update_state_after_alloc(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        num_external_tokens: int,
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> None:
+        responses = self._try_scheduler_rpc(
+            KVCacheMethod.UPDATE_STATE_AFTER_ALLOC,
+            lambda registration: encode_update_state_after_alloc(registration, request, blocks, num_external_tokens),
+            timeout_ms,
+        )
+        if responses is not None:
+            decode_ack_response(responses, KVCacheMethod.UPDATE_STATE_AFTER_ALLOC)
+
+    def build_connector_meta(
+        self,
+        scheduler_output: SchedulerOutput,
+        new_token_ids: dict[str, list[int]],
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> tuple | None:
+        """Return (metadata, touch_block_ids) or None when the remote call fails."""
+        responses = self._try_scheduler_rpc(
+            KVCacheMethod.BUILD_CONNECTOR_META,
+            lambda registration: encode_build_connector_meta_request(registration, scheduler_output, new_token_ids),
+            timeout_ms,
+        )
+        return decode_build_connector_meta_response(responses) if responses is not None else None
+
+    def request_finished(
+        self,
+        request_id: str,
+        block_ids,
+        all_groups: bool = False,
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> tuple[bool, dict | None]:
+        responses = self._try_scheduler_rpc(
+            KVCacheMethod.REQUEST_FINISHED,
+            lambda registration: encode_request_finished(registration, request_id, block_ids, all_groups),
+            timeout_ms,
+        )
+        return decode_request_finished_response(responses) if responses is not None else (False, None)
+
+    def update_connector_output(
+        self,
+        completed_events: dict[int, int],
+        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
+    ) -> list[int]:
+        """Report worker completion counts; return block ids to free locally."""
+        responses = self._try_scheduler_rpc(
+            KVCacheMethod.UPDATE_CONNECTOR_OUTPUT,
+            lambda registration: encode_update_connector_output(registration, completed_events),
+            timeout_ms,
+        )
+        return decode_update_connector_output_response(responses) if responses is not None else []
+
+    # ==============================
+    # Worker service operations
+    # ==============================
+
+    # Worker RPCs follow the connector's transfer phases. Most coordination calls
+    # return an empty or unsuccessful result after a recoverable failure, while
+    # layer-by-layer wait and save calls report infrastructure errors to the
+    # connector.
 
     def wait_for_save(
         self,
@@ -492,74 +535,14 @@ class KVCacheClient:
         )
         return decode_get_block_ids_with_load_errors_response(responses) if responses is not None else None
 
-    def lookup(
-        self,
-        request: Request,
-        num_computed_tokens: int,
-        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
-    ) -> tuple[int, bool]:
-        responses = self._try_scheduler_rpc(
-            KVCacheMethod.LOOKUP,
-            lambda registration: encode_lookup_request(registration, request, num_computed_tokens),
-            timeout_ms,
-        )
-        return decode_lookup_response(responses) if responses is not None else (0, False)
+    # ==============================
+    # Registered requests and failure handling
+    # ==============================
 
-    def update_state_after_alloc(
-        self,
-        request: Request,
-        blocks: KVCacheBlocks,
-        num_external_tokens: int,
-        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
-    ) -> None:
-        responses = self._try_scheduler_rpc(
-            KVCacheMethod.UPDATE_STATE_AFTER_ALLOC,
-            lambda registration: encode_update_state_after_alloc(registration, request, blocks, num_external_tokens),
-            timeout_ms,
-        )
-        if responses is not None:
-            decode_ack_response(responses, KVCacheMethod.UPDATE_STATE_AFTER_ALLOC)
-
-    def build_connector_meta(
-        self,
-        scheduler_output: SchedulerOutput,
-        new_token_ids: dict[str, list[int]],
-        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
-    ) -> tuple | None:
-        """Return (metadata, touch_block_ids) or None when degraded."""
-        responses = self._try_scheduler_rpc(
-            KVCacheMethod.BUILD_CONNECTOR_META,
-            lambda registration: encode_build_connector_meta_request(registration, scheduler_output, new_token_ids),
-            timeout_ms,
-        )
-        return decode_build_connector_meta_response(responses) if responses is not None else None
-
-    def request_finished(
-        self,
-        request_id: str,
-        block_ids,
-        all_groups: bool = False,
-        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
-    ) -> tuple[bool, dict | None]:
-        responses = self._try_scheduler_rpc(
-            KVCacheMethod.REQUEST_FINISHED,
-            lambda registration: encode_request_finished(registration, request_id, block_ids, all_groups),
-            timeout_ms,
-        )
-        return decode_request_finished_response(responses) if responses is not None else (False, None)
-
-    def update_connector_output(
-        self,
-        completed_events: dict[int, int],
-        timeout_ms: int = _DEFAULT_TIMEOUT_MS,
-    ) -> list[int]:
-        """Report worker completion counts; return block ids to free locally."""
-        responses = self._try_scheduler_rpc(
-            KVCacheMethod.UPDATE_CONNECTOR_OUTPUT,
-            lambda registration: encode_update_connector_output(registration, completed_events),
-            timeout_ms,
-        )
-        return decode_update_connector_output_response(responses) if responses is not None else []
+    # Every business RPC checks the configured role and obtains a registered
+    # session before sending. Busy affects only the current call; a timeout,
+    # lost transport, or missing service triggers registration again, while a
+    # stale session permanently invalidates this client.
 
     def _scheduler_rpc(
         self,
@@ -637,6 +620,81 @@ class KVCacheClient:
         self._clear_reported_degradation()
         return responses
 
+    def _send_service_request(
+        self,
+        method: KVCacheMethod,
+        payloads: tuple[bytes, ...],
+        timeout_ms: int | None,
+    ) -> list[bytes]:
+        """Send one request and translate errors defined by the KV cache service."""
+        try:
+            return self._rpc_client.request(method, payloads, timeout_ms=timeout_ms)
+        except MPRemoteError as exc:
+            message = str(exc)
+            if message.startswith(SERVICE_NOT_REGISTERED_PREFIX):
+                raise ServiceNotRegisteredError(message) from exc
+            if message.startswith(STALE_SESSION_PREFIX):
+                raise ServiceSessionExpiredError(message) from exc
+            raise
+
+    def _get_scheduler_registration(self) -> SchedulerRegistration:
+        with self._client_lifecycle_lock:
+            configured_registration = self._registration
+
+        if configured_registration is None or not isinstance(configured_registration[0], SchedulerRegistration):
+            raise RuntimeError("KVCacheClient is not configured as a Scheduler client")
+        return configured_registration[0]
+
+    def _get_worker_registration(self) -> WorkerRegistration:
+        with self._client_lifecycle_lock:
+            configured_registration = self._registration
+
+        if configured_registration is None or not isinstance(configured_registration[0], WorkerRegistration):
+            raise RuntimeError("KVCacheClient is not configured as a Worker client")
+        return configured_registration[0]
+
+    def _mark_unregistered(self) -> None:
+        with self._client_lifecycle_lock:
+            if self._registration_state is not _RegistrationState.SUPERSEDED:
+                self._registration_state = _RegistrationState.UNREGISTERED
+
+    def _mark_superseded(self) -> None:
+        with self._client_lifecycle_lock:
+            self._registration_state = _RegistrationState.SUPERSEDED
+
+    def _raise_if_superseded(self) -> None:
+        with self._client_lifecycle_lock:
+            if self._registration_state is _RegistrationState.SUPERSEDED:
+                raise ServiceSessionExpiredError("KV cache service session has been superseded")
+
+    def _report_degradation(self, method: KVCacheMethod | str, error: BaseException) -> None:
+        signature = type(error), str(error)
+        with self._client_lifecycle_lock:
+            if self._last_reported_degradation == signature:
+                return
+            self._last_reported_degradation = signature
+
+        method_name = method.value if isinstance(method, KVCacheMethod) else method
+        logger.warning(
+            "KV cache RPC %s degraded. type=%s, error=%s",
+            method_name,
+            type(error).__name__,
+            error,
+        )
+
+    def _clear_reported_degradation(self) -> None:
+        with self._client_lifecycle_lock:
+            self._last_reported_degradation = None
+
+    # ==============================
+    # Client shutdown
+    # ==============================
+
+    # Shutdown stops lease recovery and waits for any service registration already
+    # in progress, including Worker cache setup after recovery. It unregisters
+    # before closing the transport, so a timed-out registration that may have
+    # succeeded remotely still gets one cleanup attempt.
+
     def _unregister(self) -> None:
         with self._client_lifecycle_lock:
             configured_registration = self._registration
@@ -672,8 +730,8 @@ class KVCacheClient:
             self._closed = True
 
         self._stop_lease_loop()
-        # Registration and Worker cache-spec replay form one transaction. Wait
-        # for that transaction before deciding whether unregister is needed.
+        # Wait for the current service registration and its Worker cache setup
+        # before deciding whether unregister is needed.
         with self._registration_attempt_lock:
             self._unregister()
         self._rpc_client.close()

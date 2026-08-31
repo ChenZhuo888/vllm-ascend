@@ -67,7 +67,7 @@ class _ClientLifecycleState(Enum):
 
     Normal transport moves from STARTING to DISCONNECTED and then between
     DISCONNECTED and CONNECTED. Any live state may fail or begin closing;
-    closing joins the I/O owner before publishing CLOSED.
+    closing joins the I/O thread before setting CLOSED.
     """
 
     STARTING = auto()
@@ -112,7 +112,7 @@ class MPClient:
     # Public API
     # ==============================
 
-    # Application threads use this surface without touching transport-owned
+    # Application threads use these methods without touching transport-owned
     # state. Requests cross to the I/O thread through the outbound queue.
 
     def __enter__(self) -> "MPClient":
@@ -296,9 +296,9 @@ class MPClient:
                 request.future.set_exception(MPServerBusyError("MP client outbound transport is busy"))
                 continue
             except Exception as exc:
-                # Removing a request from the outbound queue and publishing
-                # it as pending is one ownership handoff. If transport send
-                # fails between those states, this thread still owns and
+                # Removing a request from the outbound queue and adding it to
+                # the pending map is one ownership handoff. If transport send
+                # fails between those steps, this thread still owns and
                 # must complete the request before the I/O loop terminates.
                 failure = self._as_server_unavailable(exc)
                 request.future.set_exception(failure)
@@ -428,7 +428,7 @@ class MPClient:
     # Shutdown
     # ==============================
 
-    # Closing first stops admission, then wakes and joins the I/O owner before
+    # Closing first stops new requests, then wakes and joins the I/O thread before
     # terminating notification and ZMQ resources from the caller thread.
 
     def close(self) -> None:

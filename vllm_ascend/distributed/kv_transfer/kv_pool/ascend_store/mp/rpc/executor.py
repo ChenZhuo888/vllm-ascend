@@ -17,11 +17,12 @@ _ResultT = TypeVar("_ResultT")
 # ==============================
 
 # MPServer owns executor lifetime through this narrow contract. Individual
-# executors decide admission and ordering without knowing RPC route semantics.
+# executors decide whether to accept work and how to order it without knowing
+# RPC route semantics.
 
 
 class TaskExecutor(Protocol):
-    """Submit work with optional affinity and blocking admission."""
+    """Submit work, optionally by key, and optionally wait for capacity."""
 
     def submit(
         self, fn: Callable[[], _ResultT], key: Hashable | None = None, block: bool = False
@@ -72,8 +73,8 @@ class InlineExecutor:
 # Bounded parallel executor
 # ==============================
 
-# Capacity includes running and pending work, so admission remains bounded even
-# though ThreadPoolExecutor itself uses an unbounded internal queue.
+# Capacity includes running and pending work, so accepted work remains bounded
+# even though ThreadPoolExecutor itself uses an unbounded internal queue.
 
 
 class BoundedThreadPoolExecutor:
@@ -110,8 +111,8 @@ class BoundedThreadPoolExecutor:
 # Key-affinity executor
 # ==============================
 
-# A stable key-to-worker mapping serializes one owner's tasks while allowing
-# unrelated owners to make progress on different threads.
+# A stable key-to-worker mapping runs tasks for the same key one at a time while
+# other keys make progress on different threads.
 
 
 _STOP = object()
@@ -158,7 +159,7 @@ class AffinityExecutor:
 
         try:
             with self._state_lock:
-                # Shutdown may win while submit waits for capacity, so admission
+                # Shutdown may happen while submit waits for capacity, so submit
                 # must recheck the lifecycle state after that blocking point.
                 if self._closed:
                     raise RuntimeError("Affinity executor is closed")

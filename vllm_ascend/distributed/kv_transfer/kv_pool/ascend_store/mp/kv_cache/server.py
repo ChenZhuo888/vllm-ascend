@@ -60,10 +60,12 @@ _MAX_PENDING_REQUESTS = 64
 
 
 class KVCacheServer:
-    """Expose KV cache services through identity-affine RPC routes.
+    """Expose KV cache services through RPC routes with explicit thread ownership.
 
-    This boundary wires protocol adapters to KVCacheServiceManager and coordinates
-    lease maintenance with graceful or forced RPC shutdown.
+    Scheduler and Worker business requests are ordered by service identity,
+    while lease renewal runs outside their work queues. The server translates
+    protocol requests for KVCacheServiceManager and coordinates service lifetime
+    with graceful or forced RPC shutdown.
     """
 
     def __init__(
@@ -140,12 +142,12 @@ class KVCacheServer:
         return self._service.worker_count
 
     # ==============================
-    # Scheduler-affine request adapters
+    # Scheduler requests ordered by identity
     # ==============================
 
-    # Scheduler RPCs share one execution lane per service identity. Keying that lane
-    # by identity rather than connection or session keeps replacement, request
-    # callbacks, and cleanup ordered across reconnects.
+    # All Scheduler RPCs for one service identity use the same executor thread.
+    # Choosing that thread by identity rather than connection or session keeps
+    # replacement, request callbacks, and cleanup ordered across reconnects.
 
     def _handle_register_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         registration, serialized_registration = decode_registration_request(payloads, SchedulerRegistration)
@@ -192,12 +194,12 @@ class KVCacheServer:
         return (ACK_RESPONSE,)
 
     # ==============================
-    # Worker-affine request adapters
+    # Worker requests ordered by identity
     # ==============================
 
-    # A Worker has one execution owner across RPC callbacks, Scheduler-initiated lookup,
-    # and lifecycle cleanup. Sharing one affinity key prevents those paths from touching
-    # Worker state concurrently.
+    # RPC callbacks, Scheduler-initiated lookup, and cleanup for one Worker all
+    # use the executor thread selected by its identity. These paths therefore
+    # cannot touch Worker state concurrently.
 
     def _handle_register_worker(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         registration, serialized_registration = decode_registration_request(payloads, WorkerRegistration)
@@ -262,11 +264,12 @@ class KVCacheServer:
         return (ACK_RESPONSE,)
 
     # ==============================
-    # Inline lease renewal
+    # Lease renewal outside work queues
     # ==============================
 
-    # Lease renewal deliberately bypasses affinity queues because it only updates
-    # lifecycle metadata. A busy work lane must not make a live owner appear expired.
+    # Lease renewal runs immediately on the RPC I/O thread because it only updates
+    # lifecycle metadata. It must not wait behind business requests, which could
+    # make a live service appear expired.
 
     def _handle_renew_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id = decode_scheduler_session(payloads)
@@ -282,9 +285,10 @@ class KVCacheServer:
     # Service and RPC lifecycle coordination
     # ==============================
 
-    # Graceful shutdown stops lease maintenance and drains accepted RPCs before closing
-    # services, while affinity executors stay alive for owner-lane cleanup. Abort cancels
-    # queued work instead and intentionally skips graceful service closure.
+    # Graceful shutdown stops lease maintenance and drains accepted RPCs before
+    # closing services. Executors stay alive until service close calls have run
+    # on their assigned threads. Abort cancels queued work instead and intentionally
+    # skips graceful service closure.
 
     def run(self) -> None:
         try:
@@ -331,7 +335,8 @@ class KVCacheServer:
             if self._abort_requested.is_set():
                 return False
             try:
-                # MPServer still owns live route executors while services close on their owner lanes.
+                # MPServer keeps route executors alive while services close on
+                # the threads selected by their identities.
                 self._service.close()
             finally:
                 rpc_closed = self._rpc_server.close()

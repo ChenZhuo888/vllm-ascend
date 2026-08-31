@@ -1,7 +1,8 @@
 """Multiprocess RPC server.
 
 The ROUTER socket is owned exclusively by the thread running ``run``.
-Request handlers publish completed responses through the notification socket.
+Completed handler responses return through a queue, and a notification socket
+wakes that thread.
 """
 
 import logging
@@ -124,10 +125,10 @@ class MPServer:
             Route(SystemMethod.ECHO, self._handle_echo, system_executor),
             *routes,
         )
-        # The route table serves request dispatch, while the executor collection
-        # is a separate ownership ledger because multiple routes may share one
-        # executor. Claim that ownership first so route validation failures can
-        # still shut down every referenced executor exactly once.
+        # The route table dispatches requests, while a separate executor list owns
+        # shutdown because multiple routes may share one executor. Collect that
+        # list first so route validation failures can still shut down every
+        # referenced executor exactly once.
         self._executors = self._collect_owned_executors(all_routes)
         try:
             self._routes = self._index_routes(all_routes)
@@ -215,7 +216,7 @@ class MPServer:
     # ==============================
 
     # The run thread exclusively owns ROUTER I/O. Public lifecycle methods only
-    # publish state transitions and wake that owner to drain or abort work.
+    # update state and wake that thread to drain or abort work.
 
     def _should_stop_run(self) -> bool:
         with self._state_condition:
@@ -375,7 +376,7 @@ class MPServer:
         with self._state_condition:
             state = self._state
         if state is _ServerState.CLOSED:
-            # CLOSED is published before resources are released. Serialize with
+            # The state becomes CLOSED before resources are released. Wait for
             # the closing thread so every successful close observes completion.
             with self._close_lock:
                 pass
@@ -439,8 +440,8 @@ class MPServer:
     # Request admission and execution
     # ==============================
 
-    # The run thread admits and dispatches requests. Executors run handlers and
-    # publish completion back through the response queue and notification socket.
+    # The run thread accepts and dispatches requests. Executors run handlers, put
+    # completed responses on the response queue, and notify the run thread.
 
     def _receive_and_dispatch_request(self) -> None:
         frames = self._socket.recv_multipart()
@@ -572,8 +573,9 @@ class MPServer:
     # Response delivery and backpressure
     # ==============================
 
-    # Executor threads publish immutable envelopes. The run thread retains any
-    # response rejected by non-blocking send and pauses admission until it drains.
+    # Executor threads put completed responses on the queue. The run thread keeps
+    # any response rejected by non-blocking send and stops accepting new requests
+    # until that response is sent.
 
     def _wake_run_loop(self) -> None:
         with self._notify_lock:
@@ -638,11 +640,12 @@ class MPServer:
                 self._send_backlog.popleft()
 
     # ==============================
-    # Terminal resource release
+    # Final resource release
     # ==============================
 
-    # Terminal paths serialize executor and transport shutdown. Notification
-    # sockets outlive executor callbacks, and the ZMQ context always closes last.
+    # All final paths use one shared cleanup sequence. Executor callbacks stop
+    # using notification sockets before those sockets close, and the ZMQ context
+    # closes last.
 
     def _shutdown_executors(self, wait: bool = True, cancel_futures: bool = True) -> None:
         for executor in self._executors:
@@ -665,8 +668,8 @@ class MPServer:
     ) -> None:
         if final_state not in {_ServerState.ABORTED, _ServerState.CLOSED}:
             raise ValueError(f"Invalid terminal MP server state: {final_state}")
-        # Only a valid DRAINED -> CLOSED or ABORTING -> ABORTED transition
-        # may claim ownership of the shared cleanup sequence.
+        # Only a valid DRAINED -> CLOSED or ABORTING -> ABORTED transition may
+        # start the shared cleanup sequence.
         expected_state = _ServerState.ABORTING if final_state is _ServerState.ABORTED else _ServerState.DRAINED
 
         with self._close_lock:
@@ -675,7 +678,7 @@ class MPServer:
                     return
                 if self._state is not expected_state:
                     return
-                # Publish the winner before slow cleanup. Concurrent close()
+                # Set the final state before slow cleanup. Concurrent close()
                 # calls wait on _close_lock before reporting success.
                 self._state = final_state
 

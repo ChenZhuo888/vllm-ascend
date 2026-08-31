@@ -38,15 +38,15 @@ class _RegistrationFlight(Generic[ServiceT]):
 class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     """Manage the registration, lease, expiration, and closure of one service type.
 
-    Internal orchestration uses ``find`` without renewing a lease. Requests from
-    a service owner use ``get_for_session``. Background expiration and manager
-    shutdown use ``owner_close_handler`` when the service has an owner lane.
+    Session-bound requests use ``get_for_session``. Internal lookups use ``find``
+    so they do not renew another service's lease. When ``owner_close_handler`` is
+    provided, expiration and shutdown delegate service closure through it.
 
     The lifecycle lock owns every per-identity state map. One identity may be
     present in at most one of registering, services, expiring, and recoverable;
     retired sessions are independent history and may coexist with current state.
-    Expiration and maintenance use separate locks only to serialize their
-    long-running work.
+    Separate locks ensure that only one expiration pass and one maintenance
+    thread run at a time.
     """
 
     def __init__(
@@ -102,12 +102,12 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
             return tuple((identity, entry.service) for identity, entry in self._services.items())
 
     # ==============================
-    # Registration and publication
+    # One registration per identity
     # ==============================
 
-    # Registration is single-flight per identity. Factories and service closure
-    # run outside the lifecycle lock, then publish only if the flight still owns
-    # that identity and the manager remains open.
+    # At most one registration runs for an identity. Factories and service close
+    # calls run without the lifecycle lock; a newly created service is added only
+    # if the same registration is still current and the manager remains open.
 
     def register(
         self,
@@ -230,21 +230,21 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     # Session access and release
     # ==============================
 
-    # Owner requests validate and renew their session. Internal coordination uses
-    # find() deliberately so one service cannot extend another service's lease.
+    # Session-bound requests validate and renew their session. Internal lookups
+    # deliberately use find() so one service cannot extend another service's lease.
 
     def renew(self, identity: IdentityT, session_id: str) -> bool:
         return self._get_and_renew_entry(identity, session_id) is not None
 
     def find(self, identity: IdentityT) -> ServiceT | None:
-        """Return a service without validating or renewing its owner session."""
+        """Return a service without validating or renewing its session."""
         with self._lock:
             self._raise_if_closed()
             entry = self._services.get(identity)
             return None if entry is None else entry.service
 
     def get_for_session(self, identity: IdentityT, session_id: str) -> ServiceT | None:
-        """Validate the owner session, renew its lease, and return the service."""
+        """Validate the session, renew its lease, and return the service."""
         entry = self._get_and_renew_entry(identity, session_id)
         return None if entry is None else entry.service
 
@@ -253,7 +253,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         identity: IdentityT,
         session_id: str,
     ) -> _ServiceEntry[ServiceT] | None:
-        """Validate, resolve, and renew an owner session atomically.
+        """Validate, resolve, and renew a session atomically.
 
         These steps stay in one method and share the lifecycle lock so expiration
         cannot detach the service between session validation and lease renewal.
@@ -309,9 +309,9 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     # Lease expiration and maintenance
     # ==============================
 
-    # Expiration claims entries under the lifecycle lock, closes them outside
-    # that lock on their owner lane, then publishes whether the session may recover.
-    # The maintenance thread only drives this same expiration path periodically.
+    # Expiration removes entries under the lifecycle lock, closes them without
+    # holding that lock, then records sessions that may register again. The
+    # maintenance thread only runs this same expiration path periodically.
 
     def expire_leases(self) -> int:
         with self._expiration_lock:
@@ -379,10 +379,9 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     # Shutdown and service closure
     # ==============================
 
-    # Closing rejects new lifecycle work before joining maintenance. Entries are
-    # detached under lock and then closed on their owner lanes without holding it.
-    # Once detached, a service is terminal: background and shutdown cleanup is
-    # best-effort and never retries because backend close need not be idempotent.
+    # Closing rejects new lifecycle work before joining the maintenance thread.
+    # Entries are removed under lock and then closed without holding it. Each
+    # service gets one close attempt because repeating backend close may be unsafe.
 
     def close(self) -> None:
         with self._lock:
@@ -401,9 +400,9 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
             self._recoverable_sessions.clear()
             self._retired_sessions.clear()
 
-        # Closing the manager makes every shared registration wait terminal,
-        # even though a factory already running outside the lock cannot be
-        # cancelled and will clean up its result when it eventually returns.
+        # Wake every caller waiting for registration with a close error. A factory
+        # already running outside the lock cannot be cancelled and will clean up
+        # its result when it eventually returns.
         for flight in registration_flights:
             flight.future.set_exception(RuntimeError(f"{self._service_name} lifecycle manager is closed"))
 
@@ -427,11 +426,12 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
             logger.exception("Failed to close %s service %r on its owner", self._service_name, service)
 
     # ==============================
-    # Lifecycle guards
+    # Session and registration validation
     # ==============================
 
-    # Caller mistakes raise local value errors. Peer-driven session and
-    # fingerprint conflicts use lifecycle errors that the business layer maps.
+    # Invalid local arguments raise ordinary value errors. Stale sessions and
+    # conflicting registration data use lifecycle errors so callers can handle
+    # them separately.
 
     def _raise_if_closed(self) -> None:
         if self._closed:

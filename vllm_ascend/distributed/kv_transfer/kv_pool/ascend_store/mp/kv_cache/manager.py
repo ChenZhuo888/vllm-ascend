@@ -45,8 +45,9 @@ _LEASE_CHECK_INTERVAL_S = 5.0
 class KVCacheServiceManager:
     """Own scheduler and worker lifecycles behind a transport-neutral API.
 
-    Owner calls are session-scoped. Cross-service lookup and lifecycle-triggered
-    cleanup use the appropriate execution lane when executors are provided.
+    Requests are accepted only for current sessions. Cross-service lookup and
+    automatic cleanup use the executor thread assigned to each service when
+    executors are provided.
     """
 
     def __init__(
@@ -115,9 +116,9 @@ class KVCacheServiceManager:
     # Service registration and sessions
     # ==============================
 
-    # Registrations bind config-derived identities to fingerprinted sessions. This
-    # makes retries idempotent while lifecycle registries fence superseded sessions
-    # from renewing or unregistering a replacement service.
+    # Registration ties each config-derived identity to a session and a hash of
+    # its registration payload. Retrying the same session is safe, while an older
+    # session cannot renew or unregister its replacement.
 
     def register_scheduler(self, registration: SchedulerRegistration, payload: bytes) -> "KVPoolScheduler":
         self._validate_scheduler_registration(registration)
@@ -177,7 +178,7 @@ class KVCacheServiceManager:
 
     # Scheduler calls reuse the original KVPoolScheduler request state rather than
     # rebuilding it in the MP layer. Resolving the current session also renews its
-    # lease, so normal request traffic counts as Scheduler liveness.
+    # lease, so normal request traffic keeps the Scheduler registered.
 
     def lookup(
         self,
@@ -253,9 +254,9 @@ class KVCacheServiceManager:
     # Worker service operations
     # ==============================
 
-    # Worker callbacks touch backend state only after resolving the current session.
-    # That lookup fences superseded owners and treats normal transfer traffic as
-    # Worker liveness.
+    # Worker requests resolve the current session before touching backend state.
+    # This rejects replaced sessions, while successful transfer requests also
+    # renew the Worker's lease.
 
     def register_worker_kv_caches(
         self,
@@ -350,9 +351,10 @@ class KVCacheServiceManager:
     # Scheduler-to-Worker lookup coordination
     # ==============================
 
-    # Scheduler lookup targets rank zero in the same engine and data-parallel group.
-    # With an executor it crosses to the Worker affinity lane but uses non-renewing
-    # find(), so Scheduler traffic cannot keep an otherwise idle Worker alive.
+    # Scheduler lookup targets rank zero in the same engine and data-parallel
+    # group. With an executor, the lookup runs on the thread assigned to that
+    # Worker. It deliberately uses find() without renewing the lease, so Scheduler
+    # traffic cannot keep an otherwise idle Worker alive.
 
     def _lookup_worker(
         self,
@@ -402,12 +404,13 @@ class KVCacheServiceManager:
         )
 
     # ==============================
-    # Lease maintenance and owner-lane closure
+    # Lease maintenance and service closure
     # ==============================
 
-    # Scheduler and Worker lifecycle registries are maintained and closed as one
-    # service boundary. Expiry and shutdown may begin off-lane, so cleanup returns
-    # to each service owner and finishes before its executor may stop.
+    # Scheduler and Worker lifecycles start and stop together. When a service has
+    # an executor, expiry and shutdown send close() to the thread selected by that
+    # service identity and wait for it, so the executors must remain alive until
+    # this manager has closed its services.
 
     def start_lease_maintenance(self) -> None:
         self._schedulers.start_maintenance()
