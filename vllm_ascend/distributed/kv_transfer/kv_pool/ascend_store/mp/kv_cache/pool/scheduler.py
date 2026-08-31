@@ -1,4 +1,4 @@
-"""Scheduler-side lookup logic reused inside the KVCacheServer process."""
+"""Adapt KVPoolScheduler to the KVCacheServer process boundary."""
 
 from collections.abc import Sequence
 
@@ -10,13 +10,11 @@ from ..view import BlockPoolProxy, SchedulerOutputView
 
 
 class _WorkerLookupBridge:
-    """Expose the worker's lookup through KVPoolScheduler's client interface.
+    """Route KVPoolScheduler's non-layerwise lookup to its Worker service.
 
-    The original scheduler reaches the worker process over zmq via
-    LookupKeyClient; inside the server both sides share one process, so the
-    bridge invokes the worker's lookup entry directly. use_layerwise is always
-    False here because the layerwise paths query the store scheduler directly
-    and never go through the client.
+    KVPoolScheduler expects a LookupKeyClient. Inside KVCacheServer, the manager
+    callback reaches the Worker on its owner lane without another RPC. Layerwise
+    lookup uses store_scheduler directly and never enters this bridge.
     """
 
     def __init__(self, identity: SchedulerIdentity, lookup_handler: WorkerLookupHandler):
@@ -34,13 +32,12 @@ class _WorkerLookupBridge:
 
 
 class MPKVPoolScheduler(KVPoolScheduler):
-    """Run the original KVPoolScheduler inside the KVCacheServer process.
+    """Run KVPoolScheduler semantics from server-side projections.
 
-    Business methods are inherited unchanged. Only construction differs:
-    use_layerwise comes from the engine's extra config, the lookup client is
-    the in-process bridge instead of a zmq LookupKeyClient, and the block pool
-    is a command-recording proxy whose instructions the connector replays on
-    the real scheduler-process pool.
+    KVPoolScheduler normally reads live vLLM request objects and a BlockPool
+    owned by the Scheduler process. This adapter refreshes retained request
+    views, routes non-layerwise Worker lookup through the Manager, and records
+    BlockPool operations for the owning process to apply.
     """
 
     def __init__(self, registration: SchedulerRegistration, lookup_handler: WorkerLookupHandler):
@@ -55,28 +52,21 @@ class MPKVPoolScheduler(KVPoolScheduler):
         self.client = _WorkerLookupBridge(registration.identity, lookup_handler)  # type: ignore[assignment]
         self._block_pool = BlockPoolProxy()  # type: ignore[assignment]
 
+    # ==============================
+    # Scheduler request state across RPC
+    # ==============================
+
+    # A RequestView is registered before scheduling continues, while later RPCs
+    # carry only the fields changed in that step. Refresh that same object before
+    # entering inherited metadata orchestration so its request registry observes
+    # the same evolving state as the in-process Scheduler.
+
     def build_connector_meta(self, scheduler_output: SchedulerOutputView):
         self._sync_request_views(scheduler_output)
         return super().build_connector_meta(scheduler_output)
 
-    def take_block_pool_commands(self) -> list[int]:
-        """Block ids the mamba bookkeeping touched; the connector replays them
-        on the real BlockPool and clears the list."""
-        return self._block_pool.take_touch_ids()
-
-    def take_free_block_commands(self) -> list[int]:
-        """Block ids whose sending events completed across all workers; the
-        connector replays the frees on the real BlockPool."""
-        return self._block_pool.take_free_ids()
-
     def _sync_request_views(self, output: SchedulerOutputView) -> None:
-        """Refresh the dynamic fields on registered views from the projection.
-
-        The original code reads num_computed_tokens/block_ids/all_token_ids off
-        live vLLM objects; here the same values arrive per step inside the
-        SchedulerOutputView and are written back onto the stored views first,
-        so the inherited methods see the same object state as inprocess mode.
-        """
+        """Apply this step's mutable Scheduler fields to registered views."""
         refreshed_new_reqs = []
         for new_req in output.scheduled_new_reqs:
             entry = self._unfinished_requests.get(new_req.req_id)
@@ -99,3 +89,19 @@ class MPKVPoolScheduler(KVPoolScheduler):
             view = entry[0]
             view.num_computed_tokens = cached.num_computed_tokens[index]
             view.all_token_ids.extend(cached.new_token_ids.get(req_id, []))
+
+    # ==============================
+    # BlockPool ownership across processes
+    # ==============================
+
+    # The inherited mamba bookkeeping runs in the server, but the real BlockPool
+    # is owned by the vLLM Scheduler process. Its proxy records block-id operations;
+    # each batch is returned once for the connector to apply after the RPC.
+
+    def take_block_pool_commands(self) -> list[int]:
+        """Return and clear block ids retained for in-flight mamba Store work."""
+        return self._block_pool.take_touch_ids()
+
+    def take_free_block_commands(self) -> list[int]:
+        """Return and clear block ids whose Store work finished on every Worker."""
+        return self._block_pool.take_free_ids()
