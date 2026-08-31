@@ -187,9 +187,7 @@ class KVCacheServiceManager:
         request: Request,
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
-        scheduler = self._schedulers.get_for_session(identity, session_id)
-        if scheduler is None:
-            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        scheduler = self._require_scheduler(identity, session_id)
         return scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
     def update_state_after_alloc(
@@ -200,9 +198,7 @@ class KVCacheServiceManager:
         blocks: BlocksView,
         num_external_tokens: int,
     ) -> None:
-        scheduler = self._schedulers.get_for_session(identity, session_id)
-        if scheduler is None:
-            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        scheduler = self._require_scheduler(identity, session_id)
         # The inherited method stores the view in _unfinished_requests, which
         # doubles as the request registry for later business methods.
         scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
@@ -213,9 +209,7 @@ class KVCacheServiceManager:
         session_id: str,
         output: SchedulerOutputView,
     ) -> tuple:
-        scheduler = self._schedulers.get_for_session(identity, session_id)
-        if scheduler is None:
-            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        scheduler = self._require_scheduler(identity, session_id)
         metadata = scheduler.build_connector_meta(output)
         take_commands = getattr(scheduler, "take_block_pool_commands", None)
         touch_block_ids = take_commands() if callable(take_commands) else []
@@ -229,9 +223,7 @@ class KVCacheServiceManager:
         block_ids,
         all_groups: bool,
     ) -> tuple:
-        scheduler = self._schedulers.get_for_session(identity, session_id)
-        if scheduler is None:
-            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        scheduler = self._require_scheduler(identity, session_id)
         request = RequestIdView(request_id=req_id)
         if all_groups:
             return scheduler.request_finished_all_groups(request, block_ids)
@@ -243,12 +235,16 @@ class KVCacheServiceManager:
         session_id: str,
         output: ConnectorOutputView,
     ) -> list[int]:
-        scheduler = self._schedulers.get_for_session(identity, session_id)
-        if scheduler is None:
-            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        scheduler = self._require_scheduler(identity, session_id)
         scheduler.update_connector_output(output)
         take_free = getattr(scheduler, "take_free_block_commands", None)
         return take_free() if callable(take_free) else []
+
+    def _require_scheduler(self, identity: SchedulerIdentity, session_id: str) -> "KVPoolScheduler":
+        scheduler = self._schedulers.get_for_session(identity, session_id)
+        if scheduler is None:
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        return scheduler
 
     # ==============================
     # Worker service operations
@@ -264,9 +260,7 @@ class KVCacheServiceManager:
         session_id: str,
         spec: WorkerKVCacheSpec,
     ) -> None:
-        worker = self._workers.get_for_session(identity, session_id)
-        if worker is None:
-            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        worker = self._require_worker(identity, session_id)
         configure = getattr(worker, "configure_kv_caches", None)
         if not callable(configure):
             raise RuntimeError(f"Worker {identity!r} does not support KV cache configuration")
@@ -279,9 +273,7 @@ class KVCacheServiceManager:
         metadata: AscendConnectorMetadata,
         event_spec: NPUEventSpec,
     ) -> None:
-        worker = self._workers.get_for_session(identity, session_id)
-        if worker is None:
-            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        worker = self._require_worker(identity, session_id)
         handler = getattr(worker, "wait_for_save", None)
         if not callable(handler):
             raise RuntimeError(f"Worker {identity!r} does not support wait_for_save")
@@ -294,9 +286,7 @@ class KVCacheServiceManager:
         finished_req_ids: set[str],
         metadata: AscendConnectorMetadata,
     ) -> tuple[set[str], set[str]]:
-        worker = self._workers.get_for_session(identity, session_id)
-        if worker is None:
-            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        worker = self._require_worker(identity, session_id)
         return worker.get_finished(finished_req_ids, metadata)
 
     def build_connector_worker_meta(
@@ -304,15 +294,11 @@ class KVCacheServiceManager:
         identity: WorkerIdentity,
         session_id: str,
     ) -> AscendStoreKVConnectorWorkerMetadata | None:
-        worker = self._workers.get_for_session(identity, session_id)
-        if worker is None:
-            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        worker = self._require_worker(identity, session_id)
         return worker.build_connector_worker_meta()
 
     def get_kv_events(self, identity: WorkerIdentity, session_id: str) -> list[BlockStored]:
-        worker = self._workers.get_for_session(identity, session_id)
-        if worker is None:
-            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        worker = self._require_worker(identity, session_id)
         return worker.get_kv_events()
 
     def start_load_kv(
@@ -321,31 +307,29 @@ class KVCacheServiceManager:
         session_id: str,
         metadata: AscendConnectorMetadata,
     ) -> None:
-        worker = self._workers.get_for_session(identity, session_id)
-        if worker is None:
-            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        worker = self._require_worker(identity, session_id)
         worker.start_load_kv(metadata)
 
     def wait_for_layer_load(self, identity: WorkerIdentity, session_id: str) -> None:
-        worker = self._workers.get_for_session(identity, session_id)
-        if worker is None:
-            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        worker = self._require_worker(identity, session_id)
         worker.wait_for_layer_load()
 
     def save_kv_layer(self, identity: WorkerIdentity, session_id: str, event_spec: NPUEventSpec) -> None:
-        worker = self._workers.get_for_session(identity, session_id)
-        if worker is None:
-            raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+        worker = self._require_worker(identity, session_id)
         handler = getattr(worker, "save_kv_layer_from_event", None)
         if not callable(handler):
             raise RuntimeError(f"Worker {identity!r} does not support cross-process layer Store")
         handler(event_spec)
 
     def get_block_ids_with_load_errors(self, identity: WorkerIdentity, session_id: str) -> set[int]:
+        worker = self._require_worker(identity, session_id)
+        return worker.get_block_ids_with_load_errors()
+
+    def _require_worker(self, identity: WorkerIdentity, session_id: str) -> "KVPoolWorker":
         worker = self._workers.get_for_session(identity, session_id)
         if worker is None:
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
-        return worker.get_block_ids_with_load_errors()
+        return worker
 
     # ==============================
     # Scheduler-to-Worker lookup coordination

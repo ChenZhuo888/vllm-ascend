@@ -2,6 +2,8 @@ import threading
 from functools import partial
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.manager import KVCacheServiceManager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import encode_registration
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import (
@@ -10,6 +12,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import AffinityExecutor
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.service import StaleSessionError
 
 _BLOCK_HASHES = [bytes.fromhex("01" * 32), bytes.fromhex("02" * 32)]
 
@@ -195,6 +198,49 @@ def test_worker_cache_spec_is_configured_on_its_owner_lane() -> None:
     finally:
         service_manager.close()
         worker_executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_new_worker_session_accepts_a_new_cache_mapping() -> None:
+    workers = []
+
+    def worker_factory(_registration):
+        worker = _FakeWorker()
+        workers.append(worker)
+        return worker
+
+    service_manager = KVCacheServiceManager(worker_factory=worker_factory)
+    old_registration = _worker_registration("old-session")
+    new_registration = _worker_registration("new-session")
+    old_spec = WorkerKVCacheSpec(caches={"old.layer": ()}, storages=())
+    new_spec = WorkerKVCacheSpec(caches={"new.layer": ()}, storages=())
+
+    try:
+        old_worker = service_manager.register_worker(old_registration, encode_registration(old_registration))
+        service_manager.register_worker_kv_caches(
+            old_registration.identity,
+            old_registration.session_id,
+            old_spec,
+        )
+
+        new_worker = service_manager.register_worker(new_registration, encode_registration(new_registration))
+        service_manager.register_worker_kv_caches(
+            new_registration.identity,
+            new_registration.session_id,
+            new_spec,
+        )
+
+        assert old_worker.close_count == 1
+        assert new_worker is workers[1]
+        assert new_worker.kv_cache_spec == new_spec
+        assert service_manager.worker_count == 1
+        with pytest.raises(StaleSessionError, match="retired"):
+            service_manager.register_worker_kv_caches(
+                old_registration.identity,
+                old_registration.session_id,
+                old_spec,
+            )
+    finally:
+        service_manager.close()
 
 
 def test_lookup_does_not_fall_back_to_a_non_coordinator_worker() -> None:
