@@ -483,6 +483,10 @@ These rules apply to changes under
   reordering methods or adding sections. When the structure is unclear, do not
   use comments to make it appear settled; preserve the ambiguity as an
   architecture question to investigate.
+- Treat the organized RPC files as the local style reference because their
+  sections follow confirmed execution ownership, concurrency, and lifecycle
+  boundaries. Reuse that reasoning process, not the number or wording of their
+  banners.
 - A class-level explanation belongs in the class docstring. Not every class or
   method needs a docstring, but explanatory prose immediately following a
   class declaration must not be written as a substitute block of comments.
@@ -507,17 +511,27 @@ These rules apply to changes under
   execution owner, or lifecycle transition while skimming the file. A
   one-method section is justified only when that method is itself a major
   transaction or lifecycle boundary.
-- Explanatory text below a section banner is optional. Add it only to capture
-  a non-obvious reason, invariant, ordering requirement, ownership rule, or
-  compatibility constraint.
+- A section that expresses ownership, concurrency, lifecycle, an execution
+  phase, cross-process adaptation, or a compatibility boundary must include a
+  short lead comment explaining why the code belongs together and which
+  invariant or ordering rule the region preserves. A title may stand alone
+  only for an obvious navigational grouping whose meaning is already complete
+  in the adjacent code and does not hide an architectural claim.
+- Review every proposed section by asking why it is an independent region. If
+  neither the adjacent code nor its lead comment answers that question, remove
+  the section or explain the missing architectural reason. Do not keep a
+  title-only taxonomy merely because the methods share a noun or RPC role.
 - Keep methods that participate in one operation close together. Prefer an
   order that exposes the public orchestration first and places its meaningful
   helpers nearby; use lifecycle order where it is the clearest narrative.
   Do not reorder methods merely for symmetry, alphabetic grouping, or route
   name consistency.
-- Before applying textual reorganization across several files, propose the
-  intended file order and section map. Establish the style on one
-  representative file and review it before propagating the approach.
+- Before changing a file, produce a read-only section map that names each
+  proposed region, the methods it contains, the architectural reason for the
+  grouping, and the lead comment needed to express that reason. When the user
+  requests staged review, wait for confirmation of this map before editing.
+  Establish the style on one representative file before propagating it, and
+  never treat the remaining files as an automatic checklist of required edits.
 
 ### Design Discipline
 
