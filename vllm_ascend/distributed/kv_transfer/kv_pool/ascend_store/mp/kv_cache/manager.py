@@ -43,7 +43,11 @@ _LEASE_CHECK_INTERVAL_S = 5.0
 
 
 class KVCacheServiceManager:
-    """Own KV cache services and coordinate calls between optional owner lanes."""
+    """Own scheduler and worker lifecycles behind a transport-neutral API.
+
+    Owner calls are session-scoped. Cross-service lookup and lifecycle-triggered
+    cleanup use the appropriate execution lane when executors are provided.
+    """
 
     def __init__(
         self,
@@ -107,6 +111,14 @@ class KVCacheServiceManager:
     def _build_scheduler(self, registration: SchedulerRegistration) -> "KVPoolScheduler":
         return self._scheduler_factory(registration, self._lookup_worker)
 
+    # ==============================
+    # Service registration and sessions
+    # ==============================
+
+    # Registrations bind config-derived identities to fingerprinted sessions. This
+    # makes retries idempotent while lifecycle registries fence superseded sessions
+    # from renewing or unregistering a replacement service.
+
     def register_scheduler(self, registration: SchedulerRegistration, payload: bytes) -> "KVPoolScheduler":
         self._validate_scheduler_registration(registration)
         scheduler = self._schedulers.register(
@@ -127,12 +139,6 @@ class KVCacheServiceManager:
         )
         return worker
 
-    def unregister_scheduler(self, identity: SchedulerIdentity, session_id: str) -> bool:
-        return self._schedulers.unregister(identity, session_id)
-
-    def unregister_worker(self, identity: WorkerIdentity, session_id: str) -> bool:
-        return self._workers.unregister(identity, session_id)
-
     def renew_scheduler(self, identity: SchedulerIdentity, session_id: str) -> None:
         if not self._schedulers.renew(identity, session_id):
             raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
@@ -140,6 +146,116 @@ class KVCacheServiceManager:
     def renew_worker(self, identity: WorkerIdentity, session_id: str) -> None:
         if not self._workers.renew(identity, session_id):
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
+
+    def unregister_scheduler(self, identity: SchedulerIdentity, session_id: str) -> bool:
+        return self._schedulers.unregister(identity, session_id)
+
+    def unregister_worker(self, identity: WorkerIdentity, session_id: str) -> bool:
+        return self._workers.unregister(identity, session_id)
+
+    @staticmethod
+    def _validate_scheduler_registration(registration: SchedulerRegistration) -> None:
+        expected_identity = SchedulerIdentity.from_config_spec(registration.config)
+        if registration.identity != expected_identity:
+            raise ValueError(
+                f"Scheduler identity does not match registration config: "
+                f"{registration.identity!r} != {expected_identity!r}"
+            )
+
+    @staticmethod
+    def _validate_worker_registration(registration: WorkerRegistration) -> None:
+        expected_identity = WorkerIdentity.from_config_spec(registration.config)
+        if registration.identity != expected_identity:
+            raise ValueError(
+                f"Worker identity does not match registration config: "
+                f"{registration.identity!r} != {expected_identity!r}"
+            )
+
+    # ==============================
+    # Scheduler service operations
+    # ==============================
+
+    # Scheduler calls reuse the original KVPoolScheduler request state rather than
+    # rebuilding it in the MP layer. Resolving the current session also renews its
+    # lease, so normal request traffic counts as Scheduler liveness.
+
+    def lookup(
+        self,
+        identity: SchedulerIdentity,
+        session_id: str,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> tuple[int, bool]:
+        scheduler = self._schedulers.get_for_session(identity, session_id)
+        if scheduler is None:
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        return scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+
+    def update_state_after_alloc(
+        self,
+        identity: SchedulerIdentity,
+        session_id: str,
+        request: RequestView,
+        blocks: BlocksView,
+        num_external_tokens: int,
+    ) -> None:
+        scheduler = self._schedulers.get_for_session(identity, session_id)
+        if scheduler is None:
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        # The inherited method stores the view in _unfinished_requests, which
+        # doubles as the request registry for later business methods.
+        scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+
+    def build_connector_meta(
+        self,
+        identity: SchedulerIdentity,
+        session_id: str,
+        output: SchedulerOutputView,
+    ) -> tuple:
+        scheduler = self._schedulers.get_for_session(identity, session_id)
+        if scheduler is None:
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        metadata = scheduler.build_connector_meta(output)
+        take_commands = getattr(scheduler, "take_block_pool_commands", None)
+        touch_block_ids = take_commands() if callable(take_commands) else []
+        return metadata, touch_block_ids
+
+    def request_finished(
+        self,
+        identity: SchedulerIdentity,
+        session_id: str,
+        req_id: str,
+        block_ids,
+        all_groups: bool,
+    ) -> tuple:
+        scheduler = self._schedulers.get_for_session(identity, session_id)
+        if scheduler is None:
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        request = RequestIdView(request_id=req_id)
+        if all_groups:
+            return scheduler.request_finished_all_groups(request, block_ids)
+        return scheduler.request_finished(request, block_ids)
+
+    def update_connector_output(
+        self,
+        identity: SchedulerIdentity,
+        session_id: str,
+        output: ConnectorOutputView,
+    ) -> list[int]:
+        scheduler = self._schedulers.get_for_session(identity, session_id)
+        if scheduler is None:
+            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
+        scheduler.update_connector_output(output)
+        take_free = getattr(scheduler, "take_free_block_commands", None)
+        return take_free() if callable(take_free) else []
+
+    # ==============================
+    # Worker service operations
+    # ==============================
+
+    # Worker callbacks touch backend state only after resolving the current session.
+    # That lookup fences superseded owners and treats normal transfer traffic as
+    # Worker liveness.
 
     def register_worker_kv_caches(
         self,
@@ -230,87 +346,13 @@ class KVCacheServiceManager:
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
         return worker.get_block_ids_with_load_errors()
 
-    def lookup(
-        self,
-        identity: SchedulerIdentity,
-        session_id: str,
-        request: Request,
-        num_computed_tokens: int,
-    ) -> tuple[int, bool]:
-        scheduler = self._schedulers.get_for_session(identity, session_id)
-        if scheduler is None:
-            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
-        return scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+    # ==============================
+    # Scheduler-to-Worker lookup coordination
+    # ==============================
 
-    def update_state_after_alloc(
-        self,
-        identity: SchedulerIdentity,
-        session_id: str,
-        request: RequestView,
-        blocks: BlocksView,
-        num_external_tokens: int,
-    ) -> None:
-        scheduler = self._schedulers.get_for_session(identity, session_id)
-        if scheduler is None:
-            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
-        # The inherited method stores the view in _unfinished_requests, which
-        # doubles as the request registry for later business methods.
-        scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
-
-    def build_connector_meta(
-        self,
-        identity: SchedulerIdentity,
-        session_id: str,
-        output: SchedulerOutputView,
-    ) -> tuple:
-        scheduler = self._schedulers.get_for_session(identity, session_id)
-        if scheduler is None:
-            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
-        metadata = scheduler.build_connector_meta(output)
-        take_commands = getattr(scheduler, "take_block_pool_commands", None)
-        touch_block_ids = take_commands() if callable(take_commands) else []
-        return metadata, touch_block_ids
-
-    def request_finished(
-        self,
-        identity: SchedulerIdentity,
-        session_id: str,
-        req_id: str,
-        block_ids,
-        all_groups: bool,
-    ) -> tuple:
-        scheduler = self._schedulers.get_for_session(identity, session_id)
-        if scheduler is None:
-            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
-        request = RequestIdView(request_id=req_id)
-        if all_groups:
-            return scheduler.request_finished_all_groups(request, block_ids)
-        return scheduler.request_finished(request, block_ids)
-
-    def update_connector_output(
-        self,
-        identity: SchedulerIdentity,
-        session_id: str,
-        output: ConnectorOutputView,
-    ) -> list[int]:
-        scheduler = self._schedulers.get_for_session(identity, session_id)
-        if scheduler is None:
-            raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
-        scheduler.update_connector_output(output)
-        take_free = getattr(scheduler, "take_free_block_commands", None)
-        return take_free() if callable(take_free) else []
-
-    def start_lease_maintenance(self) -> None:
-        self._schedulers.start_maintenance()
-        self._workers.start_maintenance()
-
-    def stop_lease_maintenance(self, wait: bool = True) -> None:
-        self._workers.stop_maintenance(wait=wait)
-        self._schedulers.stop_maintenance(wait=wait)
-
-    def close(self) -> None:
-        self._workers.close()
-        self._schedulers.close()
+    # Scheduler lookup targets rank zero in the same engine and data-parallel group.
+    # With an executor it crosses to the Worker affinity lane but uses non-renewing
+    # find(), so Scheduler traffic cannot keep an otherwise idle Worker alive.
 
     def _lookup_worker(
         self,
@@ -351,6 +393,34 @@ class KVCacheServiceManager:
         hash_strings = [block_hash.hex() for block_hash in block_hashes]
         return worker.lookup_scheduler(token_len, hash_strings, kv_cache_group_ids, use_layerwise, hbm_hit_tokens)
 
+    @staticmethod
+    def _get_lookup_worker_identity(scheduler_identity: SchedulerIdentity) -> WorkerIdentity:
+        return WorkerIdentity(
+            scheduler_identity.engine_id,
+            rank=_LOOKUP_COORDINATOR_RANK,
+            data_parallel_rank=scheduler_identity.data_parallel_rank,
+        )
+
+    # ==============================
+    # Lease maintenance and owner-lane closure
+    # ==============================
+
+    # Lease expiry and final shutdown may begin outside a service's owner thread.
+    # Cleanup is sent back to that affinity lane and awaited, so configured executors
+    # must remain alive until close() returns.
+
+    def start_lease_maintenance(self) -> None:
+        self._schedulers.start_maintenance()
+        self._workers.start_maintenance()
+
+    def stop_lease_maintenance(self, wait: bool = True) -> None:
+        self._workers.stop_maintenance(wait=wait)
+        self._schedulers.stop_maintenance(wait=wait)
+
+    def close(self) -> None:
+        self._workers.close()
+        self._schedulers.close()
+
     def _close_service_on_owner(
         self,
         executor: TaskExecutor | None,
@@ -364,33 +434,7 @@ class KVCacheServiceManager:
         executor.submit(callback, identity, block=True).result()
 
     @staticmethod
-    def _get_lookup_worker_identity(scheduler_identity: SchedulerIdentity) -> WorkerIdentity:
-        return WorkerIdentity(
-            scheduler_identity.engine_id,
-            rank=_LOOKUP_COORDINATOR_RANK,
-            data_parallel_rank=scheduler_identity.data_parallel_rank,
-        )
-
-    @staticmethod
     def _close_service(service: object) -> None:
         close = getattr(service, "close", None)
         if callable(close):
             close()
-
-    @staticmethod
-    def _validate_scheduler_registration(registration: SchedulerRegistration) -> None:
-        expected_identity = SchedulerIdentity.from_config_spec(registration.config)
-        if registration.identity != expected_identity:
-            raise ValueError(
-                f"Scheduler identity does not match registration config: "
-                f"{registration.identity!r} != {expected_identity!r}"
-            )
-
-    @staticmethod
-    def _validate_worker_registration(registration: WorkerRegistration) -> None:
-        expected_identity = WorkerIdentity.from_config_spec(registration.config)
-        if registration.identity != expected_identity:
-            raise ValueError(
-                f"Worker identity does not match registration config: "
-                f"{registration.identity!r} != {expected_identity!r}"
-            )

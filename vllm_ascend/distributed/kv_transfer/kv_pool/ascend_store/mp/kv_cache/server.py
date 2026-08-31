@@ -143,8 +143,9 @@ class KVCacheServer:
     # Scheduler-affine request adapters
     # ==============================
 
-    # Scheduler routes share an affinity executor keyed by SchedulerIdentity.
-    # Registration, session work, and closure therefore stay ordered for one owner.
+    # Affinity is keyed by service identity rather than client connection or session.
+    # Replacement, request callbacks, and cleanup for the same Scheduler therefore
+    # cannot overtake one another.
 
     def _handle_register_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         registration, serialized_registration = decode_registration_request(payloads, SchedulerRegistration)
@@ -194,8 +195,9 @@ class KVCacheServer:
     # Worker-affine request adapters
     # ==============================
 
-    # Worker routes and scheduler-initiated lookup share the worker affinity
-    # executor, keeping configuration, transfer work, and closure ordered per owner.
+    # A Worker has one execution owner across RPC callbacks, Scheduler-initiated lookup,
+    # and lifecycle cleanup. Sharing one affinity key prevents those paths from touching
+    # Worker state concurrently.
 
     def _handle_register_worker(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         registration, serialized_registration = decode_registration_request(payloads, WorkerRegistration)
@@ -263,8 +265,8 @@ class KVCacheServer:
     # Inline lease renewal
     # ==============================
 
-    # These handlers run on the RPC thread and must remain bounded to lease metadata.
-    # Inline execution keeps renewal independent of scheduler and worker backlog.
+    # Lease renewal deliberately bypasses affinity queues because it only updates
+    # lifecycle metadata. A busy work lane must not make a live owner appear expired.
 
     def _handle_renew_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id = decode_scheduler_session(payloads)
@@ -280,9 +282,9 @@ class KVCacheServer:
     # Service and RPC lifecycle coordination
     # ==============================
 
-    # KVCacheServer coordinates lease maintenance with RPC admission and draining.
-    # Services close on live affinity lanes before MPServer releases executors and
-    # transport; abort deliberately skips that graceful sequence.
+    # Graceful shutdown stops lease maintenance and drains accepted RPCs before closing
+    # services, while affinity executors stay alive for owner-lane cleanup. Abort cancels
+    # queued work instead and intentionally skips graceful service closure.
 
     def run(self) -> None:
         try:
