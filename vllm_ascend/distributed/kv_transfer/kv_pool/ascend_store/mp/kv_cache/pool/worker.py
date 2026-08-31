@@ -1,4 +1,4 @@
-"""Worker-side KV cache logic reused inside the KVCacheServer process."""
+"""Adapt KVPoolWorker memory and transfer runtime to KVCacheServer."""
 
 import threading
 from collections.abc import Callable
@@ -68,11 +68,13 @@ WorkerBackendFactory = Callable[[object, int | None, bool], WorkerBackend]
 
 
 class MPKVPoolWorker(KVPoolWorker):
-    """Reuse KVPoolWorker's lookup inside the KVCacheServer process.
+    """Run KVPoolWorker against cache memory imported into KVCacheServer.
 
-    The server process has no torch.distributed group, so rank fields are
-    derived from registration. NPU cache mappings and the Worker backend are
-    attached later by the Worker registration path.
+    Construction derives parallel ranks without torch.distributed and leaves
+    the device runtime inactive. The first cache registration identifies the
+    NPU and activates the backend and inherited transfer logic. RPC adapters
+    preserve source-process event ordering, while this service owns its imported
+    mappings, created backend, and transfer threads.
     """
 
     def __init__(
@@ -127,6 +129,16 @@ class MPKVPoolWorker(KVPoolWorker):
         """Defer backend creation until the IPC mapping identifies its NPU."""
         self._parallel_config = parallel_config
 
+    # ==============================
+    # Worker runtime activation from cache mapping
+    # ==============================
+
+    # The service is constructed without an NPU runtime because only the later
+    # cache mapping identifies its device. Registration imports that mapping,
+    # binds the backend to the same NPU, and publishes it only after inherited
+    # buffer and transfer setup succeeds; partial activation is undone before
+    # failure escapes.
+
     def configure_kv_caches(self, spec: WorkerKVCacheSpec) -> None:
         """Install the Worker's fixed cache mapping, tolerating RPC retries."""
         if self._runtime_failure is not None:
@@ -161,23 +173,6 @@ class MPKVPoolWorker(KVPoolWorker):
             raise
         self._publish_kv_caches(spec, imported)
 
-    def _register_runtime(self, imported: ImportedKVCache) -> None:
-        self.m_store.set_device()
-        self._runtime_active = True
-        super().register_kv_caches(imported.tensors)
-
-    def _publish_kv_caches(self, spec: WorkerKVCacheSpec, imported: ImportedKVCache) -> None:
-        self._imported_kv_cache = imported
-        self.kv_cache_spec = spec
-        self.kv_caches = imported.tensors
-        self.device_index = imported.device_index
-
-    def _clear_kv_caches(self) -> None:
-        self._imported_kv_cache = None
-        self.kv_cache_spec = None
-        self.kv_caches = {}
-        self.device_index = None
-
     def _activate_backend(self, device_index: int | None) -> None:
         if self._store_is_external:
             return
@@ -193,11 +188,32 @@ class MPKVPoolWorker(KVPoolWorker):
     def _create_backend(self, parallel_config, device_index: int | None, lazy_init: bool) -> WorkerBackend:
         return create_mp_backend(self.backend, parallel_config, device_index, lazy_init)
 
+    def _register_runtime(self, imported: ImportedKVCache) -> None:
+        self.m_store.set_device()
+        self._runtime_active = True
+        super().register_kv_caches(imported.tensors)
+
+    def _publish_kv_caches(self, spec: WorkerKVCacheSpec, imported: ImportedKVCache) -> None:
+        self._imported_kv_cache = imported
+        self.kv_cache_spec = spec
+        self.kv_caches = imported.tensors
+        self.device_index = imported.device_index
+
+    # ==============================
+    # Connector step state and NPU event handoff
+    # ==============================
+
+    # Connector steps and Store callbacks arrive through separate RPCs, while
+    # their ordering events are recorded in the vLLM Worker process. Retain the
+    # current step metadata, import only events from the cache's NPU, and preserve
+    # source-stream order instead of recording replacement events in the server.
+
     def start_load_kv(self, metadata: AscendConnectorMetadata) -> None:
         self._current_connector_metadata = metadata
         super().start_load_kv(metadata)
 
     def save_kv_layer_from_event(self, event_spec: NPUEventSpec) -> None:
+        """Run one inherited layer Store using the event recorded by the vLLM Worker."""
         if self._current_connector_metadata is None:
             raise RuntimeError("Layer Store requires start_load_kv for the current step")
         if self.kv_cache_spec is None:
@@ -211,6 +227,39 @@ class MPKVPoolWorker(KVPoolWorker):
         event = _ImportedNPUEvent(import_npu_event(event_spec))
         self.sync_save_events[self.current_layer] = event  # type: ignore[assignment]
         super().save_kv_layer(self._current_connector_metadata)
+
+    def wait_for_save(self, connector_metadata: AscendConnectorMetadata, event_spec: NPUEventSpec) -> None:
+        """Submit savable requests behind the source event and wait for the send queue."""
+        if self.kv_send_thread is None:
+            raise RuntimeError("Worker Store runtime is not initialized")
+        send_thread = self.kv_send_thread
+        send_thread.raise_if_failed()
+        save_requests = [request for request in connector_metadata.requests if request.can_save]
+        if not save_requests:
+            return
+
+        if self.kv_cache_spec is None:
+            raise RuntimeError("Worker KV caches must be configured before wait_for_save")
+        device_uuids = {storage.device_uuid for storage in self.kv_cache_spec.storages}
+        if event_spec.device_uuid not in device_uuids:
+            raise ValueError(f"NPU event device {event_spec.device_uuid!r} does not match Worker KV caches")
+
+        current_event = import_npu_event(event_spec)
+        for request in save_requests:
+            request.skip_null_blocks_by_group = self.group_uses_align_state
+            request.current_event = current_event
+            send_thread.add_stored_request(request.req_id)
+            send_thread.add_request(request)
+        send_thread.request_queue.join()
+
+    # ==============================
+    # Transfer thread lifecycle
+    # ==============================
+
+    # Buffer registration activates one transfer runtime selected by role,
+    # transfer mode, and backend layout. Each thread must report ready before
+    # activation can complete; shutdown signals every thread before waiting for
+    # them so no thread remains blocked on a peer that has not been told to stop.
 
     def _start_kv_transfer_threads(self) -> None:
         if self._transfer_threads_started:
@@ -348,28 +397,14 @@ class MPKVPoolWorker(KVPoolWorker):
         self.kv_recv_thread = None
         self._transfer_threads_started = False
 
-    def wait_for_save(self, connector_metadata: AscendConnectorMetadata, event_spec: NPUEventSpec) -> None:
-        if self.kv_send_thread is None:
-            raise RuntimeError("Worker Store runtime is not initialized")
-        send_thread = self.kv_send_thread
-        send_thread.raise_if_failed()
-        save_requests = [request for request in connector_metadata.requests if request.can_save]
-        if not save_requests:
-            return
+    # ==============================
+    # Worker runtime shutdown
+    # ==============================
 
-        if self.kv_cache_spec is None:
-            raise RuntimeError("Worker KV caches must be configured before wait_for_save")
-        device_uuids = {storage.device_uuid for storage in self.kv_cache_spec.storages}
-        if event_spec.device_uuid not in device_uuids:
-            raise ValueError(f"NPU event device {event_spec.device_uuid!r} does not match Worker KV caches")
-
-        current_event = import_npu_event(event_spec)
-        for request in save_requests:
-            request.skip_null_blocks_by_group = self.group_uses_align_state
-            request.current_event = current_event
-            send_thread.add_stored_request(request.req_id)
-            send_thread.add_request(request)
-        send_thread.request_queue.join()
+    # Shutdown reverses runtime activation: stop transfer threads, unregister
+    # backend buffers, close only a backend created by this service, and finally
+    # release imported mappings and published cache state. An externally supplied
+    # backend remains owned by its caller.
 
     def close(self) -> None:
         imported = self._imported_kv_cache
@@ -402,3 +437,9 @@ class MPKVPoolWorker(KVPoolWorker):
         finally:
             self.m_store = _MissingWorkerBackend()
             self._backend_device_index = None
+
+    def _clear_kv_caches(self) -> None:
+        self._imported_kv_cache = None
+        self.kv_cache_spec = None
+        self.kv_caches = {}
+        self.device_index = None
