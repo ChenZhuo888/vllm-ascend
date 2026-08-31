@@ -15,10 +15,8 @@ from ..rpc import TaskExecutor
 from ..service import ServiceLifecycleManager
 from .error import ServiceNotRegisteredError
 from .registration import (
-    SchedulerFactory,
     SchedulerIdentity,
     SchedulerRegistration,
-    WorkerFactory,
     WorkerIdentity,
     WorkerLookupHandler,
     WorkerRegistration,
@@ -34,8 +32,11 @@ from .view import (
 )
 
 if TYPE_CHECKING:
-    from ...pool_scheduler import KVPoolScheduler
-    from ...pool_worker import KVPoolWorker
+    from .pool.scheduler import MPKVPoolScheduler
+    from .pool.worker import MPKVPoolWorker
+
+SchedulerFactory = Callable[[SchedulerRegistration, WorkerLookupHandler], "MPKVPoolScheduler"]
+WorkerFactory = Callable[[WorkerRegistration], "MPKVPoolWorker"]
 
 _LOOKUP_COORDINATOR_RANK = 0
 _SERVICE_LEASE_TIMEOUT_S = 60.0
@@ -63,7 +64,7 @@ class KVCacheServiceManager:
         self._scheduler_factory = scheduler_factory or self._create_scheduler
         self._worker_factory = worker_factory or self._create_worker
         self._worker_executor = worker_executor
-        self._schedulers = ServiceLifecycleManager[SchedulerIdentity, "KVPoolScheduler"](
+        self._schedulers = ServiceLifecycleManager[SchedulerIdentity, "MPKVPoolScheduler"](
             "Scheduler",
             self._close_service,
             lease_timeout_s=lease_timeout_s,
@@ -72,7 +73,7 @@ class KVCacheServiceManager:
             thread_name="ascend-store-scheduler-lifecycle",
             owner_close_handler=partial(self._close_service_on_owner, scheduler_executor),
         )
-        self._workers = ServiceLifecycleManager[WorkerIdentity, "KVPoolWorker"](
+        self._workers = ServiceLifecycleManager[WorkerIdentity, "MPKVPoolWorker"](
             "Worker",
             self._close_service,
             lease_timeout_s=lease_timeout_s,
@@ -93,13 +94,13 @@ class KVCacheServiceManager:
     @staticmethod
     def _create_scheduler(
         registration: SchedulerRegistration, lookup_handler: WorkerLookupHandler
-    ) -> "KVPoolScheduler":
+    ) -> "MPKVPoolScheduler":
         from .pool.scheduler import MPKVPoolScheduler
 
         return MPKVPoolScheduler(registration, lookup_handler)
 
     @staticmethod
-    def _create_worker(registration: WorkerRegistration) -> "KVPoolWorker":
+    def _create_worker(registration: WorkerRegistration) -> "MPKVPoolWorker":
         from .pool.worker import MPKVPoolWorker
 
         vllm_config, kv_cache_config = registration.config.build_runtime()
@@ -109,7 +110,7 @@ class KVCacheServiceManager:
             rank=registration.identity.rank,
         )
 
-    def _build_scheduler(self, registration: SchedulerRegistration) -> "KVPoolScheduler":
+    def _build_scheduler(self, registration: SchedulerRegistration) -> "MPKVPoolScheduler":
         return self._scheduler_factory(registration, self._lookup_worker)
 
     # ==============================
@@ -120,7 +121,7 @@ class KVCacheServiceManager:
     # its registration payload. Retrying the same session is safe, while an older
     # session cannot renew or unregister its replacement.
 
-    def register_scheduler(self, registration: SchedulerRegistration, payload: bytes) -> "KVPoolScheduler":
+    def register_scheduler(self, registration: SchedulerRegistration, payload: bytes) -> "MPKVPoolScheduler":
         self._validate_scheduler_registration(registration)
         scheduler = self._schedulers.register(
             registration.identity,
@@ -130,7 +131,7 @@ class KVCacheServiceManager:
         )
         return scheduler
 
-    def register_worker(self, registration: WorkerRegistration, payload: bytes) -> "KVPoolWorker":
+    def register_worker(self, registration: WorkerRegistration, payload: bytes) -> "MPKVPoolWorker":
         self._validate_worker_registration(registration)
         worker = self._workers.register(
             registration.identity,
@@ -211,9 +212,7 @@ class KVCacheServiceManager:
     ) -> tuple:
         scheduler = self._require_scheduler(identity, session_id)
         metadata = scheduler.build_connector_meta(output)
-        take_commands = getattr(scheduler, "take_block_pool_commands", None)
-        touch_block_ids = take_commands() if callable(take_commands) else []
-        return metadata, touch_block_ids
+        return metadata, scheduler.take_block_pool_commands()
 
     def request_finished(
         self,
@@ -237,10 +236,9 @@ class KVCacheServiceManager:
     ) -> list[int]:
         scheduler = self._require_scheduler(identity, session_id)
         scheduler.update_connector_output(output)
-        take_free = getattr(scheduler, "take_free_block_commands", None)
-        return take_free() if callable(take_free) else []
+        return scheduler.take_free_block_commands()
 
-    def _require_scheduler(self, identity: SchedulerIdentity, session_id: str) -> "KVPoolScheduler":
+    def _require_scheduler(self, identity: SchedulerIdentity, session_id: str) -> "MPKVPoolScheduler":
         scheduler = self._schedulers.get_for_session(identity, session_id)
         if scheduler is None:
             raise ServiceNotRegisteredError(f"Scheduler {identity!r} is not registered")
@@ -261,10 +259,7 @@ class KVCacheServiceManager:
         spec: WorkerKVCacheSpec,
     ) -> None:
         worker = self._require_worker(identity, session_id)
-        configure = getattr(worker, "configure_kv_caches", None)
-        if not callable(configure):
-            raise RuntimeError(f"Worker {identity!r} does not support KV cache configuration")
-        configure(spec)
+        worker.configure_kv_caches(spec)
 
     def wait_for_save(
         self,
@@ -274,10 +269,7 @@ class KVCacheServiceManager:
         event_spec: NPUEventSpec,
     ) -> None:
         worker = self._require_worker(identity, session_id)
-        handler = getattr(worker, "wait_for_save", None)
-        if not callable(handler):
-            raise RuntimeError(f"Worker {identity!r} does not support wait_for_save")
-        handler(metadata, event_spec)
+        worker.wait_for_save(metadata, event_spec)
 
     def get_finished(
         self,
@@ -316,16 +308,13 @@ class KVCacheServiceManager:
 
     def save_kv_layer(self, identity: WorkerIdentity, session_id: str, event_spec: NPUEventSpec) -> None:
         worker = self._require_worker(identity, session_id)
-        handler = getattr(worker, "save_kv_layer_from_event", None)
-        if not callable(handler):
-            raise RuntimeError(f"Worker {identity!r} does not support cross-process layer Store")
-        handler(event_spec)
+        worker.save_kv_layer_from_event(event_spec)
 
     def get_block_ids_with_load_errors(self, identity: WorkerIdentity, session_id: str) -> set[int]:
         worker = self._require_worker(identity, session_id)
         return worker.get_block_ids_with_load_errors()
 
-    def _require_worker(self, identity: WorkerIdentity, session_id: str) -> "KVPoolWorker":
+    def _require_worker(self, identity: WorkerIdentity, session_id: str) -> "MPKVPoolWorker":
         worker = self._workers.get_for_session(identity, session_id)
         if worker is None:
             raise ServiceNotRegisteredError(f"Worker {identity!r} is not registered")
@@ -421,7 +410,5 @@ class KVCacheServiceManager:
         executor.submit(callback, identity, block=True).result()
 
     @staticmethod
-    def _close_service(service: object) -> None:
-        close = getattr(service, "close", None)
-        if callable(close):
-            close()
+    def _close_service(service: "MPKVPoolScheduler | MPKVPoolWorker") -> None:
+        service.close()

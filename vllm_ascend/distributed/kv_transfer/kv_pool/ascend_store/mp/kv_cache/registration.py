@@ -2,7 +2,6 @@
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -10,15 +9,9 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from .config import KVPoolConfigSpec
 
-if TYPE_CHECKING:
-    from ..pool_scheduler import KVPoolScheduler
-    from ..pool_worker import KVPoolWorker
-
 _LEGACY_SESSION_ID = "legacy"
 
 WorkerLookupHandler = Callable[["SchedulerIdentity", int, Sequence[BlockHash], list[int] | None, bool, int], int]
-SchedulerFactory = Callable[["SchedulerRegistration", WorkerLookupHandler], "KVPoolScheduler"]
-WorkerFactory = Callable[["WorkerRegistration"], "KVPoolWorker"]
 
 
 def _validate_engine_id(engine_id: str) -> None:

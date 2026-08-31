@@ -22,6 +22,8 @@ class _FakeScheduler:
         self._identity = identity
         self._lookup_handler = lookup_handler
         self.store_scheduler = object()
+        self.touch_block_ids = []
+        self.free_block_ids = []
         self.close_count = 0
 
     def close(self) -> None:
@@ -37,6 +39,24 @@ class _FakeScheduler:
             num_computed_tokens,
         )
         return matched_tokens, False
+
+    @staticmethod
+    def build_connector_meta(output):
+        return output
+
+    def take_block_pool_commands(self) -> list[int]:
+        block_ids = self.touch_block_ids
+        self.touch_block_ids = []
+        return block_ids
+
+    @staticmethod
+    def update_connector_output(output) -> None:
+        return None
+
+    def take_free_block_commands(self) -> list[int]:
+        block_ids = self.free_block_ids
+        self.free_block_ids = []
+        return block_ids
 
 
 class _FakeWorker:
@@ -239,6 +259,37 @@ def test_new_worker_session_accepts_a_new_cache_mapping() -> None:
                 old_registration.session_id,
                 old_spec,
             )
+    finally:
+        service_manager.close()
+
+
+def test_scheduler_block_pool_commands_cross_the_manager_boundary() -> None:
+    service_manager = KVCacheServiceManager(_create_scheduler)
+    registration = _scheduler_registration("scheduler-session")
+
+    try:
+        scheduler = service_manager.register_scheduler(registration, encode_registration(registration))
+        scheduler.touch_block_ids = [5, 8]
+        scheduler.free_block_ids = [13, 21]
+        scheduler_output = SimpleNamespace()
+        connector_output = SimpleNamespace()
+
+        metadata, touch_block_ids = service_manager.build_connector_meta(
+            registration.identity,
+            registration.session_id,
+            scheduler_output,
+        )
+        free_block_ids = service_manager.update_connector_output(
+            registration.identity,
+            registration.session_id,
+            connector_output,
+        )
+
+        assert metadata is scheduler_output
+        assert touch_block_ids == [5, 8]
+        assert free_block_ids == [13, 21]
+        assert scheduler.touch_block_ids == []
+        assert scheduler.free_block_ids == []
     finally:
         service_manager.close()
 

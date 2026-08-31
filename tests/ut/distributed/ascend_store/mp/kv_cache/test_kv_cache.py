@@ -110,6 +110,9 @@ class _FakeWorker:
         self._invalid_block_ids = set()
         return block_ids
 
+    def close(self) -> None:
+        return None
+
 
 class _FakeScheduler:
     def __init__(self, identity: SchedulerIdentity, lookup_handler: WorkerLookupHandler):
@@ -127,6 +130,9 @@ class _FakeScheduler:
         )
         return max(matched_tokens - num_computed_tokens, 0), False
 
+    def close(self) -> None:
+        return None
+
 
 class _BlockingScheduler:
     def __init__(self, started_events, release_events):
@@ -139,6 +145,9 @@ class _BlockingScheduler:
         if not self._release_events[request_index].wait(5):
             raise TimeoutError(f"Timed out waiting to release request {request.request_id}")
         return 0, False
+
+    def close(self) -> None:
+        return None
 
 
 def _make_vllm_config(

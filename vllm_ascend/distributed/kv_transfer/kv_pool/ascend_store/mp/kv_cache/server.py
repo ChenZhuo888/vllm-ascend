@@ -16,7 +16,7 @@ from ..rpc import (
     Route,
 )
 from ..service import ServiceBusyError
-from .manager import KVCacheServiceManager
+from .manager import KVCacheServiceManager, SchedulerFactory, WorkerFactory
 from .protocol import (
     ACK_RESPONSE,
     KVCacheMethod,
@@ -48,12 +48,7 @@ from .protocol import (
     scheduler_affinity_key,
     worker_affinity_key,
 )
-from .registration import (
-    SchedulerFactory,
-    SchedulerRegistration,
-    WorkerFactory,
-    WorkerRegistration,
-)
+from .registration import SchedulerRegistration, WorkerRegistration
 from .view import ConnectorOutputView
 
 _MAX_PENDING_REQUESTS = 64
