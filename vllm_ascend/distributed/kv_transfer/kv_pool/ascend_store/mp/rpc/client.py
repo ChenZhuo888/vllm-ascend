@@ -428,8 +428,9 @@ class MPClient:
     # Shutdown
     # ==============================
 
-    # Closing first stops new requests, then wakes and joins the I/O thread before
-    # terminating notification and ZMQ resources from the caller thread.
+    # Closing is a cross-thread handoff. New calls are rejected first; the I/O
+    # thread then completes all queued and pending requests and closes its sockets.
+    # The caller joins that thread before releasing the remaining shared resources.
 
     def close(self) -> None:
         with self._client_lifecycle_condition:

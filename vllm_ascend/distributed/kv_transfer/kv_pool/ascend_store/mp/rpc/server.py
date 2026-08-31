@@ -215,8 +215,10 @@ class MPServer:
     # Server lifecycle
     # ==============================
 
-    # The run thread exclusively owns ROUTER I/O. Public lifecycle methods only
-    # update state and wake that thread to drain or abort work.
+    # Public lifecycle methods control admission but leave ROUTER I/O to the run
+    # thread. Graceful stop keeps accepted requests until their responses are sent
+    # and uses their client deadlines to bound the drain; abort cancels queued work
+    # and stops without waiting for running handlers.
 
     def _should_stop_run(self) -> bool:
         with self._state_condition:
@@ -396,8 +398,10 @@ class MPServer:
     # System routes and response encoding
     # ==============================
 
-    # PING and ECHO are transport-owned health methods. All handler outcomes are
-    # encoded here so worker threads never access the ROUTER socket directly.
+    # Built-in health routes and response builders define the behavior owned by
+    # the transport, including status and remote error details. They produce
+    # complete response frames but never send them; the run thread remains the
+    # sole ROUTER owner.
 
     @staticmethod
     def _handle_ping(payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
@@ -440,8 +444,10 @@ class MPServer:
     # Request admission and execution
     # ==============================
 
-    # The run thread accepts and dispatches requests. Executors run handlers, put
-    # completed responses on the response queue, and notify the run thread.
+    # Admission claims each (client identity, request ID) before route dispatch so
+    # accepted work has one tracked completion. Executors own handler ordering, but
+    # completion only queues a response; the request remains accepted until the run
+    # thread sends or aborts it.
 
     def _receive_and_dispatch_request(self) -> None:
         frames = self._socket.recv_multipart()

@@ -105,9 +105,11 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     # One registration per identity
     # ==============================
 
-    # At most one registration runs for an identity. Factories and service close
-    # calls run without the lifecycle lock; a newly created service is added only
-    # if the same registration is still current and the manager remains open.
+    # Registration is one state transition per identity. Repeated calls for the
+    # same session share its result; a different session first makes the old one
+    # invalid and removes its service before constructing the replacement.
+    # Factories and close calls run outside the lifecycle lock, and a result is
+    # published only while its registration is current and the manager is open.
 
     def register(
         self,
@@ -230,8 +232,11 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     # Session access and release
     # ==============================
 
-    # Session-bound requests validate and renew their session. Internal lookups
-    # deliberately use find() so one service cannot extend another service's lease.
+    # The lifecycle lock decides which session owns each service and makes that
+    # decision visible before slow backend cleanup begins. Only requests for the
+    # current session renew its lease; server-internal reads do not. These rules
+    # keep session replacement, expiration, and unregister consistent while
+    # allowing unrelated lifecycle work to continue during cleanup.
 
     def renew(self, identity: IdentityT, session_id: str) -> bool:
         return self._get_and_renew_entry(identity, session_id) is not None

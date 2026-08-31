@@ -49,6 +49,11 @@ class KVCacheServiceManager:
     Requests are accepted only for current sessions. Cross-service lookup and
     automatic cleanup use the executor thread assigned to each service when
     executors are provided.
+
+    Optional factories let tests replace or observe service construction while
+    exercising the real lifecycle paths. Production uses the built-in MP
+    Scheduler and Worker implementations; the factories are not business
+    extension points.
     """
 
     def __init__(

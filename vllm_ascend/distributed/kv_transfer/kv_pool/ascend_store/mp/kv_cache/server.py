@@ -61,6 +61,11 @@ class KVCacheServer:
     while lease renewal runs outside their work queues. The server translates
     protocol requests for KVCacheServiceManager and coordinates service lifetime
     with graceful or forced RPC shutdown.
+
+    Optional factories let tests replace or observe service construction while
+    exercising the real routing, thread-affinity, and lifecycle paths. Production
+    uses the built-in MP Scheduler and Worker implementations; the factories are
+    not business extension points.
     """
 
     def __init__(
