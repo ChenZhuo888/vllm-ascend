@@ -60,7 +60,11 @@ _MAX_PENDING_REQUESTS = 64
 
 
 class KVCacheServer:
-    """Own Scheduler and Worker services and expose their operations through RPC."""
+    """Expose KV cache services through identity-affine RPC routes.
+
+    This boundary wires protocol adapters to KVCacheServiceManager and coordinates
+    lease maintenance with graceful or forced RPC shutdown.
+    """
 
     def __init__(
         self,
@@ -135,6 +139,13 @@ class KVCacheServer:
     def worker_count(self) -> int:
         return self._service.worker_count
 
+    # ==============================
+    # Scheduler-affine request adapters
+    # ==============================
+
+    # Scheduler routes share an affinity executor keyed by SchedulerIdentity.
+    # Registration, session work, and closure therefore stay ordered for one owner.
+
     def _handle_register_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         registration, serialized_registration = decode_registration_request(payloads, SchedulerRegistration)
         try:
@@ -142,6 +153,49 @@ class KVCacheServer:
         except ServiceBusyError as exc:
             raise MPServerBusyError(str(exc)) from exc
         return (ACK_RESPONSE,)
+
+    def _handle_lookup(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, request, num_computed_tokens = decode_lookup_request(payloads)
+        matched_tokens, is_async = self._service.lookup(
+            identity,
+            session_id,
+            cast(Request, request),
+            num_computed_tokens,
+        )
+        return encode_lookup_response(matched_tokens, is_async)
+
+    def _handle_update_state_after_alloc(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, request, blocks, num_external_tokens = decode_update_state_after_alloc(payloads)
+        self._service.update_state_after_alloc(identity, session_id, request, blocks, num_external_tokens)
+        return (ACK_RESPONSE,)
+
+    def _handle_build_connector_meta(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, output = decode_build_connector_meta_request(payloads)
+        metadata, touch_block_ids = self._service.build_connector_meta(identity, session_id, output)
+        return encode_build_connector_meta_response(metadata, touch_block_ids)
+
+    def _handle_request_finished(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, req_id, block_ids, all_groups = decode_request_finished(payloads)
+        delay_free, extra = self._service.request_finished(identity, session_id, req_id, block_ids, all_groups)
+        return encode_request_finished_response(delay_free, extra)
+
+    def _handle_update_connector_output(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id, completed_events = decode_update_connector_output(payloads)
+        output = ConnectorOutputView(kv_connector_worker_meta=AscendStoreKVConnectorWorkerMetadata(completed_events))
+        free_block_ids = self._service.update_connector_output(identity, session_id, output)
+        return encode_update_connector_output_response(free_block_ids)
+
+    def _handle_unregister_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        identity, session_id = decode_scheduler_session(payloads)
+        self._service.unregister_scheduler(identity, session_id)
+        return (ACK_RESPONSE,)
+
+    # ==============================
+    # Worker-affine request adapters
+    # ==============================
+
+    # Worker routes and scheduler-initiated lookup share the worker affinity
+    # executor, keeping configuration, transfer work, and closure ordered per owner.
 
     def _handle_register_worker(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         registration, serialized_registration = decode_registration_request(payloads, WorkerRegistration)
@@ -200,15 +254,17 @@ class KVCacheServer:
         block_ids = self._service.get_block_ids_with_load_errors(identity, session_id)
         return encode_get_block_ids_with_load_errors_response(block_ids)
 
-    def _handle_unregister_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id = decode_scheduler_session(payloads)
-        self._service.unregister_scheduler(identity, session_id)
-        return (ACK_RESPONSE,)
-
     def _handle_unregister_worker(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id = decode_worker_session(payloads)
         self._service.unregister_worker(identity, session_id)
         return (ACK_RESPONSE,)
+
+    # ==============================
+    # Inline lease renewal
+    # ==============================
+
+    # These handlers run on the RPC thread and must remain bounded to lease metadata.
+    # Inline execution keeps renewal independent of scheduler and worker backlog.
 
     def _handle_renew_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         identity, session_id = decode_scheduler_session(payloads)
@@ -220,36 +276,13 @@ class KVCacheServer:
         self._service.renew_worker(identity, session_id)
         return (ACK_RESPONSE,)
 
-    def _handle_lookup(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id, request, num_computed_tokens = decode_lookup_request(payloads)
-        matched_tokens, is_async = self._service.lookup(
-            identity,
-            session_id,
-            cast(Request, request),
-            num_computed_tokens,
-        )
-        return encode_lookup_response(matched_tokens, is_async)
+    # ==============================
+    # Service and RPC lifecycle coordination
+    # ==============================
 
-    def _handle_update_state_after_alloc(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id, request, blocks, num_external_tokens = decode_update_state_after_alloc(payloads)
-        self._service.update_state_after_alloc(identity, session_id, request, blocks, num_external_tokens)
-        return (ACK_RESPONSE,)
-
-    def _handle_build_connector_meta(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id, output = decode_build_connector_meta_request(payloads)
-        metadata, touch_block_ids = self._service.build_connector_meta(identity, session_id, output)
-        return encode_build_connector_meta_response(metadata, touch_block_ids)
-
-    def _handle_request_finished(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id, req_id, block_ids, all_groups = decode_request_finished(payloads)
-        delay_free, extra = self._service.request_finished(identity, session_id, req_id, block_ids, all_groups)
-        return encode_request_finished_response(delay_free, extra)
-
-    def _handle_update_connector_output(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        identity, session_id, completed_events = decode_update_connector_output(payloads)
-        output = ConnectorOutputView(kv_connector_worker_meta=AscendStoreKVConnectorWorkerMetadata(completed_events))
-        free_block_ids = self._service.update_connector_output(identity, session_id, output)
-        return encode_update_connector_output_response(free_block_ids)
+    # KVCacheServer coordinates lease maintenance with RPC admission and draining.
+    # Services close on live affinity lanes before MPServer releases executors and
+    # transport; abort deliberately skips that graceful sequence.
 
     def run(self) -> None:
         try:
