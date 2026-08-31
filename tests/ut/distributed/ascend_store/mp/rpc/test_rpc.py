@@ -28,7 +28,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     Route,
     SystemMethod,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.client import _ClientLifecycleState
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.client import _ClientState
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc.protocol import (
     ResponseStatus,
     decode_request,
@@ -281,7 +281,7 @@ def test_client_server_round_trip():
         client.wait_until_connected()
 
         assert client.is_transport_connected
-        assert client._lifecycle_state is _ClientLifecycleState.CONNECTED
+        assert client._lifecycle_state is _ClientState.CONNECTED
         assert client.ping() == "OK"
         assert client.echo(b"hello ascend store") == b"hello ascend store"
 
@@ -291,7 +291,7 @@ def test_client_server_round_trip():
         assert process.is_alive()
         assert client.ping() == "OK"
         client.close()
-        assert client._lifecycle_state is _ClientLifecycleState.CLOSED
+        assert client._lifecycle_state is _ClientState.CLOSED
     finally:
         _cleanup(client, parent_conn, process)
 
@@ -306,7 +306,7 @@ def test_client_close_wakes_thread_waiting_for_connection() -> None:
         client.wait_until_connected(timeout_ms=5000)
 
     try:
-        assert client._lifecycle_state is _ClientLifecycleState.DISCONNECTED
+        assert client._lifecycle_state is _ClientState.DISCONNECTED
         with pytest.raises(MPServerUnavailableError, match="MP server is unavailable"):
             client.submit_request(SystemMethod.PING)
 
@@ -318,7 +318,7 @@ def test_client_close_wakes_thread_waiting_for_connection() -> None:
             with pytest.raises(MPClientClosedError, match="MP client is closed"):
                 wait_future.result(timeout=1)
 
-        assert client._lifecycle_state is _ClientLifecycleState.CLOSED
+        assert client._lifecycle_state is _ClientState.CLOSED
     finally:
         client.close()
 

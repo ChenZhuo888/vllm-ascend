@@ -86,11 +86,42 @@ class _ResponseEnvelope:
 
 
 class _ServerState(Enum):
-    """Lifecycle states for graceful and forced server shutdown.
+    """State of server admission, request draining, and resource ownership.
 
-    Graceful operation moves from READY to RUNNING, then through DRAINING and
-    DRAINED before CLOSED releases resources. Any nonterminal state may instead
-    move through ABORTING to ABORTED.
+    Only the transitions shown below are supported. Calls that leave the state
+    unchanged are omitted.
+
+        +-------+                  +---------+
+        | READY |----- run() ----->| RUNNING |---------------------- run failure -----------------------+
+        +-------+                  +---------+                                                          |
+            |                           |                                                               |
+            +---------------------------+                                                               |
+                                        |                                                               |
+                      +-----------------+---------------------------------------------------------------+
+                      |                                                                                 |
+               request_stop()                                                                        abort()
+                      |                                                                                 |
+                      v                                                                                 v
+                +----------+                                +---------+                  +--------+     |
+                | DRAINING |--- accepted responses sent --->| DRAINED |---- close() ---->| CLOSED |     |
+                +----------+                                +---------+                  +--------+     |
+                      |                                          |                                      |
+            abort() / run failure                             abort()                                   |
+                      |                                          |                                      |
+                      +------------------------------------------+--------------------------------------+
+                                                                 |
+                                                                 v
+                                                            +----------+
+                                                            | ABORTING |
+                                                            +----------+
+                                                                 | forced cleanup
+                                                                 v
+                                                            +---------+
+                                                            | ABORTED |
+                                                            +---------+
+
+    Construction failure closes resources before an MPServer is returned and
+    therefore sits outside this state machine.
     """
 
     READY = auto()
