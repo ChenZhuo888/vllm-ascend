@@ -473,6 +473,52 @@ These rules apply to changes under
 - Keep formatting compact and compatible with PyCharm and Ruff. Avoid
   arbitrary or poetic line wrapping.
 
+### Textual Organization
+
+- The purpose of textual organization is to reveal the real architecture,
+  control flow, ownership, and lifecycle of the code. It is not a comment
+  coverage exercise and must not create a superficial taxonomy of every
+  method.
+- Establish the actual call chain and responsibility boundaries before
+  reordering methods or adding sections. When the structure is unclear, do not
+  use comments to make it appear settled; preserve the ambiguity as an
+  architecture question to investigate.
+- A class-level explanation belongs in the class docstring. Not every class or
+  method needs a docstring, but explanatory prose immediately following a
+  class declaration must not be written as a substitute block of comments.
+- Constructors, properties, and nearby construction helpers normally read as
+  one natural opening and do not need headings such as `Construction`,
+  `State`, or `Helpers`.
+- Use section banners only for substantial, coherent functional regions or
+  execution phases whose boundary materially improves navigation. A class may
+  begin with a section only when it is the first of several genuine peer
+  regions, never merely to label the first methods.
+- Use this banner form at the indentation level of the region, with real blank
+  lines rather than comment-only spacer lines:
+
+  ```python
+  # ==============================
+  # Scheduler-side methods
+  # ==============================
+  ```
+
+- A section title should reveal more than the names of the methods below it.
+  It should help a reader reconstruct a responsibility, pipeline stage,
+  execution owner, or lifecycle transition while skimming the file. A
+  one-method section is justified only when that method is itself a major
+  transaction or lifecycle boundary.
+- Explanatory text below a section banner is optional. Add it only to capture
+  a non-obvious reason, invariant, ordering requirement, ownership rule, or
+  compatibility constraint.
+- Keep methods that participate in one operation close together. Prefer an
+  order that exposes the public orchestration first and places its meaningful
+  helpers nearby; use lifecycle order where it is the clearest narrative.
+  Do not reorder methods merely for symmetry, alphabetic grouping, or route
+  name consistency.
+- Before applying textual reorganization across several files, propose the
+  intended file order and section map. Establish the style on one
+  representative file and review it before propagating the approach.
+
 ### Design Discipline
 
 - Apply DDD lightly: use domain language and explicit boundaries, but do not
