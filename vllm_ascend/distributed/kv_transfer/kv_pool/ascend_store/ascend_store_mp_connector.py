@@ -29,7 +29,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory
     export_worker_kv_caches,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import record_npu_event
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
@@ -79,9 +78,7 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         self.use_layerwise = extra_config.get("use_layerwise", False)
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
         self._kv_cache_export_lock = threading.Lock()
-        self._next_kv_cache_generation = 1
-        self._active_kv_cache_export: ExportedKVCache | None = None
-        self._pending_kv_cache_exports: dict[int, ExportedKVCache] = {}
+        self._kv_cache_export: ExportedKVCache | None = None
         self._pending_load_block_ids: set[int] = set()
         self._local_load_error_block_ids: set[int] = set()
         self._locally_finished_store_req_ids: set[str] = set()
@@ -220,42 +217,19 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         self._require_worker_role("register_kv_caches")
         with self._kv_cache_export_lock:
-            generation = self._next_kv_cache_generation
-            self._next_kv_cache_generation += 1
-
-        exported = export_worker_kv_caches(kv_caches, generation)
-        with self._kv_cache_export_lock:
-            self._pending_kv_cache_exports[generation] = exported
+            if self._kv_cache_export is not None:
+                raise RuntimeError("Worker KV caches are already registered")
+            exported = export_worker_kv_caches(kv_caches)
+            self._kv_cache_export = exported
         try:
-            self._kv_cache_client.register_kv_caches(exported.spec, on_registered=self._confirm_kv_cache_export)
+            self._kv_cache_client.register_kv_caches(exported.spec)
         except Exception:
             with self._kv_cache_export_lock:
-                failed = self._pending_kv_cache_exports.pop(generation, None)
+                failed = self._kv_cache_export
+                self._kv_cache_export = None
             if failed is not None:
                 failed.close()
             raise
-
-    def _confirm_kv_cache_export(self, spec: WorkerKVCacheSpec) -> None:
-        to_close: list[ExportedKVCache] = []
-        with self._kv_cache_export_lock:
-            confirmed = self._pending_kv_cache_exports.pop(spec.generation, None)
-            if confirmed is None:
-                return
-
-            active = self._active_kv_cache_export
-            if active is not None and active.spec.generation >= spec.generation:
-                to_close.append(confirmed)
-            else:
-                self._active_kv_cache_export = confirmed
-                if active is not None:
-                    to_close.append(active)
-                stale_generations = [
-                    generation for generation in self._pending_kv_cache_exports if generation < spec.generation
-                ]
-                to_close.extend(self._pending_kv_cache_exports.pop(generation) for generation in stale_generations)
-
-        for cache_export in to_close:
-            cache_export.close()
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         self._require_worker_role("start_load_kv")
@@ -373,10 +347,7 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
             self._kv_cache_client.close()
         finally:
             with self._kv_cache_export_lock:
-                exports = list(self._pending_kv_cache_exports.values())
-                self._pending_kv_cache_exports.clear()
-                if self._active_kv_cache_export is not None:
-                    exports.append(self._active_kv_cache_export)
-                    self._active_kv_cache_export = None
-            for cache_export in exports:
+                cache_export = self._kv_cache_export
+                self._kv_cache_export = None
+            if cache_export is not None:
                 cache_export.close()

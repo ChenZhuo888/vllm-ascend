@@ -40,7 +40,6 @@ def test_shared_storage_is_exported_once_and_views_are_rebuilt() -> None:
 
     exported = export_worker_kv_caches(
         {"layer.0": storage, "layer.1": expected_slice},
-        generation=1,
         adapter=adapter,
     )
     imported = import_worker_kv_caches(exported.spec, adapter)
@@ -56,7 +55,7 @@ def test_shared_storage_is_exported_once_and_views_are_rebuilt() -> None:
 
 def test_invalid_tensor_layout_is_rejected_before_import() -> None:
     adapter = _CPUMemoryAdapter()
-    exported = export_worker_kv_caches({"layer.0": torch.zeros(8)}, 1, adapter)
+    exported = export_worker_kv_caches({"layer.0": torch.zeros(8)}, adapter)
     tensor = replace(exported.spec.caches["layer.0"][0], storage_index=1)
     invalid_spec = replace(exported.spec, caches={"layer.0": (tensor,)})
 
@@ -68,7 +67,7 @@ def test_invalid_tensor_layout_is_rejected_before_import() -> None:
 
 def test_exported_and_imported_cache_release_owned_references() -> None:
     adapter = _CPUMemoryAdapter()
-    exported = export_worker_kv_caches({"layer.0": torch.zeros(8)}, 1, adapter)
+    exported = export_worker_kv_caches({"layer.0": torch.zeros(8)}, adapter)
     imported = import_worker_kv_caches(exported.spec, adapter)
 
     imported.close()

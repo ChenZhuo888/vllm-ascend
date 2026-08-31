@@ -487,7 +487,7 @@ def test_multiple_workers_are_registered_and_rank_zero_serves_lookup() -> None:
             clients.append(client)
             _wait_until_connected(client)
             assert client.register_worker(_make_vllm_config(rank=rank), kv_cache_config=None)
-            spec = WorkerKVCacheSpec(generation=1, caches={f"layer.{rank}": ()}, storages=())
+            spec = WorkerKVCacheSpec(caches={f"layer.{rank}": ()}, storages=())
             assert client.register_kv_caches(spec)
 
         scheduler_client = KVCacheClient(endpoint)

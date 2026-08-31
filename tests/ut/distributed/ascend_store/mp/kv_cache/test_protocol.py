@@ -108,7 +108,6 @@ def _make_worker_kv_cache_spec() -> WorkerKVCacheSpec:
         dtype="torch.float16",
     )
     return WorkerKVCacheSpec(
-        generation=1,
         caches={"layer.0": (tensor,)},
         storages=(storage,),
     )

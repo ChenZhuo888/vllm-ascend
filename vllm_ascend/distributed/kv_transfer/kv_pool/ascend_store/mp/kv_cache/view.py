@@ -88,9 +88,8 @@ class KVCacheStorageSpec:
 
 @dataclass(frozen=True)
 class WorkerKVCacheSpec:
-    """One generation of storage handles and tensor layouts for a Worker."""
+    """Storage handles and tensor layouts registered by one Worker."""
 
-    generation: int
     caches: dict[str, tuple[KVCacheTensorSpec, ...]]
     storages: tuple[KVCacheStorageSpec, ...]
 

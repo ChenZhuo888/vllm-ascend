@@ -119,8 +119,8 @@ def test_worker_registers_process_neutral_kv_cache_layouts() -> None:
     config = _make_vllm_config()
     storage = torch.empty((4, 8), dtype=torch.float16)
 
-    def export(caches, generation):
-        return export_worker_kv_caches(caches, generation, _CPUMemoryAdapter())
+    def export(caches):
+        return export_worker_kv_caches(caches, _CPUMemoryAdapter())
 
     with (
         patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
@@ -138,7 +138,6 @@ def test_worker_registers_process_neutral_kv_cache_layouts() -> None:
     assert first.shape == (4, 8)
     assert first.stride == storage.stride()
     assert first.dtype == "torch.float16"
-    assert spec.generation == 1
     assert len(spec.storages) == 1
     assert spec.storages[0].size_bytes == storage.untyped_storage().nbytes()
     assert spec.storages[0].device_type == "cpu"
@@ -401,27 +400,18 @@ def test_worker_load_error_query_failure_invalidates_pending_load_blocks() -> No
 def test_worker_keeps_exported_cache_alive_until_shutdown() -> None:
     config = _make_vllm_config()
     exported = MagicMock()
-    exported.spec.generation = 1
-
-    def register(spec, on_registered):
-        on_registered(spec)
-        return True
 
     with (
         patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
         patch(f"{CONNECTOR_MODULE}.export_worker_kv_caches", return_value=exported),
     ):
-        client_class.return_value.register_kv_caches.side_effect = register
         connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
         connector.register_kv_caches({"layer.0": MagicMock()})
 
         exported.close.assert_not_called()
         connector.shutdown()
 
-    client_class.return_value.register_kv_caches.assert_called_once_with(
-        exported.spec,
-        on_registered=connector._confirm_kv_cache_export,
-    )
+    client_class.return_value.register_kv_caches.assert_called_once_with(exported.spec)
     exported.close.assert_called_once_with()
 
 
@@ -442,77 +432,41 @@ def test_worker_releases_exported_cache_when_registration_fails() -> None:
     exported.close.assert_called_once_with()
 
 
-def test_worker_keeps_active_export_when_replacement_fails() -> None:
+def test_worker_keeps_exported_cache_while_registration_recovers() -> None:
     config = _make_vllm_config()
-    exports = []
-
-    def export(_caches, generation):
-        cache_export = MagicMock()
-        cache_export.spec.generation = generation
-        exports.append(cache_export)
-        return cache_export
-
-    def register(spec, on_registered):
-        if spec.generation == 2:
-            raise RuntimeError("registration failed")
-        on_registered(spec)
-        return True
+    exported = MagicMock()
 
     with (
         patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
-        patch(f"{CONNECTOR_MODULE}.export_worker_kv_caches", side_effect=export),
+        patch(f"{CONNECTOR_MODULE}.export_worker_kv_caches", return_value=exported),
     ):
-        client_class.return_value.register_kv_caches.side_effect = register
+        client_class.return_value.register_kv_caches.return_value = False
         connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
         connector.register_kv_caches({"layer.0": MagicMock()})
 
-        with pytest.raises(RuntimeError, match="registration failed"):
+        exported.close.assert_not_called()
+        connector.shutdown()
+
+    exported.close.assert_called_once_with()
+
+
+def test_worker_rejects_a_second_cache_registration() -> None:
+    config = _make_vllm_config()
+    exported = MagicMock()
+
+    with (
+        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
+        patch(f"{CONNECTOR_MODULE}.export_worker_kv_caches", return_value=exported) as export,
+    ):
+        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
+        connector.register_kv_caches({"layer.0": MagicMock()})
+        with pytest.raises(RuntimeError, match="already registered"):
             connector.register_kv_caches({"layer.0": MagicMock()})
-
-        exports[0].close.assert_not_called()
-        exports[1].close.assert_called_once_with()
         connector.shutdown()
 
-    exports[0].close.assert_called_once_with()
-
-
-def test_worker_keeps_active_export_while_replacement_is_unconfirmed() -> None:
-    config = _make_vllm_config()
-    exports = []
-    callbacks = []
-
-    def export(_caches, generation):
-        cache_export = MagicMock()
-        cache_export.spec.generation = generation
-        exports.append(cache_export)
-        return cache_export
-
-    def register(spec, on_registered):
-        callbacks.append(on_registered)
-        if spec.generation == 1:
-            on_registered(spec)
-            return True
-        return False
-
-    with (
-        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
-        patch(f"{CONNECTOR_MODULE}.export_worker_kv_caches", side_effect=export),
-    ):
-        client_class.return_value.register_kv_caches.side_effect = register
-        connector = AscendStoreMPConnector(config, KVConnectorRole.WORKER, _make_kv_cache_config())
-        connector.register_kv_caches({"layer.0": MagicMock()})
-        connector.register_kv_caches({"layer.0": MagicMock()})
-
-        exports[0].close.assert_not_called()
-        exports[1].close.assert_not_called()
-
-        callbacks[1](exports[1].spec)
-
-        exports[0].close.assert_called_once_with()
-        exports[1].close.assert_not_called()
-        connector.shutdown()
-
-    exports[1].close.assert_called_once_with()
+    export.assert_called_once()
+    client_class.return_value.register_kv_caches.assert_called_once_with(exported.spec)
+    exported.close.assert_called_once_with()
 
 
 def test_connector_rejects_sleep_mode() -> None:

@@ -93,12 +93,9 @@ class TorchNPUIPCAdapter:
 
 def export_worker_kv_caches(
     kv_caches: dict[str, torch.Tensor],
-    generation: int,
     adapter: KVCacheStorageAdapter | None = None,
 ) -> ExportedKVCache:
     """Export each allocation once and describe every tensor view over it."""
-    if generation <= 0:
-        raise ValueError(f"KV cache generation must be greater than 0, got {generation}")
     if not kv_caches:
         raise ValueError("kv_caches must not be empty")
 
@@ -139,7 +136,6 @@ def export_worker_kv_caches(
         caches[name] = tuple(tensor_specs)
 
     spec = WorkerKVCacheSpec(
-        generation=generation,
         caches=caches,
         storages=tuple(storage_specs),
     )
@@ -201,8 +197,6 @@ def _rebuild_cache_tensors(
 
 
 def _validate_worker_spec(spec: WorkerKVCacheSpec) -> None:
-    if spec.generation <= 0:
-        raise ValueError(f"KV cache generation must be greater than 0, got {spec.generation}")
     if not spec.storages:
         raise ValueError("KV cache storage handles are required")
     if not spec.caches:

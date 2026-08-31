@@ -83,28 +83,33 @@ SCHEDULER_OUTPUT = SimpleNamespace(
     scheduled_new_reqs=[],
     scheduled_cached_reqs=SimpleNamespace(req_ids=[], new_block_ids=[], num_computed_tokens=[]),
 )
-WORKER_KV_CACHE_SPEC = WorkerKVCacheSpec(generation=1, caches={"layer.0": ()}, storages=())
+WORKER_KV_CACHE_SPEC = WorkerKVCacheSpec(caches={"layer.0": ()}, storages=())
 
 
 def test_worker_cache_registration_uses_worker_rpc() -> None:
     with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
         client = _configure_mock_worker_client(client_class, [[b"OK"]])
-        confirmed = []
 
-        assert client.register_kv_caches(WORKER_KV_CACHE_SPEC, on_registered=confirmed.append)
+        assert client.register_kv_caches(WORKER_KV_CACHE_SPEC)
         request = client_class.return_value.request
         assert request.call_args.args[0].value == "REGISTER_KV_CACHES"
-        assert confirmed == [WORKER_KV_CACHE_SPEC]
 
 
 def test_worker_cache_registration_marks_client_unregistered_when_busy() -> None:
     with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
         client = _configure_mock_worker_client(client_class, MPServerBusyError("busy"))
-        confirmed = []
 
-        assert not client.register_kv_caches(WORKER_KV_CACHE_SPEC, on_registered=confirmed.append)
+        assert not client.register_kv_caches(WORKER_KV_CACHE_SPEC)
         assert not client.is_registered
-        assert confirmed == []
+
+
+def test_worker_cache_registration_rejects_a_second_mapping() -> None:
+    with patch(f"{CLIENT_MODULE}.MPClient") as client_class:
+        client = _configure_mock_worker_client(client_class, [[b"OK"]])
+
+        assert client.register_kv_caches(WORKER_KV_CACHE_SPEC)
+        with pytest.raises(RuntimeError, match="already registered"):
+            client.register_kv_caches(WORKER_KV_CACHE_SPEC)
 
 
 def test_worker_wait_for_save_has_no_default_deadline() -> None:

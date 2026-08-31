@@ -73,11 +73,10 @@ _ConfiguredRegistration = tuple[SchedulerRegistration | WorkerRegistration, tupl
 
 @dataclass(frozen=True)
 class _WorkerKVCacheRegistration:
-    """Latest Worker cache registration retained for service recovery."""
+    """Worker cache registration retained for service recovery."""
 
     spec: WorkerKVCacheSpec
     payloads: tuple[bytes, ...]
-    on_registered: Callable[[WorkerKVCacheSpec], None] | None
 
 
 class _RegistrationState(Enum):
@@ -167,18 +166,17 @@ class KVCacheClient:
         self,
         spec: WorkerKVCacheSpec,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
-        on_registered: Callable[[WorkerKVCacheSpec], None] | None = None,
     ) -> bool:
-        """Register one cache generation and report when Server confirms it."""
+        """Register the Worker's fixed cache mapping."""
         self._raise_if_superseded()
         registration = self._get_worker_registration()
         payloads = encode_register_kv_caches_request(registration, spec)
-        cache_registration = _WorkerKVCacheRegistration(spec, payloads, on_registered)
+        cache_registration = _WorkerKVCacheRegistration(spec, payloads)
         with self._client_lifecycle_lock:
-            previous_registration = self._worker_kv_cache_registration
+            if self._worker_kv_cache_registration is not None:
+                raise RuntimeError("Worker KV caches are already registered")
             self._worker_kv_cache_registration = cache_registration
 
-        confirmed = False
         try:
             if not self.is_registered:
                 return self._try_register()
@@ -189,19 +187,15 @@ class KVCacheClient:
                 timeout_ms,
             )
             if responses is None:
-                # Service recovery registers the latest generation again.
+                # Service recovery registers the same cache mapping again.
                 self._mark_unregistered()
                 return False
             decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
-            confirmed = True
-            if on_registered is not None:
-                on_registered(spec)
             return True
         except BaseException:
-            if not confirmed:
-                with self._client_lifecycle_lock:
-                    if self._worker_kv_cache_registration is cache_registration:
-                        self._worker_kv_cache_registration = previous_registration
+            with self._client_lifecycle_lock:
+                if self._worker_kv_cache_registration is cache_registration:
+                    self._worker_kv_cache_registration = None
             raise
 
     def _try_register(self) -> bool:
@@ -253,8 +247,6 @@ class KVCacheClient:
                         _REGISTRATION_TIMEOUT_MS,
                     )
                     decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
-                    if worker_kv_cache_registration.on_registered is not None:
-                        worker_kv_cache_registration.on_registered(worker_kv_cache_registration.spec)
             except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError, ServiceNotRegisteredError):
                 self._mark_unregistered()
                 raise

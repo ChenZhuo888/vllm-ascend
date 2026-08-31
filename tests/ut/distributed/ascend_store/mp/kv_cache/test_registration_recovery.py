@@ -266,7 +266,7 @@ def test_service_renewal_uses_the_registered_session(service_type: str, renew_me
             client.close()
 
 
-def test_worker_cache_spec_is_replayed_after_registration_recovers() -> None:
+def test_worker_cache_spec_is_registered_again_after_service_recovers() -> None:
     with (
         patch(f"{KV_CACHE_CLIENT_MODULE}.MPClient") as rpc_client_class,
         patch(f"{KV_CACHE_CLIENT_MODULE}.KVCacheClient._start_lease_loop"),
@@ -280,19 +280,15 @@ def test_worker_cache_spec_is_replayed_after_registration_recovers() -> None:
             [b"OK"],
         ]
         client = KVCacheClient("tcp://127.0.0.1:12345")
-        confirmed = []
-
         try:
             assert client.register_worker(_make_vllm_config(), None)
-            spec = WorkerKVCacheSpec(generation=1, caches={"layer.0": ()}, storages=())
-            assert not client.register_kv_caches(spec, on_registered=confirmed.append)
+            spec = WorkerKVCacheSpec(caches={"layer.0": ()}, storages=())
+            assert not client.register_kv_caches(spec)
             assert not client.is_registered
-            assert confirmed == []
 
             client._maintain_lease()
 
             assert client.is_registered
-            assert confirmed == [spec]
             methods = [call.args[0] for call in rpc_client.request.call_args_list]
             assert methods == [
                 KVCacheMethod.REGISTER_WORKER,

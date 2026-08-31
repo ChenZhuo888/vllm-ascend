@@ -128,7 +128,7 @@ class MPKVPoolWorker(KVPoolWorker):
         self._parallel_config = parallel_config
 
     def configure_kv_caches(self, spec: WorkerKVCacheSpec) -> None:
-        """Install a newer cache generation, tolerating stale RPC replay."""
+        """Install the Worker's fixed cache mapping, tolerating RPC retries."""
         if self._runtime_failure is not None:
             raise RuntimeError("Worker KV cache runtime is unavailable; re-register the Worker service") from (
                 self._runtime_failure
@@ -136,20 +136,14 @@ class MPKVPoolWorker(KVPoolWorker):
 
         current_spec = self.kv_cache_spec
         if current_spec is not None:
-            if spec.generation < current_spec.generation:
+            if spec == current_spec:
                 return
-            if spec.generation == current_spec.generation:
-                if spec == current_spec:
-                    return
-                raise RuntimeError(f"KV cache generation {spec.generation} has conflicting specifications")
+            raise RuntimeError("Worker KV caches are already configured with a different specification")
 
         imported = self._cache_importer(spec)
-        if self._imported_kv_cache is None:
-            self._configure_first_generation(spec, imported)
-            return
-        self._replace_generation(spec, imported)
+        self._configure_kv_caches(spec, imported)
 
-    def _configure_first_generation(self, spec: WorkerKVCacheSpec, imported: ImportedKVCache) -> None:
+    def _configure_kv_caches(self, spec: WorkerKVCacheSpec, imported: ImportedKVCache) -> None:
         try:
             self._activate_backend(imported.device_index)
             self._register_runtime(imported)
@@ -159,69 +153,26 @@ class MPKVPoolWorker(KVPoolWorker):
             except BaseException as cleanup_error:
                 self._failed_imported_kv_cache = imported
                 self._runtime_failure = cleanup_error
-                raise RuntimeError("Failed to clean up the first KV cache generation") from cleanup_error
+                raise RuntimeError("Failed to clean up the Worker KV cache mapping") from cleanup_error
             try:
                 self._close_backend()
             finally:
                 imported.close()
             raise
-        self._publish_generation(spec, imported)
-
-    def _replace_generation(self, spec: WorkerKVCacheSpec, imported: ImportedKVCache) -> None:
-        previous = self._imported_kv_cache
-        previous_spec = self.kv_cache_spec
-        assert previous is not None and previous_spec is not None
-
-        if imported.device_index != self._backend_device_index and not self._store_is_external:
-            imported.close()
-            raise RuntimeError(
-                f"KV cache generation moved from NPU {self._backend_device_index} to {imported.device_index}"
-            )
-
-        try:
-            self._deactivate_runtime()
-        except BaseException:
-            imported.close()
-            raise
-
-        try:
-            self._register_runtime(imported)
-        except BaseException as registration_error:
-            try:
-                self._deactivate_runtime()
-            except BaseException as cleanup_error:
-                self._failed_imported_kv_cache = imported
-                self._runtime_failure = cleanup_error
-                raise RuntimeError(
-                    f"Failed to clean up KV cache generation {spec.generation} after activation failed"
-                ) from cleanup_error
-            try:
-                self._register_runtime(previous)
-            except BaseException as rollback_error:
-                imported.close()
-                self._runtime_failure = rollback_error
-                raise RuntimeError(
-                    f"Failed to activate KV cache generation {spec.generation} and restore "
-                    f"generation {previous_spec.generation}: {type(registration_error).__name__}: {registration_error}"
-                ) from rollback_error
-            imported.close()
-            raise
-
-        self._publish_generation(spec, imported)
-        previous.close()
+        self._publish_kv_caches(spec, imported)
 
     def _register_runtime(self, imported: ImportedKVCache) -> None:
         self.m_store.set_device()
         self._runtime_active = True
         super().register_kv_caches(imported.tensors)
 
-    def _publish_generation(self, spec: WorkerKVCacheSpec, imported: ImportedKVCache) -> None:
+    def _publish_kv_caches(self, spec: WorkerKVCacheSpec, imported: ImportedKVCache) -> None:
         self._imported_kv_cache = imported
         self.kv_cache_spec = spec
         self.kv_caches = imported.tensors
         self.device_index = imported.device_index
 
-    def _clear_generation(self) -> None:
+    def _clear_kv_caches(self) -> None:
         self._imported_kv_cache = None
         self.kv_cache_spec = None
         self.kv_caches = {}
@@ -434,7 +385,7 @@ class MPKVPoolWorker(KVPoolWorker):
             self._failed_imported_kv_cache = None
             self._runtime_failure = None
             self._current_connector_metadata = None
-            self._clear_generation()
+            self._clear_kv_caches()
 
     def _deactivate_runtime(self) -> None:
         if not self._runtime_active:

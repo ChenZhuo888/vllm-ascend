@@ -35,7 +35,7 @@ def _mooncake_register_version_error(exc: TypeError) -> RuntimeError:
 
 
 class MPMooncakeBackend(MooncakeBackend):
-    """Register every Worker generation instead of using the process-wide one-shot path."""
+    """Own the Mooncake buffer registration for one MP Worker service."""
 
     def __init__(self, parallel_config: Any, device_index: int, lazy_init: bool = False):
         self.device_index = device_index

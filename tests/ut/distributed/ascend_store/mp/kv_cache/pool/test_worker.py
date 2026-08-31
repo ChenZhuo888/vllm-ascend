@@ -118,7 +118,7 @@ def test_mp_worker_initializes_parent_cpu_state() -> None:
 
 def test_mp_worker_maps_cache_once_and_releases_it_on_close() -> None:
     adapter = _CPUMemoryAdapter()
-    exported = export_worker_kv_caches({"layer.0": torch.arange(8)}, 1, adapter)
+    exported = export_worker_kv_caches({"layer.0": torch.arange(8)}, adapter)
     importer = MagicMock(side_effect=lambda spec: import_worker_kv_caches(spec, adapter))
     store = MagicMock()
     worker = MPKVPoolWorker(_make_vllm_config(), store=store, cache_importer=importer)
@@ -141,31 +141,10 @@ def test_mp_worker_maps_cache_once_and_releases_it_on_close() -> None:
     store.close.assert_not_called()
 
 
-def test_mp_worker_replaces_newer_generation_and_ignores_stale_replay() -> None:
+def test_mp_worker_rejects_a_different_cache_mapping() -> None:
     adapter = _CPUMemoryAdapter()
-    first = export_worker_kv_caches({"layer.0": torch.zeros(8)}, 1, adapter)
-    second = export_worker_kv_caches({"layer.0": torch.ones(8)}, 2, adapter)
-    worker = MPKVPoolWorker(
-        _make_vllm_config(),
-        store=MagicMock(),
-        cache_importer=lambda spec: import_worker_kv_caches(spec, adapter),
-    )
-
-    worker.configure_kv_caches(first.spec)
-    first_mapping = worker.kv_caches
-    worker.configure_kv_caches(second.spec)
-    worker.configure_kv_caches(first.spec)
-
-    assert worker.kv_cache_spec == second.spec
-    assert torch.equal(worker.kv_caches["layer.0"][0], torch.ones(8))
-    assert first_mapping == {}
-    worker.close()
-
-
-def test_mp_worker_rejects_conflicting_spec_for_same_generation() -> None:
-    adapter = _CPUMemoryAdapter()
-    first = export_worker_kv_caches({"layer.0": torch.zeros(8)}, 1, adapter)
-    conflicting = export_worker_kv_caches({"layer.0": torch.ones(8)}, 1, adapter)
+    first = export_worker_kv_caches({"layer.0": torch.zeros(8)}, adapter)
+    conflicting = export_worker_kv_caches({"layer.0": torch.ones(8)}, adapter)
     worker = MPKVPoolWorker(
         _make_vllm_config(),
         store=MagicMock(),
@@ -174,97 +153,8 @@ def test_mp_worker_rejects_conflicting_spec_for_same_generation() -> None:
 
     worker.configure_kv_caches(first.spec)
 
-    with pytest.raises(RuntimeError, match="conflicting specifications"):
+    with pytest.raises(RuntimeError, match="different specification"):
         worker.configure_kv_caches(conflicting.spec)
-    worker.close()
-
-
-def test_mp_worker_keeps_current_mapping_when_new_import_fails() -> None:
-    adapter = _CPUMemoryAdapter()
-    first = export_worker_kv_caches({"layer.0": torch.zeros(8)}, 1, adapter)
-    second = export_worker_kv_caches({"layer.0": torch.ones(8)}, 2, adapter)
-
-    def import_cache(spec):
-        if spec.generation == 2:
-            raise RuntimeError("import failed")
-        return import_worker_kv_caches(spec, adapter)
-
-    worker = MPKVPoolWorker(_make_vllm_config(), store=MagicMock(), cache_importer=import_cache)
-    worker.configure_kv_caches(first.spec)
-    current_mapping = worker.kv_caches
-
-    with pytest.raises(RuntimeError, match="import failed"):
-        worker.configure_kv_caches(second.spec)
-
-    assert worker.kv_cache_spec == first.spec
-    assert worker.kv_caches is current_mapping
-    assert torch.equal(worker.kv_caches["layer.0"][0], torch.zeros(8))
-    worker.close()
-
-
-def test_mp_worker_restores_previous_generation_when_registration_fails() -> None:
-    adapter = _CPUMemoryAdapter()
-    first = export_worker_kv_caches({"layer.0": torch.zeros(8)}, 1, adapter)
-    second = export_worker_kv_caches({"layer.0": torch.ones(8)}, 2, adapter)
-    store = MagicMock()
-    store.register_buffer.side_effect = [None, RuntimeError("registration failed"), None]
-    worker = MPKVPoolWorker(
-        _make_vllm_config(),
-        store=store,
-        cache_importer=lambda spec: import_worker_kv_caches(spec, adapter),
-    )
-
-    worker.configure_kv_caches(first.spec)
-
-    with pytest.raises(RuntimeError, match="registration failed"):
-        worker.configure_kv_caches(second.spec)
-
-    assert worker.kv_cache_spec == first.spec
-    assert torch.equal(worker.kv_caches["layer.0"][0], torch.zeros(8))
-    worker.close()
-
-
-def test_mp_worker_does_not_replace_generation_when_current_cleanup_fails() -> None:
-    adapter = _CPUMemoryAdapter()
-    first = export_worker_kv_caches({"layer.0": torch.zeros(8)}, 1, adapter)
-    second = export_worker_kv_caches({"layer.0": torch.ones(8)}, 2, adapter)
-    store = MagicMock()
-    store.unregister_buffer.side_effect = [RuntimeError("cleanup failed"), None]
-    worker = MPKVPoolWorker(
-        _make_vllm_config(),
-        store=store,
-        cache_importer=lambda spec: import_worker_kv_caches(spec, adapter),
-    )
-    worker.configure_kv_caches(first.spec)
-
-    with pytest.raises(RuntimeError, match="cleanup failed"):
-        worker.configure_kv_caches(second.spec)
-
-    assert worker.kv_cache_spec == first.spec
-    assert torch.equal(worker.kv_caches["layer.0"][0], torch.zeros(8))
-    store.register_buffer.assert_called_once()
-    worker.close()
-
-
-def test_mp_worker_requires_reregistration_when_failed_generation_cannot_be_cleaned_up() -> None:
-    adapter = _CPUMemoryAdapter()
-    first = export_worker_kv_caches({"layer.0": torch.zeros(8)}, 1, adapter)
-    second = export_worker_kv_caches({"layer.0": torch.ones(8)}, 2, adapter)
-    store = MagicMock()
-    store.register_buffer.side_effect = [None, RuntimeError("registration failed")]
-    store.unregister_buffer.side_effect = [None, RuntimeError("cleanup failed"), None]
-    worker = MPKVPoolWorker(
-        _make_vllm_config(),
-        store=store,
-        cache_importer=lambda spec: import_worker_kv_caches(spec, adapter),
-    )
-    worker.configure_kv_caches(first.spec)
-
-    with pytest.raises(RuntimeError, match="Failed to clean up KV cache generation 2"):
-        worker.configure_kv_caches(second.spec)
-    with pytest.raises(RuntimeError, match="re-register the Worker service"):
-        worker.configure_kv_caches(first.spec)
-
     worker.close()
 
 
@@ -314,7 +204,7 @@ def test_mp_worker_returns_miss_before_backend_is_initialized() -> None:
 
 def test_mp_worker_initializes_own_backend_after_cache_mapping() -> None:
     adapter = _CPUMemoryAdapter()
-    exported = export_worker_kv_caches({"layer.0": torch.arange(8)}, 1, adapter)
+    exported = export_worker_kv_caches({"layer.0": torch.arange(8)}, adapter)
     store = MagicMock()
     store.exists.return_value = [1, 1]
     backend_factory = MagicMock(return_value=store)
@@ -336,7 +226,6 @@ def test_mp_worker_initializes_own_backend_after_cache_mapping() -> None:
 def test_mp_worker_wait_for_save_imports_source_event() -> None:
     worker = _make_worker([0, 0])
     worker.kv_cache_spec = WorkerKVCacheSpec(
-        generation=1,
         caches={"layer.0": ()},
         storages=(
             KVCacheStorageSpec(
@@ -374,7 +263,6 @@ def test_mp_worker_wait_for_save_imports_source_event() -> None:
 def test_mp_worker_layer_store_reuses_source_event() -> None:
     worker = _make_worker([0, 0])
     worker.kv_cache_spec = WorkerKVCacheSpec(
-        generation=1,
         caches={"layer.0": ()},
         storages=(
             KVCacheStorageSpec(
