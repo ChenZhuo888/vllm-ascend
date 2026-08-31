@@ -517,6 +517,20 @@ These rules apply to changes under
   invariant or ordering rule the region preserves. A title may stand alone
   only for an obvious navigational grouping whose meaning is already complete
   in the adjacent code and does not hide an architectural claim.
+- A section lead comment is the design explanation for the region, not a
+  collection of otherwise useful facts. Begin by stating the region's role in
+  the surrounding control flow and the overall design that makes its methods a
+  coherent whole. Add ownership rules, invariants, ordering constraints, or
+  maintenance pitfalls only when they follow from and clarify that design.
+- Keep each explanation at the narrowest scope that owns it: class
+  responsibility belongs in the class docstring, regional design belongs in
+  the section lead, and method-specific conditions or workarounds belong next
+  to the method. Do not promote a local implementation detail into a section
+  comment merely because it is important.
+- A section lead should read as one short, coherent explanation that helps an
+  unfamiliar maintainer learn and reconstruct the design. If its sentences are
+  only independent facts about nearby methods, rewrite the regional narrative
+  or move those facts to their actual owners.
 - Review every proposed section by asking why it is an independent region. If
   neither the adjacent code nor its lead comment answers that question, remove
   the section or explain the missing architectural reason. Do not keep a

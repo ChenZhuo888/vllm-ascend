@@ -405,9 +405,9 @@ class KVCacheServiceManager:
     # Lease maintenance and owner-lane closure
     # ==============================
 
-    # Lease expiry and final shutdown may begin outside a service's owner thread.
-    # Cleanup is sent back to that affinity lane and awaited, so configured executors
-    # must remain alive until close() returns.
+    # Scheduler and Worker lifecycle registries are maintained and closed as one
+    # service boundary. Expiry and shutdown may begin off-lane, so cleanup returns
+    # to each service owner and finishes before its executor may stop.
 
     def start_lease_maintenance(self) -> None:
         self._schedulers.start_maintenance()

@@ -143,9 +143,9 @@ class KVCacheServer:
     # Scheduler-affine request adapters
     # ==============================
 
-    # Affinity is keyed by service identity rather than client connection or session.
-    # Replacement, request callbacks, and cleanup for the same Scheduler therefore
-    # cannot overtake one another.
+    # Scheduler RPCs share one execution lane per service identity. Keying that lane
+    # by identity rather than connection or session keeps replacement, request
+    # callbacks, and cleanup ordered across reconnects.
 
     def _handle_register_scheduler(self, payloads: tuple[bytes, ...]) -> tuple[bytes, ...]:
         registration, serialized_registration = decode_registration_request(payloads, SchedulerRegistration)
