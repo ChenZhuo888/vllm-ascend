@@ -468,6 +468,10 @@ These rules apply to changes under
 - Use precise domain names. Avoid generic names such as `Manager`, `Service`,
   `Context`, or `Handler` unless the object genuinely owns that complete
   responsibility.
+- Prefer plain, direct language in names, docstrings, and comments. Keep
+  established terms such as `RPC` when they are the shared, precise vocabulary,
+  but do not introduce specialized terminology when simpler wording communicates
+  the same design without losing meaning.
 - Comments should explain why a decision, invariant, ordering constraint, or
   workaround exists. Do not restate what the code already says.
 - Keep formatting compact and compatible with PyCharm and Ruff. Avoid
@@ -479,6 +483,10 @@ These rules apply to changes under
   control flow, ownership, and lifecycle of the code. It is not a comment
   coverage exercise and must not create a superficial taxonomy of every
   method.
+- Apply the plain-language rule from Human-Readable Code to section titles,
+  class docstrings, section lead comments, and method-local explanations. Keep
+  specialized terms only when they are established shared vocabulary and more
+  precise than a simpler alternative.
 - Establish the actual call chain and responsibility boundaries before
   reordering methods or adding sections. When the structure is unclear, do not
   use comments to make it appear settled; preserve the ambiguity as an
