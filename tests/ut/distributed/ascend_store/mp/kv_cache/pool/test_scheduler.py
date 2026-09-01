@@ -43,9 +43,12 @@ def _make_config(kv_role="kv_producer", extra_config=None, block_size=16):
     config = MagicMock()
     config.kv_transfer_config.kv_role = kv_role
     config.kv_transfer_config.engine_id = "engine-0"
+    config.kv_transfer_config.kv_connector = "AscendStoreConnector"
     config.kv_transfer_config.kv_connector_extra_config = extra_config or {}
     config.kv_transfer_config.get_from_extra_config.return_value = True
     config.parallel_config.data_parallel_rank = 0
+    config.parallel_config.data_parallel_index = 0
+    config.parallel_config.data_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1
     config.parallel_config.decode_context_parallel_size = 1
     config.parallel_config.tensor_parallel_size = 1
@@ -54,11 +57,17 @@ def _make_config(kv_role="kv_producer", extra_config=None, block_size=16):
     config.parallel_config.world_size = 1
     config.cache_config.block_size = block_size
     config.cache_config.hash_block_size = block_size
+    config.cache_config.prefix_match_unit = None
     config.model_config.model = "org/llama-7b"
+    config.model_config.max_model_len = 1024
     config.model_config.use_mla = False
     config.model_config.hf_text_config = MagicMock(spec=[])
+    config.model_config.hf_config = config.model_config.hf_text_config
     config.model_config.get_total_num_kv_heads.return_value = 1
     config.model_config.get_num_layers.return_value = 2
+    config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    config.speculative_config = None
+    config.kv_events_config = None
     return config
 
 

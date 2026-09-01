@@ -85,7 +85,10 @@ def _make_vllm_config(tp_size: int = 1, rank: int = 0) -> MagicMock:
     config.model_config.get_total_num_kv_heads.return_value = tp_size
 
     config.parallel_config.data_parallel_rank = 0
+    config.parallel_config.data_parallel_index = 0
+    config.parallel_config.data_parallel_size = 1
     config.parallel_config.rank = rank
+    config.parallel_config.world_size = tp_size
     config.parallel_config.tensor_parallel_size = tp_size
     config.parallel_config.pipeline_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1
@@ -93,11 +96,13 @@ def _make_vllm_config(tp_size: int = 1, rank: int = 0) -> MagicMock:
 
     config.kv_transfer_config.kv_role = "kv_producer"
     config.kv_transfer_config.engine_id = "engine-0"
+    config.kv_transfer_config.kv_connector = "AscendStoreConnector"
     config.kv_transfer_config.kv_connector_extra_config = {"backend": "mooncake"}
     config.cache_config.block_size = 16
     config.cache_config.prefix_match_unit = None
     config.scheduler_config.disable_hybrid_kv_cache_manager = False
     config.speculative_config = None
+    config.kv_events_config = None
     return config
 
 

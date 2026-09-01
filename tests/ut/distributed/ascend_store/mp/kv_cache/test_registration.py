@@ -76,10 +76,38 @@ def _make_vllm_config(
     data_parallel_rank: int = 0,
     block_size: int = 16,
 ):
+    hf_config = SimpleNamespace(num_hidden_layers=2, model_type="llama")
     return SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=block_size),
-        kv_transfer_config=SimpleNamespace(engine_id=engine_id),
-        parallel_config=SimpleNamespace(rank=rank, data_parallel_rank=data_parallel_rank),
+        model_config=SimpleNamespace(
+            model="org/model",
+            max_model_len=1024,
+            hf_text_config=hf_config,
+            hf_config=hf_config,
+            use_mla=False,
+            get_num_layers=lambda _parallel_config: 2,
+            get_total_num_kv_heads=lambda: 1,
+        ),
+        parallel_config=SimpleNamespace(
+            rank=rank,
+            world_size=1,
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_index=data_parallel_rank,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        kv_transfer_config=SimpleNamespace(
+            engine_id=engine_id,
+            kv_role="kv_both",
+            kv_connector="AscendStoreConnector",
+            kv_connector_extra_config={},
+        ),
+        cache_config=SimpleNamespace(block_size=block_size, prefix_match_unit=None),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+        kv_events_config=None,
     )
 
 
@@ -94,12 +122,8 @@ def _scheduler_registration(session_id: str, *, data_parallel_rank: int = 0, blo
 
 def test_registration_projects_only_kv_pool_configuration() -> None:
     config = _make_vllm_config()
-    config.model_config = SimpleNamespace(
-        model="org/model",
-        max_model_len=1024,
-        runtime_state=_UnserializableRuntimeState(),
-        runtime_tensor=torch.ones(1024),
-    )
+    config.model_config.runtime_state = _UnserializableRuntimeState()
+    config.model_config.runtime_tensor = torch.ones(1024)
     config.compilation_config = _UnserializableRuntimeState()
     config.kv_transfer_config.kv_role = "kv_both"
     config.kv_transfer_config.kv_connector_extra_config = {"backend": "mooncake"}
@@ -186,6 +210,53 @@ def test_registration_rejects_runtime_objects_in_extra_config() -> None:
 
     with pytest.raises(TypeError, match="Unsupported registration configuration value Tensor"):
         SchedulerRegistration.create(config, None, 0)
+
+
+def test_registration_rejects_missing_required_configuration() -> None:
+    config = _make_vllm_config()
+    del config.parallel_config.world_size
+
+    with pytest.raises(ValueError, match="parallel_config.world_size must be set"):
+        SchedulerRegistration.create(config, None, 0)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "error", "match"),
+    [
+        ("parallel_config", "tensor_parallel_size", 0, ValueError, "tensor_parallel_size must be positive"),
+        ("cache_config", "block_size", "16", TypeError, "block_size must be an integer"),
+        ("kv_transfer_config", "kv_role", "invalid", ValueError, "kv_role must be one of"),
+        (
+            "kv_transfer_config",
+            "kv_connector_extra_config",
+            [],
+            TypeError,
+            "kv_connector_extra_config must be a mapping",
+        ),
+    ],
+)
+def test_registration_rejects_invalid_required_configuration(section, field, value, error, match) -> None:
+    config = _make_vllm_config()
+    setattr(getattr(config, section), field, value)
+
+    with pytest.raises(error, match=match):
+        SchedulerRegistration.create(config, None, 0)
+
+
+def test_registration_preserves_optional_configuration() -> None:
+    config = _make_vllm_config()
+    hf_config = SimpleNamespace(num_hidden_layers=2)
+    config.model_config.hf_text_config = hf_config
+    config.model_config.hf_config = hf_config
+    config.scheduler_config.disable_hybrid_kv_cache_manager = None
+
+    registration = SchedulerRegistration.create(config, None, 0)
+
+    assert registration.config.model_config.model_type is None
+    assert registration.config.model_config.compress_ratios is None
+    assert registration.config.scheduler_config.disable_hybrid_kv_cache_manager is False
+    assert registration.config.speculative_config is None
+    assert registration.config.kv_events_config is None
 
 
 def _worker_registration(session_id: str, *, data_parallel_rank: int = 0, rank: int = 0):

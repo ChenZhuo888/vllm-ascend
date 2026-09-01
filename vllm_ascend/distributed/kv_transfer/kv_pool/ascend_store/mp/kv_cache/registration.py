@@ -16,9 +16,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-_DEFAULT_BLOCK_SIZE = 16
-_DEFAULT_MODEL_LAYERS = 1
-_DEFAULT_PARALLEL_SIZE = 1
+_KV_ROLES = {"kv_producer", "kv_consumer", "kv_both"}
 _SUPPORTED_SPEC_MODULES = {
     "vllm.v1.kv_cache_interface",
     "vllm_ascend.core.kv_cache_interface",
@@ -116,28 +114,55 @@ class KVPoolModelConfigSpec:
     compress_ratios: tuple[int, ...] | None
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: object) -> KVPoolModelConfigSpec:
-        model_config = getattr(vllm_config, "model_config", None)
-        parallel_config = getattr(vllm_config, "parallel_config", None)
-        hf_text_config = getattr(model_config, "hf_text_config", None)
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> KVPoolModelConfigSpec:
+        model_config = _require_attr(vllm_config, "model_config", "vllm_config")
+        parallel_config = _require_attr(vllm_config, "parallel_config", "vllm_config")
+        hf_text_config = _require_attr(model_config, "hf_text_config", "model_config")
         hf_config = getattr(model_config, "hf_config", None) or hf_text_config
-        num_layers = _call_int(model_config, "get_num_layers", parallel_config, default=_DEFAULT_MODEL_LAYERS)
-        compress_ratios = _optional_int_tuple(getattr(hf_text_config, "compress_ratios", None))
+        num_layers = _call_required_positive_int(
+            model_config,
+            "get_num_layers",
+            "model_config.get_num_layers()",
+            parallel_config,
+        )
+        compress_ratios = _optional_int_tuple(
+            getattr(hf_text_config, "compress_ratios", None),
+            "model_config.hf_text_config.compress_ratios",
+        )
         if compress_ratios is None:
-            compress_ratios = _optional_int_tuple(getattr(hf_config, "compress_ratios", None))
+            compress_ratios = _optional_int_tuple(
+                getattr(hf_config, "compress_ratios", None),
+                "model_config.hf_config.compress_ratios",
+            )
+        num_hidden_layers = _optional_positive_int(
+            getattr(hf_text_config, "num_hidden_layers", None),
+            "model_config.hf_text_config.num_hidden_layers",
+        )
         return cls(
-            model=_read_str(model_config, "model", ""),
-            max_model_len=_read_int(model_config, "max_model_len", 0),
+            model=_require_non_empty_str(
+                _require_attr(model_config, "model", "model_config"),
+                "model_config.model",
+            ),
+            max_model_len=_require_positive_int(
+                _require_attr(model_config, "max_model_len", "model_config"),
+                "model_config.max_model_len",
+            ),
             num_layers=num_layers,
-            num_kv_heads=_call_int(
+            num_kv_heads=_call_required_positive_int(
                 model_config,
                 "get_total_num_kv_heads",
-                default=_DEFAULT_PARALLEL_SIZE,
+                "model_config.get_total_num_kv_heads()",
             ),
-            num_hidden_layers=_read_int(hf_text_config, "num_hidden_layers", num_layers),
-            use_mla=_read_bool(model_config, "use_mla", False),
-            use_sparse=hf_text_config is not None and hasattr(hf_text_config, "index_topk"),
-            model_type=_read_optional_str(hf_config, "model_type"),
+            num_hidden_layers=num_hidden_layers if num_hidden_layers is not None else num_layers,
+            use_mla=_require_bool(
+                _require_attr(model_config, "use_mla", "model_config"),
+                "model_config.use_mla",
+            ),
+            use_sparse=hasattr(hf_text_config, "index_topk"),
+            model_type=_optional_str(
+                getattr(hf_config, "model_type", None),
+                "model_config.hf_config.model_type",
+            ),
             compress_ratios=compress_ratios,
         )
 
@@ -178,24 +203,44 @@ class KVPoolParallelConfigSpec:
     decode_context_parallel_size: int
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: object) -> KVPoolParallelConfigSpec:
-        config = getattr(vllm_config, "parallel_config", None)
-        tp_size = _read_positive_int(config, "tensor_parallel_size", _DEFAULT_PARALLEL_SIZE)
-        pp_size = _read_positive_int(config, "pipeline_parallel_size", _DEFAULT_PARALLEL_SIZE)
-        pcp_size = _read_positive_int(config, "prefill_context_parallel_size", _DEFAULT_PARALLEL_SIZE)
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> KVPoolParallelConfigSpec:
+        config = _require_attr(vllm_config, "parallel_config", "vllm_config")
         return cls(
-            rank=_read_int(config, "rank", 0),
-            world_size=_read_positive_int(config, "world_size", tp_size * pp_size * pcp_size),
-            data_parallel_rank=_read_int(config, "data_parallel_rank", 0),
-            data_parallel_index=_read_int(config, "data_parallel_index", 0),
-            data_parallel_size=_read_positive_int(config, "data_parallel_size", _DEFAULT_PARALLEL_SIZE),
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            prefill_context_parallel_size=pcp_size,
-            decode_context_parallel_size=_read_positive_int(
-                config,
-                "decode_context_parallel_size",
-                _DEFAULT_PARALLEL_SIZE,
+            rank=_require_non_negative_int(
+                _require_attr(config, "rank", "parallel_config"),
+                "parallel_config.rank",
+            ),
+            world_size=_require_positive_int(
+                _require_attr(config, "world_size", "parallel_config"),
+                "parallel_config.world_size",
+            ),
+            data_parallel_rank=_require_non_negative_int(
+                _require_attr(config, "data_parallel_rank", "parallel_config"),
+                "parallel_config.data_parallel_rank",
+            ),
+            data_parallel_index=_require_non_negative_int(
+                _require_attr(config, "data_parallel_index", "parallel_config"),
+                "parallel_config.data_parallel_index",
+            ),
+            data_parallel_size=_require_positive_int(
+                _require_attr(config, "data_parallel_size", "parallel_config"),
+                "parallel_config.data_parallel_size",
+            ),
+            tensor_parallel_size=_require_positive_int(
+                _require_attr(config, "tensor_parallel_size", "parallel_config"),
+                "parallel_config.tensor_parallel_size",
+            ),
+            pipeline_parallel_size=_require_positive_int(
+                _require_attr(config, "pipeline_parallel_size", "parallel_config"),
+                "parallel_config.pipeline_parallel_size",
+            ),
+            prefill_context_parallel_size=_require_positive_int(
+                _require_attr(config, "prefill_context_parallel_size", "parallel_config"),
+                "parallel_config.prefill_context_parallel_size",
+            ),
+            decode_context_parallel_size=_require_positive_int(
+                _require_attr(config, "decode_context_parallel_size", "parallel_config"),
+                "parallel_config.decode_context_parallel_size",
             ),
         )
 
@@ -204,26 +249,36 @@ class KVPoolParallelConfigSpec:
 class KVPoolTransferConfigSpec:
     engine_id: str
     kv_role: str
-    kv_connector: str | None
+    kv_connector: str
     kv_connector_extra_config: dict[str, Any]
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: object) -> KVPoolTransferConfigSpec:
-        config = getattr(vllm_config, "kv_transfer_config", None)
-        if config is None:
-            raise ValueError("kv_transfer_config must be set")
-        engine_id = _read_str(config, "engine_id", "")
-        if not engine_id:
-            raise ValueError("kv_transfer_config.engine_id must not be empty")
-        extra_config = getattr(config, "kv_connector_extra_config", None)
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> KVPoolTransferConfigSpec:
+        config = _require_attr(vllm_config, "kv_transfer_config", "vllm_config")
+        engine_id = _require_non_empty_str(
+            _require_attr(config, "engine_id", "kv_transfer_config"),
+            "kv_transfer_config.engine_id",
+        )
+        kv_role = _require_non_empty_str(
+            _require_attr(config, "kv_role", "kv_transfer_config"),
+            "kv_transfer_config.kv_role",
+        )
+        if kv_role not in _KV_ROLES:
+            raise ValueError(f"kv_transfer_config.kv_role must be one of {sorted(_KV_ROLES)}, got {kv_role!r}")
+        extra_config = _require_attr(config, "kv_connector_extra_config", "kv_transfer_config")
         if not isinstance(extra_config, Mapping):
-            extra_config = {}
+            raise TypeError(
+                f"kv_transfer_config.kv_connector_extra_config must be a mapping, got {type(extra_config).__name__}"
+            )
         projected_extra_config = _project_extra_value(extra_config)
         assert isinstance(projected_extra_config, dict)
         return cls(
             engine_id=engine_id,
-            kv_role=_read_str(config, "kv_role", "kv_both"),
-            kv_connector=_read_optional_str(config, "kv_connector"),
+            kv_role=kv_role,
+            kv_connector=_require_non_empty_str(
+                _require_attr(config, "kv_connector", "kv_transfer_config"),
+                "kv_transfer_config.kv_connector",
+            ),
             kv_connector_extra_config=projected_extra_config,
         )
 
@@ -237,11 +292,17 @@ class KVPoolCacheConfigSpec:
     prefix_match_unit: int | None
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: object) -> KVPoolCacheConfigSpec:
-        config = getattr(vllm_config, "cache_config", None)
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> KVPoolCacheConfigSpec:
+        config = _require_attr(vllm_config, "cache_config", "vllm_config")
         return cls(
-            block_size=_read_positive_int(config, "block_size", _DEFAULT_BLOCK_SIZE),
-            prefix_match_unit=_read_optional_int(config, "prefix_match_unit"),
+            block_size=_require_positive_int(
+                _require_attr(config, "block_size", "cache_config"),
+                "cache_config.block_size",
+            ),
+            prefix_match_unit=_optional_positive_int(
+                _require_attr(config, "prefix_match_unit", "cache_config", allow_none=True),
+                "cache_config.prefix_match_unit",
+            ),
         )
 
 
@@ -250,13 +311,19 @@ class KVPoolSchedulerConfigSpec:
     disable_hybrid_kv_cache_manager: bool
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: object) -> KVPoolSchedulerConfigSpec:
-        config = getattr(vllm_config, "scheduler_config", None)
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> KVPoolSchedulerConfigSpec:
+        config = _require_attr(vllm_config, "scheduler_config", "vllm_config")
+        disable_hybrid = _require_attr(
+            config,
+            "disable_hybrid_kv_cache_manager",
+            "scheduler_config",
+            allow_none=True,
+        )
         return cls(
-            disable_hybrid_kv_cache_manager=_read_bool(
-                config,
-                "disable_hybrid_kv_cache_manager",
-                False,
+            disable_hybrid_kv_cache_manager=(
+                _require_bool(disable_hybrid, "scheduler_config.disable_hybrid_kv_cache_manager")
+                if disable_hybrid is not None
+                else False
             )
         )
 
@@ -267,14 +334,20 @@ class KVPoolSpeculativeConfigSpec:
     eagle_enabled: bool
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: object) -> KVPoolSpeculativeConfigSpec | None:
+    def from_vllm_config(cls, vllm_config: VllmConfig) -> KVPoolSpeculativeConfigSpec | None:
         config = getattr(vllm_config, "speculative_config", None)
         if config is None:
             return None
-        use_eagle = getattr(config, "use_eagle", None)
+        use_eagle = _require_attr(config, "use_eagle", "speculative_config")
+        if not callable(use_eagle):
+            raise TypeError("speculative_config.use_eagle must be callable")
+        eagle_enabled = use_eagle()
         return cls(
-            num_speculative_tokens=_read_int(config, "num_speculative_tokens", 0),
-            eagle_enabled=use_eagle() is True if callable(use_eagle) else False,
+            num_speculative_tokens=_require_positive_int(
+                _require_attr(config, "num_speculative_tokens", "speculative_config"),
+                "speculative_config.num_speculative_tokens",
+            ),
+            eagle_enabled=_require_bool(eagle_enabled, "speculative_config.use_eagle()"),
         )
 
     def use_eagle(self) -> bool:
@@ -300,10 +373,18 @@ class KVPoolConfigSpec:
     @classmethod
     def from_vllm_config(
         cls,
-        vllm_config: object,
+        vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig | None,
     ) -> KVPoolConfigSpec:
         kv_events_config = getattr(vllm_config, "kv_events_config", None)
+        kv_events_enabled = (
+            _require_bool(
+                _require_attr(kv_events_config, "enable_kv_cache_events", "kv_events_config"),
+                "kv_events_config.enable_kv_cache_events",
+            )
+            if kv_events_config is not None
+            else False
+        )
         return cls(
             model_config=KVPoolModelConfigSpec.from_vllm_config(vllm_config),
             parallel_config=KVPoolParallelConfigSpec.from_vllm_config(vllm_config),
@@ -311,11 +392,7 @@ class KVPoolConfigSpec:
             cache_config=KVPoolCacheConfigSpec.from_vllm_config(vllm_config),
             scheduler_config=KVPoolSchedulerConfigSpec.from_vllm_config(vllm_config),
             speculative_config=KVPoolSpeculativeConfigSpec.from_vllm_config(vllm_config),
-            kv_events_config=(
-                KVPoolEventsConfigSpec(enable_kv_cache_events=True)
-                if _read_bool(kv_events_config, "enable_kv_cache_events", False)
-                else None
-            ),
+            kv_events_config=(KVPoolEventsConfigSpec(enable_kv_cache_events=True) if kv_events_enabled else None),
             kv_cache_config=KVCacheConfigData.from_config(kv_cache_config) if kv_cache_config is not None else None,
         )
 
@@ -340,52 +417,69 @@ def _project_extra_value(value: Any) -> Any:
     raise TypeError(f"Unsupported registration configuration value {type(value).__name__}")
 
 
-def _call_int(obj: object, name: str, *args: object, default: int) -> int:
+_MISSING = object()
+
+
+def _require_attr(obj: object, name: str, owner: str, *, allow_none: bool = False) -> Any:
+    value = getattr(obj, name, _MISSING)
+    if value is _MISSING or (value is None and not allow_none):
+        raise ValueError(f"{owner}.{name} must be set")
+    return value
+
+
+def _call_required_positive_int(obj: object, name: str, field_name: str, *args: object) -> int:
     method = getattr(obj, name, None)
     if not callable(method):
-        return default
-    try:
-        value = method(*args)
-    except (AttributeError, TypeError, ValueError):
-        return default
-    return value if isinstance(value, int) and not isinstance(value, bool) else default
+        raise TypeError(f"{field_name.removesuffix('()')} must be callable")
+    return _require_positive_int(method(*args), field_name)
 
 
-def _read_bool(obj: object, name: str, default: bool) -> bool:
-    value = getattr(obj, name, default)
-    return value if isinstance(value, bool) else default
+def _require_bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a boolean, got {type(value).__name__}")
+    return value
 
 
-def _read_int(obj: object, name: str, default: int) -> int:
-    value = getattr(obj, name, default)
-    return value if isinstance(value, int) and not isinstance(value, bool) else default
+def _require_int(value: object, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
+    return value
 
 
-def _read_positive_int(obj: object, name: str, default: int) -> int:
-    value = _read_int(obj, name, default)
-    return value if value > 0 else default
+def _require_positive_int(value: object, name: str) -> int:
+    value = _require_int(value, name)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
 
 
-def _read_optional_int(obj: object, name: str) -> int | None:
-    value = getattr(obj, name, None)
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
+def _optional_positive_int(value: object, name: str) -> int | None:
+    if value is None:
+        return None
+    return _require_positive_int(value, name)
 
 
-def _read_str(obj: object, name: str, default: str) -> str:
-    value = getattr(obj, name, default)
-    return value if isinstance(value, str) else default
+def _require_non_empty_str(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string, got {type(value).__name__}")
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return value
 
 
-def _read_optional_str(obj: object, name: str) -> str | None:
-    value = getattr(obj, name, None)
-    return value if isinstance(value, str) else None
+def _optional_str(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    return _require_non_empty_str(value, name)
 
 
-def _optional_int_tuple(value: object) -> tuple[int, ...] | None:
+def _optional_int_tuple(value: object, name: str) -> tuple[int, ...] | None:
+    if value is None:
+        return None
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        return None
+        raise TypeError(f"{name} must be a sequence of integers, got {type(value).__name__}")
     if not all(isinstance(item, int) and not isinstance(item, bool) for item in value):
-        return None
+        raise TypeError(f"{name} must contain integers only")
     return tuple(value)
 
 

@@ -94,9 +94,38 @@ class _FakeWorker:
 
 
 def _make_vllm_config(rank: int = 0, data_parallel_rank: int = 0):
+    hf_config = SimpleNamespace(num_hidden_layers=2, model_type="llama")
     return SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(engine_id="engine-0"),
-        parallel_config=SimpleNamespace(rank=rank, data_parallel_rank=data_parallel_rank),
+        model_config=SimpleNamespace(
+            model="org/model",
+            max_model_len=1024,
+            hf_text_config=hf_config,
+            hf_config=hf_config,
+            use_mla=False,
+            get_num_layers=lambda _parallel_config: 2,
+            get_total_num_kv_heads=lambda: 1,
+        ),
+        parallel_config=SimpleNamespace(
+            rank=rank,
+            world_size=1,
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_index=data_parallel_rank,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        kv_transfer_config=SimpleNamespace(
+            engine_id="engine-0",
+            kv_role="kv_both",
+            kv_connector="AscendStoreConnector",
+            kv_connector_extra_config={},
+        ),
+        cache_config=SimpleNamespace(block_size=16, prefix_match_unit=None),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+        kv_events_config=None,
     )
 
 
