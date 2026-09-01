@@ -148,3 +148,11 @@ class MPKVPoolScheduler(KVPoolScheduler):
     def take_free_block_commands(self) -> list[int]:
         """Return and clear block ids whose Store work finished on every Worker."""
         return self._block_pool.take_free_ids()
+
+    def close(self) -> None:
+        """Satisfy the manager's uniform service close contract.
+
+        Unlike the Worker service, the Scheduler owns no backend, transfer
+        threads, or imported memory; its request views and recorded block-id
+        commands die with this object.
+        """

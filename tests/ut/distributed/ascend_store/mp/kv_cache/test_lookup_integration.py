@@ -10,8 +10,10 @@ import zmq.asyncio  # noqa: F401
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheServer
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.manager import KVCacheServiceManager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.scheduler import MPKVPoolScheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.worker import MPKVPoolWorker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import encode_registration
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import (
     SchedulerRegistration,
     WorkerLookupHandler,
@@ -251,6 +253,26 @@ def test_lookup_returns_miss_after_coordinator_unregisters() -> None:
         worker_client.close()
         scheduler_client.close()
         _stop_lookup_server(process)
+
+
+def test_unregister_closes_the_real_scheduler_service() -> None:
+    # Fake scheduler factories all implement close(), so only the real
+    # MPKVPoolScheduler can expose a service missing the manager's close
+    # contract. Client-side unregister hides that failure behind best-effort
+    # cleanup, so the manager is called directly here.
+    registration = SchedulerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        page_size_bytes=0,
+        session_id="scheduler-session",
+    )
+    service_manager = KVCacheServiceManager(scheduler_factory=_create_scheduler)
+
+    scheduler = service_manager.register_scheduler(registration, encode_registration(registration))
+    assert isinstance(scheduler, MPKVPoolScheduler)
+
+    assert service_manager.unregister_scheduler(registration.identity, registration.session_id) is True
+    assert service_manager.scheduler_count == 0
 
 
 def test_update_state_after_alloc_round_trip_after_lookup() -> None:
