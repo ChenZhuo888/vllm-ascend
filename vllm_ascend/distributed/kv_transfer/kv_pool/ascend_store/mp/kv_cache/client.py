@@ -65,6 +65,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_MS = 5000
 _REGISTRATION_TIMEOUT_MS = 500
+# First-time cache registration imports NPU IPC mappings, creates the backend,
+# and registers its buffers, which exceeds the identity-registration budget on
+# real hardware. A timeout here only triggers an idempotent retry.
+_CACHE_REGISTRATION_TIMEOUT_MS = 5000
 _LEASE_RENEW_INTERVAL_MS = 1000
 _LEASE_REQUEST_TIMEOUT_MS = 1000
 _ConfiguredRegistration = tuple[SchedulerRegistration | WorkerRegistration, tuple[bytes, ...]]
@@ -243,7 +247,7 @@ class KVCacheClient:
                     responses = self._send_service_request(
                         KVCacheMethod.REGISTER_KV_CACHES,
                         worker_kv_cache_registration.payloads,
-                        _REGISTRATION_TIMEOUT_MS,
+                        _CACHE_REGISTRATION_TIMEOUT_MS,
                     )
                     decode_ack_response(responses, KVCacheMethod.REGISTER_KV_CACHES)
             except (MPRequestTimeoutError, MPServerBusyError, MPServerUnavailableError, ServiceNotRegisteredError):
