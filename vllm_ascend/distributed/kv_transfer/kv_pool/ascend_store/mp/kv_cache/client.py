@@ -69,6 +69,10 @@ _REGISTRATION_TIMEOUT_MS = 500
 # and registers its buffers, which exceeds the identity-registration budget on
 # real hardware. A timeout here only triggers an idempotent retry.
 _CACHE_REGISTRATION_TIMEOUT_MS = 5000
+# Unregistering closes the service on the server: the Worker stops transfer
+# threads and unregisters backend buffers, which can also exceed the fast-fail
+# identity budget. Cleanup stays best-effort, with lease expiry as backstop.
+_UNREGISTER_TIMEOUT_MS = 5000
 _LEASE_RENEW_INTERVAL_MS = 1000
 _LEASE_REQUEST_TIMEOUT_MS = 1000
 _ConfiguredRegistration = tuple[SchedulerRegistration | WorkerRegistration, tuple[bytes, ...]]
@@ -712,7 +716,7 @@ class KVCacheClient:
             payloads = encode_worker_session(registration.identity, registration.session_id)
 
         try:
-            responses = self._send_service_request(method, payloads, _REGISTRATION_TIMEOUT_MS)
+            responses = self._send_service_request(method, payloads, _UNREGISTER_TIMEOUT_MS)
             decode_ack_response(responses, method)
         except Exception:
             # close() is best-effort cleanup; transport recovery is no longer useful once the client is closing.
