@@ -106,6 +106,31 @@ def test_identical_concurrent_registration_shares_factory_result() -> None:
     assert created == [first_service]
 
 
+def test_pending_registration_cannot_be_unregistered() -> None:
+    factory_started = threading.Event()
+    release_factory = threading.Event()
+
+    def factory() -> _FakeService:
+        factory_started.set()
+        assert release_factory.wait(5), "Service factory was not released"
+        return _FakeService()
+
+    manager = _create_manager()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        registration = executor.submit(manager.register, "service-0", "session-0", b"config", factory)
+        assert factory_started.wait(5), "Service factory did not start"
+        try:
+            with pytest.raises(StaleSessionError, match="stale"):
+                manager.unregister("service-0", "other-session")
+            assert not manager.unregister("service-0", "session-0")
+        finally:
+            release_factory.set()
+
+        service = registration.result(timeout=5)
+
+    assert manager.get_for_session("service-0", "session-0") is service
+
+
 def test_manager_close_terminates_shared_registration_wait() -> None:
     factory_started = threading.Event()
     release_factory = threading.Event()
@@ -124,14 +149,14 @@ def test_manager_close_terminates_shared_registration_wait() -> None:
         creator = executor.submit(manager.register, "service-0", "session-0", b"config", factory)
         assert factory_started.wait(5), "Service factory did not start"
 
-        flight = manager._registering["service-0"]
-        wait_for_result = flight.future.result
+        registration = manager._states["service-0"]
+        wait_for_result = registration.future.result
 
         def observe_wait():
             wait_started.set()
             return wait_for_result()
 
-        with patch.object(flight.future, "result", side_effect=observe_wait):
+        with patch.object(registration.future, "result", side_effect=observe_wait):
             waiter = executor.submit(manager.register, "service-0", "session-0", b"config", factory)
             assert wait_started.wait(5), "Concurrent registration did not wait on the shared flight"
 
@@ -173,6 +198,52 @@ def test_expired_session_recovers_only_with_the_same_fingerprint() -> None:
 
     second_service = manager.register("service-0", "session-0", b"config", _FakeService)
     assert second_service is not first_service
+
+
+def test_failed_recovery_registration_remains_recoverable() -> None:
+    now = [0.0]
+    manager = _create_manager(lambda: now[0])
+    manager.register("service-0", "session-0", b"config", _FakeService)
+
+    now[0] = 11.0
+    manager.expire_leases()
+
+    def fail_factory() -> _FakeService:
+        raise RuntimeError("registration failed")
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        manager.register("service-0", "session-0", b"config", fail_factory)
+
+    recovered = manager.register("service-0", "session-0", b"config", _FakeService)
+    assert manager.get_for_session("service-0", "session-0") is recovered
+
+
+def test_unregister_does_not_retire_a_recovering_registration() -> None:
+    now = [0.0]
+    factory_started = threading.Event()
+    release_factory = threading.Event()
+    manager = _create_manager(lambda: now[0])
+    manager.register("service-0", "session-0", b"config", _FakeService)
+
+    now[0] = 11.0
+    manager.expire_leases()
+
+    def factory() -> _FakeService:
+        factory_started.set()
+        assert release_factory.wait(5), "Recovery factory was not released"
+        return _FakeService()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        recovery = executor.submit(manager.register, "service-0", "session-0", b"config", factory)
+        assert factory_started.wait(5), "Recovery factory did not start"
+        try:
+            assert not manager.unregister("service-0", "session-0")
+        finally:
+            release_factory.set()
+
+        recovered = recovery.result(timeout=5)
+
+    assert manager.get_for_session("service-0", "session-0") is recovered
 
 
 def test_expiration_does_not_retain_service_after_close_failure() -> None:

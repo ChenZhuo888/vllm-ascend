@@ -15,7 +15,7 @@ ServiceT = TypeVar("ServiceT")
 
 
 @dataclass
-class _ServiceEntry(Generic[ServiceT]):
+class _ActiveService(Generic[ServiceT]):
     session_id: str
     fingerprint: bytes
     service: ServiceT
@@ -29,10 +29,23 @@ class _RecoverableSession:
 
 
 @dataclass(frozen=True)
-class _RegistrationFlight(Generic[ServiceT]):
+class _PendingRegistration(Generic[ServiceT]):
     session_id: str
     fingerprint: bytes
     future: Future[ServiceT]
+    restore_on_failure: _RecoverableSession | None = None
+
+
+@dataclass(frozen=True)
+class _ExpiringService(Generic[ServiceT]):
+    session_id: str
+    fingerprint: bytes
+    service: ServiceT
+
+
+_ServiceState = (
+    _PendingRegistration[ServiceT] | _ActiveService[ServiceT] | _ExpiringService[ServiceT] | _RecoverableSession
+)
 
 
 class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
@@ -42,11 +55,32 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     so they do not renew another service's lease. When ``owner_close_handler`` is
     provided, expiration and shutdown delegate service closure through it.
 
-    The lifecycle lock owns every per-identity state map. One identity may be
-    present in at most one of registering, services, expiring, and recoverable;
-    retired sessions are independent history and may coexist with current state.
-    Separate locks ensure that only one expiration pass and one maintenance
-    thread run at a time.
+             register()          succeeds          lease expires      close finishes
+      +--------+       +-------------+       +--------+       +----------+       +-------------+
+      | absent |------>| registering |------>| active |------>| expiring |------>| recoverable |
+      +--------+       +-------------+       +--------+       +----------+       +-------------+
+          ^                |    ^                                                       |
+          | factory fails  |    | register again                                        |
+          | without a      |    +-------------------------------------------------------+
+          | saved state    |
+          +----------------+
+
+    A registration started from ``recoverable`` saves that state until its
+    factory succeeds; factory failure returns to ``recoverable`` instead of
+    losing the session's recovery path. Registering a new session from ``active``
+    retires and closes the old session before moving to ``registering``.
+
+    Unregister retires the session and moves ``active`` or ``recoverable`` to
+    ``absent``. During ``expiring``, it makes close completion move to ``absent``
+    instead of ``recoverable``. Registration is rejected while a service is
+    expiring, and unregister does not interrupt a registration already in progress.
+
+    ``_lock`` serializes every current-state transition and retired-session
+    update. An identity therefore has one current state, while retired session
+    IDs remain alongside a newer state so stale calls stay rejected.
+    ``_expiration_lock`` prevents expiration and shutdown from closing the same
+    service concurrently; ``_maintenance_lock`` protects the single background
+    maintenance thread.
     """
 
     def __init__(
@@ -75,10 +109,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         self._owner_close_handler = owner_close_handler
 
         self._lock = threading.RLock()
-        self._services: dict[IdentityT, _ServiceEntry[ServiceT]] = {}
-        self._registering: dict[IdentityT, _RegistrationFlight[ServiceT]] = {}
-        self._expiring: dict[IdentityT, _ServiceEntry[ServiceT]] = {}
-        self._recoverable_sessions: dict[IdentityT, _RecoverableSession] = {}
+        self._states: dict[IdentityT, _ServiceState[ServiceT]] = {}
         self._retired_sessions: dict[IdentityT, set[str]] = {}
         self._closed = False
 
@@ -90,7 +121,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     @property
     def count(self) -> int:
         with self._lock:
-            return len(self._services)
+            return sum(isinstance(state, _ActiveService) for state in self._states.values())
 
     @property
     def is_running(self) -> bool:
@@ -99,7 +130,11 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
 
     def items(self) -> tuple[tuple[IdentityT, ServiceT], ...]:
         with self._lock:
-            return tuple((identity, entry.service) for identity, entry in self._services.items())
+            return tuple(
+                (identity, state.service)
+                for identity, state in self._states.items()
+                if isinstance(state, _ActiveService)
+            )
 
     # ==============================
     # One registration per identity
@@ -120,52 +155,51 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     ) -> ServiceT:
         self._validate_session_id(session_id)
         old_service = None
+        registration = None
 
         with self._lock:
             self._raise_if_closed()
             self._raise_if_retired(identity, session_id)
-            if identity in self._expiring:
+            state = self._states.get(identity)
+            if isinstance(state, _ExpiringService):
                 raise ServiceBusyError(f"{self._service_name} {identity!r} is being expired")
 
-            entry = self._services.get(identity)
-            if entry is not None:
-                if entry.session_id == session_id:
-                    self._validate_fingerprint(identity, entry.fingerprint, fingerprint)
-                    entry.last_seen = self._clock()
-                    return entry.service
+            if isinstance(state, _ActiveService):
+                if state.session_id == session_id:
+                    self._validate_fingerprint(identity, state.fingerprint, fingerprint)
+                    state.last_seen = self._clock()
+                    return state.service
 
-                self._retire_session_locked(identity, entry.session_id)
-                del self._services[identity]
-                old_service = entry.service
+                self._retire_session_locked(identity, state.session_id)
+                old_service = state.service
+                state = None
 
-            flight = self._registering.get(identity)
-            if flight is not None:
-                if flight.session_id != session_id:
+            if isinstance(state, _PendingRegistration):
+                if state.session_id != session_id:
                     raise RegistrationConflictError(
-                        f"{self._service_name} {identity!r} is already registering session {flight.session_id!r}"
+                        f"{self._service_name} {identity!r} is already registering session {state.session_id!r}"
                     )
-                self._validate_fingerprint(identity, flight.fingerprint, fingerprint)
-                wait_future = flight.future
+                self._validate_fingerprint(identity, state.fingerprint, fingerprint)
+                wait_future = state.future
             else:
-                self._prepare_recoverable_locked(identity, session_id, fingerprint)
-                flight = _RegistrationFlight(session_id, fingerprint, Future())
-                self._registering[identity] = flight
+                restore_on_failure = None
+                if isinstance(state, _RecoverableSession):
+                    if state.session_id == session_id:
+                        self._validate_fingerprint(identity, state.fingerprint, fingerprint)
+                        restore_on_failure = state
+                    else:
+                        self._retire_session_locked(identity, state.session_id)
+                elif state is not None:
+                    raise TypeError(f"Unexpected {self._service_name} lifecycle state: {type(state).__name__}")
+
+                registration = _PendingRegistration(session_id, fingerprint, Future(), restore_on_failure)
+                self._states[identity] = registration
                 wait_future = None
 
         if wait_future is not None:
             return wait_future.result()
-        return self._create_and_publish(identity, session_id, fingerprint, factory, flight, old_service)
-
-    def _prepare_recoverable_locked(self, identity: IdentityT, session_id: str, fingerprint: bytes) -> None:
-        recoverable = self._recoverable_sessions.get(identity)
-        if recoverable is None:
-            return
-        if recoverable.session_id == session_id:
-            self._validate_fingerprint(identity, recoverable.fingerprint, fingerprint)
-            return
-
-        self._retire_session_locked(identity, recoverable.session_id)
-        del self._recoverable_sessions[identity]
+        assert registration is not None
+        return self._create_and_publish(identity, session_id, fingerprint, factory, registration, old_service)
 
     def _create_and_publish(
         self,
@@ -173,7 +207,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         session_id: str,
         fingerprint: bytes,
         factory: Callable[[], ServiceT],
-        flight: _RegistrationFlight[ServiceT],
+        registration: _PendingRegistration[ServiceT],
         old_service: ServiceT | None,
     ) -> ServiceT:
         service = None
@@ -183,12 +217,12 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
 
             service = factory()
             with self._lock:
-                self._publish_locked(identity, session_id, fingerprint, flight, service)
+                self._publish_locked(identity, session_id, fingerprint, registration, service)
         except BaseException as exc:
-            self._fail_registration(identity, flight, service, exc)
+            self._fail_registration(identity, registration, service, exc)
             raise
 
-        flight.future.set_result(service)
+        registration.future.set_result(service)
         return service
 
     def _publish_locked(
@@ -196,37 +230,38 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         identity: IdentityT,
         session_id: str,
         fingerprint: bytes,
-        flight: _RegistrationFlight[ServiceT],
+        registration: _PendingRegistration[ServiceT],
         service: ServiceT,
     ) -> None:
         self._raise_if_closed()
-        current_flight = self._registering.get(identity)
-        if current_flight is not flight:
+        if self._states.get(identity) is not registration:
             raise RuntimeError(f"{self._service_name} {identity!r} registration is no longer active")
 
-        self._services[identity] = _ServiceEntry(session_id, fingerprint, service, self._clock())
-        recoverable = self._recoverable_sessions.get(identity)
-        if recoverable is not None and recoverable.session_id == session_id:
-            del self._recoverable_sessions[identity]
-        del self._registering[identity]
+        # Reinsert the identity so active iteration retains publication order,
+        # including when concurrent factories finish out of order.
+        del self._states[identity]
+        self._states[identity] = _ActiveService(session_id, fingerprint, service, self._clock())
 
     def _fail_registration(
         self,
         identity: IdentityT,
-        flight: _RegistrationFlight[ServiceT],
+        registration: _PendingRegistration[ServiceT],
         service: ServiceT | None,
         exc: BaseException,
     ) -> None:
-        should_complete_flight = False
+        should_complete_registration = False
         with self._lock:
-            if self._registering.get(identity) is flight:
-                del self._registering[identity]
-                should_complete_flight = True
+            if self._states.get(identity) is registration:
+                if registration.restore_on_failure is None:
+                    del self._states[identity]
+                else:
+                    self._states[identity] = registration.restore_on_failure
+                should_complete_registration = True
 
         if service is not None:
             self._close_service_safely(service)
-        if should_complete_flight:
-            flight.future.set_exception(exc)
+        if should_complete_registration:
+            registration.future.set_exception(exc)
 
     # ==============================
     # Session access and release
@@ -245,8 +280,8 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         """Return a service without validating or renewing its session."""
         with self._lock:
             self._raise_if_closed()
-            entry = self._services.get(identity)
-            return None if entry is None else entry.service
+            state = self._states.get(identity)
+            return state.service if isinstance(state, _ActiveService) else None
 
     def get_for_session(self, identity: IdentityT, session_id: str) -> ServiceT | None:
         """Validate the session, renew its lease, and return the service."""
@@ -257,7 +292,7 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         self,
         identity: IdentityT,
         session_id: str,
-    ) -> _ServiceEntry[ServiceT] | None:
+    ) -> _ActiveService[ServiceT] | None:
         """Validate, resolve, and renew a session atomically.
 
         These steps stay in one method and share the lifecycle lock so expiration
@@ -267,42 +302,58 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
         with self._lock:
             self._raise_if_closed()
             self._raise_if_retired(identity, session_id)
-            entry = self._services.get(identity)
-            if entry is None:
+            state = self._states.get(identity)
+            if not isinstance(state, _ActiveService):
                 return None
-            self._validate_session(identity, session_id, entry.session_id)
-            entry.last_seen = self._clock()
-            return entry
+            self._validate_session(identity, session_id, state.session_id)
+            state.last_seen = self._clock()
+            return state
 
     def unregister(self, identity: IdentityT, session_id: str) -> bool:
+        """Retire a session and release its service when this call owns cleanup.
+
+        An active service is detached under the lifecycle lock and closed after
+        that lock is released. Expiration already owns the close of an expiring
+        service, so unregister only retires its session and leaves the state in
+        place until cleanup finishes; this prevents replacement from racing the
+        old close. A recoverable session has no service left and only loses its
+        recovery permission. A pending factory may already be running outside
+        the lock and cannot be cancelled safely, while an absent identity has
+        nothing to unregister; both return ``False``.
+        """
         self._validate_session_id(session_id)
         service = None
 
         with self._lock:
             self._raise_if_closed()
             self._raise_if_retired(identity, session_id)
+            state = self._states.get(identity)
 
-            expiring = self._expiring.get(identity)
-            if expiring is not None:
-                self._validate_session(identity, session_id, expiring.session_id)
-                self._retire_session_locked(identity, session_id)
-                return True
-
-            recoverable = self._recoverable_sessions.get(identity)
-            if recoverable is not None:
-                self._validate_session(identity, session_id, recoverable.session_id)
-                del self._recoverable_sessions[identity]
-                self._retire_session_locked(identity, session_id)
-                return True
-
-            entry = self._services.get(identity)
-            if entry is None:
+            if isinstance(state, _PendingRegistration):
+                self._validate_session(identity, session_id, state.session_id)
                 return False
-            self._validate_session(identity, session_id, entry.session_id)
 
-            del self._services[identity]
+            if state is None:
+                return False
+
+            if isinstance(state, _ExpiringService):
+                self._validate_session(identity, session_id, state.session_id)
+                self._retire_session_locked(identity, session_id)
+                return True
+
+            if isinstance(state, _RecoverableSession):
+                self._validate_session(identity, session_id, state.session_id)
+                del self._states[identity]
+                self._retire_session_locked(identity, session_id)
+                return True
+
+            if not isinstance(state, _ActiveService):
+                raise TypeError(f"Unexpected {self._service_name} lifecycle state: {type(state).__name__}")
+            self._validate_session(identity, session_id, state.session_id)
+
+            del self._states[identity]
             self._retire_session_locked(identity, session_id)
-            service = entry.service
+            service = state.service
 
         self._close_service(service)
         return True
@@ -314,9 +365,10 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     # Lease expiration and maintenance
     # ==============================
 
-    # Expiration removes entries under the lifecycle lock, closes them without
-    # holding that lock, then records sessions that may register again. The
-    # maintenance thread only runs this same expiration path periodically.
+    # Expiration first makes stale services unavailable by moving them to
+    # ``expiring`` under the lifecycle lock. It then closes them on their owner
+    # lane without that lock and exposes the session as recoverable only after
+    # cleanup finishes. The maintenance thread runs this same transaction.
 
     def expire_leases(self) -> int:
         with self._expiration_lock:
@@ -324,25 +376,30 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
             with self._lock:
                 if self._closed:
                     return 0
-                expired_services = [
-                    (identity, entry) for identity, entry in self._services.items() if entry.last_seen <= stale_before
+                expiring_services = [
+                    (
+                        identity,
+                        _ExpiringService(state.session_id, state.fingerprint, state.service),
+                    )
+                    for identity, state in self._states.items()
+                    if isinstance(state, _ActiveService) and state.last_seen <= stale_before
                 ]
-                for identity, entry in expired_services:
-                    del self._services[identity]
-                    self._expiring[identity] = entry
+                for identity, expiring in expiring_services:
+                    self._states[identity] = expiring
 
-            for identity, entry in expired_services:
-                self._close_on_owner_safely(identity, entry.service)
-                self._finish_expiration(identity, entry)
-            return len(expired_services)
+            for identity, expiring in expiring_services:
+                self._close_on_owner_safely(identity, expiring.service)
+                self._finish_expiration(identity, expiring)
+            return len(expiring_services)
 
-    def _finish_expiration(self, identity: IdentityT, entry: _ServiceEntry[ServiceT]) -> None:
+    def _finish_expiration(self, identity: IdentityT, expiring: _ExpiringService[ServiceT]) -> None:
         with self._lock:
-            if self._expiring.get(identity) is not entry:
+            if self._states.get(identity) is not expiring:
                 return
-            del self._expiring[identity]
-            if entry.session_id not in self._retired_sessions.get(identity, ()):
-                self._recoverable_sessions[identity] = _RecoverableSession(entry.session_id, entry.fingerprint)
+            if expiring.session_id in self._retired_sessions.get(identity, ()):
+                del self._states[identity]
+            else:
+                self._states[identity] = _RecoverableSession(expiring.session_id, expiring.fingerprint)
 
     def start_maintenance(self) -> None:
         with self._lock:
@@ -396,20 +453,21 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
 
         self.stop_maintenance()
         with self._expiration_lock, self._lock:
-            services = [(identity, entry.service) for identity, entry in self._services.items()]
-            services.extend((identity, entry.service) for identity, entry in self._expiring.items())
-            registration_flights = tuple(self._registering.values())
-            self._services.clear()
-            self._registering.clear()
-            self._expiring.clear()
-            self._recoverable_sessions.clear()
+            states = tuple(self._states.items())
+            services = [
+                (identity, state.service)
+                for identity, state in states
+                if isinstance(state, (_ActiveService, _ExpiringService))
+            ]
+            registrations = [state for _, state in states if isinstance(state, _PendingRegistration)]
+            self._states.clear()
             self._retired_sessions.clear()
 
         # Wake every caller waiting for registration with a close error. A factory
         # already running outside the lock cannot be cancelled and will clean up
         # its result when it eventually returns.
-        for flight in registration_flights:
-            flight.future.set_exception(RuntimeError(f"{self._service_name} lifecycle manager is closed"))
+        for registration in registrations:
+            registration.future.set_exception(RuntimeError(f"{self._service_name} lifecycle manager is closed"))
 
         for identity, service in services:
             self._close_on_owner_safely(identity, service)
