@@ -7,14 +7,12 @@ import torch
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.worker import MPKVPoolWorker
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata, ReqMeta
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import (
+    KVCacheStorageSpec,
+    NPUEventSpec,
+    WorkerKVCacheSpec,
     export_worker_kv_caches,
     import_worker_kv_caches,
-)
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import (
-    KVCacheStorageSpec,
-    WorkerKVCacheSpec,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 

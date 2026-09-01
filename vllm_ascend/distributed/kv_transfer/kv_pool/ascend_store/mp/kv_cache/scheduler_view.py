@@ -1,4 +1,4 @@
-"""Serializable stand-ins for vLLM objects consumed inside the KVCacheServer process."""
+"""Scheduler-owned vLLM objects projected into the KVCacheServer process."""
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -59,41 +59,6 @@ class ConnectorOutputView:
     kv_connector_worker_meta: "AscendStoreKVConnectorWorkerMetadata"
 
 
-@dataclass(frozen=True)
-class KVCacheTensorSpec:
-    """Process-neutral layout of one tensor in a worker KV cache.
-
-    ``storage_index`` points to the corresponding opaque handle in
-    ``WorkerKVCacheSpec.storages``; no process-local address crosses the wire.
-    """
-
-    storage_index: int
-    storage_offset_bytes: int
-    shape: tuple[int, ...]
-    stride: tuple[int, ...]
-    dtype: str
-
-
-@dataclass(frozen=True)
-class KVCacheStorageSpec:
-    """Opaque IPC handle and source-device identity for one allocation."""
-
-    size_bytes: int
-    device_type: str
-    device_uuid: str
-    handle_type: str
-    handle_version: int
-    handle: bytes
-
-
-@dataclass(frozen=True)
-class WorkerKVCacheSpec:
-    """Storage handles and tensor layouts registered by one Worker."""
-
-    caches: dict[str, tuple[KVCacheTensorSpec, ...]]
-    storages: tuple[KVCacheStorageSpec, ...]
-
-
 @dataclass
 class ScheduledNewReqPayload:
     """Wire projection of the dynamic fields of vLLM NewRequestData."""
@@ -132,47 +97,3 @@ class SchedulerOutputView:
     num_scheduled_tokens: dict[str, int]
     scheduled_new_reqs: list
     scheduled_cached_reqs: CachedReqsView
-
-
-class _BlockIdIndex:
-    """Stand-in for BlockPool.blocks (dict[int, Block]) inside the server.
-
-    The inherited bookkeeping only uses ``blocks[block_id]`` to hand the
-    result straight to ``touch``/``free_blocks``; it never reads any Block
-    attribute. So every id can simply map to itself, which makes the
-    recorded commands arrive as plain block-id lists.
-    """
-
-    def __getitem__(self, block_id: int) -> int:
-        return block_id
-
-
-class BlockPoolProxy:
-    """Command-recording stand-in for the scheduler-process BlockPool.
-
-    The inherited mamba bookkeeping reads blocks[id] and calls
-    touch/free_blocks on whatever holds the _block_pool slot. The proxy turns
-    those calls into block-id lists that the connector replays on the real
-    pool after the RPC returns, so no object ever crosses the process border.
-    """
-
-    def __init__(self):
-        self.blocks = _BlockIdIndex()
-        self._touch_ids: list[int] = []
-        self._free_ids: list[int] = []
-
-    def touch(self, block_ids) -> None:
-        self._touch_ids.extend(block_ids)
-
-    def free_blocks(self, block_ids) -> None:
-        self._free_ids.extend(block_ids)
-
-    def take_touch_ids(self) -> list[int]:
-        ids = self._touch_ids
-        self._touch_ids = []
-        return ids
-
-    def take_free_ids(self) -> list[int]:
-        ids = self._free_ids
-        self._free_ids = []
-        return ids

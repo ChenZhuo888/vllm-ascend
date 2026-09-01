@@ -10,11 +10,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache import
     KVCacheMethod,
     ServiceSessionExpiredError,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     decode_scheduler_session,
     decode_worker_session,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPRemoteError,
     MPRequestTimeoutError,

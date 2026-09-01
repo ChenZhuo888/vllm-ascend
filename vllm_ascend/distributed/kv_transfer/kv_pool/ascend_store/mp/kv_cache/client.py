@@ -29,6 +29,7 @@ from .error import (
     ServiceNotRegisteredError,
     ServiceSessionExpiredError,
 )
+from .npu_ipc import NPUEventSpec, WorkerKVCacheSpec
 from .protocol import (
     KVCacheMethod,
     decode_ack_response,
@@ -59,8 +60,6 @@ from .protocol import (
     encode_worker_session,
 )
 from .registration import SchedulerRegistration, WorkerRegistration
-from .synchronization import NPUEventSpec
-from .view import WorkerKVCacheSpec
 
 logger = logging.getLogger(__name__)
 

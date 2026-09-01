@@ -49,7 +49,7 @@ from .protocol import (
     worker_affinity_key,
 )
 from .registration import SchedulerRegistration, WorkerRegistration
-from .view import ConnectorOutputView
+from .scheduler_view import ConnectorOutputView
 
 _MAX_PENDING_REQUESTS = 64
 

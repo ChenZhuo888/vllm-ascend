@@ -24,11 +24,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendStoreKVConnectorWorkerMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import (
     ExportedKVCache,
     export_worker_kv_caches,
+    record_npu_event,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import record_npu_event
 
 if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool

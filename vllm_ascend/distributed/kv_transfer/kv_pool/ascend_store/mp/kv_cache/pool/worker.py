@@ -9,9 +9,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from ....metadata import AscendConnectorMetadata
 from ....pool_worker import KVPoolWorker
-from ..memory import ImportedKVCache, import_worker_kv_caches
-from ..synchronization import NPUEventSpec, import_npu_event
-from ..view import WorkerKVCacheSpec
+from ..npu_ipc import ImportedKVCache, NPUEventSpec, WorkerKVCacheSpec, import_npu_event, import_worker_kv_caches
 from .backend import create_mp_backend
 from .transfer import (
     MPKVCacheStoreKeyLayerRecvingThread,

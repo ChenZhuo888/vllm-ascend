@@ -6,7 +6,49 @@ from vllm.v1.core.kv_cache_utils import BlockHash
 
 from ....pool_scheduler import KVPoolScheduler
 from ..registration import SchedulerIdentity, SchedulerRegistration, WorkerLookupHandler
-from ..view import BlockPoolProxy, SchedulerOutputView
+from ..scheduler_view import SchedulerOutputView
+
+
+class _BlockIdIndex:
+    """Map block ids to themselves for inherited BlockPool bookkeeping.
+
+    The inherited code only uses blocks[id] to pass the result directly to
+    touch or free_blocks; it never reads a Block attribute.
+    """
+
+    def __getitem__(self, block_id: int) -> int:
+        return block_id
+
+
+class _BlockPoolProxy:
+    """Record server-side BlockPool operations for its Scheduler owner.
+
+    The inherited mamba bookkeeping reads blocks[id] and calls touch or
+    free_blocks on the object occupying its _block_pool slot. Recording those
+    ids lets the connector apply the operations to the real Scheduler-process
+    BlockPool after the RPC returns.
+    """
+
+    def __init__(self):
+        self.blocks = _BlockIdIndex()
+        self._touch_ids: list[int] = []
+        self._free_ids: list[int] = []
+
+    def touch(self, block_ids) -> None:
+        self._touch_ids.extend(block_ids)
+
+    def free_blocks(self, block_ids) -> None:
+        self._free_ids.extend(block_ids)
+
+    def take_touch_ids(self) -> list[int]:
+        ids = self._touch_ids
+        self._touch_ids = []
+        return ids
+
+    def take_free_ids(self) -> list[int]:
+        ids = self._free_ids
+        self._free_ids = []
+        return ids
 
 
 class _WorkerLookupBridge:
@@ -50,7 +92,7 @@ class MPKVPoolScheduler(KVPoolScheduler):
             page_size_bytes=registration.page_size_bytes,
         )
         self.client = _WorkerLookupBridge(registration.identity, lookup_handler)  # type: ignore[assignment]
-        self._block_pool = BlockPoolProxy()  # type: ignore[assignment]
+        self._block_pool = _BlockPoolProxy()  # type: ignore[assignment]
 
     # ==============================
     # Scheduler request state across RPC

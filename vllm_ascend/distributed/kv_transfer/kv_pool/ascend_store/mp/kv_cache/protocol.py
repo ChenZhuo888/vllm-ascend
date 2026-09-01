@@ -14,20 +14,19 @@ from vllm.v1.request import Request
 
 from ...metadata import AscendConnectorMetadata, AscendStoreKVConnectorWorkerMetadata
 from ..rpc import MPProtocolError
+from .npu_ipc import NPUEventSpec, WorkerKVCacheSpec
 from .registration import (
     SchedulerIdentity,
     SchedulerRegistration,
     WorkerIdentity,
     WorkerRegistration,
 )
-from .synchronization import NPUEventSpec
-from .view import (
+from .scheduler_view import (
     BlocksView,
     CachedReqsView,
     RequestView,
     ScheduledNewReqPayload,
     SchedulerOutputView,
-    WorkerKVCacheSpec,
 )
 
 ACK_RESPONSE = b"OK"

@@ -18,6 +18,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp import KVCacheClient, KVCacheMethod, KVCacheServer
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import (
+    NPUEventSpec,
+    WorkerKVCacheSpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     encode_lookup_response,
     encode_registration_request,
@@ -29,8 +33,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
     WorkerLookupHandler,
     WorkerRegistration,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPClient,
     MPRemoteError,

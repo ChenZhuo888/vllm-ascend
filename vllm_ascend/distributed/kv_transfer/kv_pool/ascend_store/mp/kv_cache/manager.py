@@ -14,6 +14,7 @@ from ...metadata import AscendConnectorMetadata, AscendStoreKVConnectorWorkerMet
 from ..rpc import TaskExecutor
 from ..service import ServiceLifecycleManager
 from .error import ServiceNotRegisteredError
+from .npu_ipc import NPUEventSpec, WorkerKVCacheSpec
 from .registration import (
     SchedulerIdentity,
     SchedulerRegistration,
@@ -21,14 +22,12 @@ from .registration import (
     WorkerLookupHandler,
     WorkerRegistration,
 )
-from .synchronization import NPUEventSpec
-from .view import (
+from .scheduler_view import (
     BlocksView,
     ConnectorOutputView,
     RequestIdView,
     RequestView,
     SchedulerOutputView,
-    WorkerKVCacheSpec,
 )
 
 if TYPE_CHECKING:

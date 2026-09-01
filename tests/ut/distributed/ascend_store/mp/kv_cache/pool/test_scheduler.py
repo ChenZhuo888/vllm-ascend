@@ -14,7 +14,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
     SchedulerIdentity,
     SchedulerRegistration,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.scheduler_view import (
     BlocksView,
     CachedReqsView,
     ConnectorOutputView,

@@ -29,8 +29,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protoc
     encode_get_kv_events_response,
     encode_lookup_response,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import (
+    NPUEventSpec,
+    WorkerKVCacheSpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import (
     MPRemoteError,
     MPRequestTimeoutError,

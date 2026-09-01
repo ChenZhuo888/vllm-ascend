@@ -5,12 +5,12 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.manager import KVCacheServiceManager
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import encode_registration
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import (
     SchedulerRegistration,
     WorkerRegistration,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import AffinityExecutor
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.service import StaleSessionError
 

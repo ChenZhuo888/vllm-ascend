@@ -32,8 +32,8 @@ from tests.e2e.pull_request.one_card.test_ascend_store_mp_ipc import (
 )
 
 if TYPE_CHECKING:
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import WorkerKVCacheSpec
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import WorkerRegistration
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 
 
 class _ModelConfig:

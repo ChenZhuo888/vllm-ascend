@@ -1,15 +1,63 @@
-"""NPU IPC export and import of Worker KV cache allocations."""
+"""NPU IPC mappings and ordering events shared with KVCacheServer.
+
+KV cache allocations and stream events require torch-npu IPC handles rather
+than ordinary serialization. Both paths identify the physical NPU by UUID so
+the server can recover the correct local device even when logical indices
+differ between processes.
+"""
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import cloudpickle
 import torch
 
-from .view import KVCacheStorageSpec, KVCacheTensorSpec, WorkerKVCacheSpec
-
 TORCH_NPU_IPC_HANDLE = "torch_npu_ipc"
 TORCH_NPU_IPC_VERSION = 1
+
+
+# ==============================
+# Worker KV cache mappings
+# ==============================
+
+# Registration exports each allocation once and describes every tensor view
+# separately. Source allocations and imported mappings remain referenced for
+# the lifetime of the corresponding client registration and Worker service.
+
+
+@dataclass(frozen=True)
+class KVCacheTensorSpec:
+    """Process-neutral layout of one tensor in a worker KV cache.
+
+    ``storage_index`` points to the corresponding opaque handle in
+    ``WorkerKVCacheSpec.storages``; no process-local address crosses the wire.
+    """
+
+    storage_index: int
+    storage_offset_bytes: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: str
+
+
+@dataclass(frozen=True)
+class KVCacheStorageSpec:
+    """Opaque IPC handle and source-device identity for one allocation."""
+
+    size_bytes: int
+    device_type: str
+    device_uuid: str
+    handle_type: str
+    handle_version: int
+    handle: bytes
+
+
+@dataclass(frozen=True)
+class WorkerKVCacheSpec:
+    """Storage handles and tensor layouts registered by one Worker."""
+
+    caches: dict[str, tuple[KVCacheTensorSpec, ...]]
+    storages: tuple[KVCacheStorageSpec, ...]
 
 
 class KVCacheStorageAdapter(Protocol):
@@ -71,7 +119,7 @@ class TorchNPUIPCAdapter:
 
         from torch_npu.multiprocessing.reductions import rebuild_npu_tensor
 
-        device_index = self._resolve_device(spec.device_uuid)
+        device_index = _resolve_device(spec.device_uuid, "KV cache")
         torch.npu.set_device(device_index)
         ipc_args = list(cloudpickle.loads(spec.handle))
         if len(ipc_args) <= 6:
@@ -80,15 +128,6 @@ class TorchNPUIPCAdapter:
         # Logical device indices may differ between the Worker and server.
         ipc_args[6] = device_index
         return rebuild_npu_tensor(*ipc_args), device_index
-
-    @staticmethod
-    def _resolve_device(device_uuid: str) -> int:
-        from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import npu_generate_uuid
-
-        for device_index in range(torch.npu.device_count()):
-            if npu_generate_uuid(device_index) == device_uuid:
-                return device_index
-        raise ValueError(f"No local NPU matches KV cache device UUID {device_uuid!r}")
 
 
 def export_worker_kv_caches(
@@ -272,3 +311,86 @@ def _decode_dtype(value: str) -> torch.dtype:
     if not isinstance(dtype, torch.dtype):
         raise ValueError(f"Unsupported KV cache dtype {value!r}")
     return dtype
+
+
+# ==============================
+# NPU event ordering across processes
+# ==============================
+
+# Events are recorded on the source Worker stream and only their IPC handles
+# cross the process boundary. Keeping the source event alive and importing it
+# on the matching NPU preserves that stream order without recording a substitute
+# event inside KVCacheServer.
+
+
+@dataclass(frozen=True)
+class NPUEventSpec:
+    """Process-neutral identity and IPC handle for one NPU event."""
+
+    device_uuid: str
+    handle: bytes
+
+
+@dataclass
+class ExportedNPUEvent:
+    """Keep the source event alive while another process imports it."""
+
+    spec: NPUEventSpec
+    _event: Any | None
+
+    def close(self) -> None:
+        self._event = None
+
+
+def record_npu_event(stream: Any | None = None) -> ExportedNPUEvent:
+    """Record and export an event on the current logical NPU device."""
+    from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import npu_generate_uuid
+
+    device_index = torch.npu.current_device()
+    event = torch.npu.Event(interprocess=True)
+    if stream is None:
+        event.record()
+    else:
+        event.record(stream)
+    handle = event.ipc_handle()
+    if not isinstance(handle, bytes) or not handle:
+        raise RuntimeError("torch-npu returned an invalid NPU event IPC handle")
+    return ExportedNPUEvent(NPUEventSpec(npu_generate_uuid(device_index), handle), event)
+
+
+def import_npu_event(spec: NPUEventSpec) -> Any:
+    """Rebuild an event on the local logical device matching its UUID."""
+    if not isinstance(spec, NPUEventSpec):
+        raise TypeError(f"spec must be NPUEventSpec, got {type(spec).__name__}")
+    if not spec.device_uuid or not spec.handle:
+        raise ValueError("NPU event specification is incomplete")
+
+    device_index = _resolve_device(spec.device_uuid, "event")
+    torch.npu.set_device(device_index)
+    return torch.npu.Event.from_ipc_handle(device_index, spec.handle)
+
+
+def _resolve_device(device_uuid: str, resource: str) -> int:
+    from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import npu_generate_uuid
+
+    for device_index in range(torch.npu.device_count()):
+        if npu_generate_uuid(device_index) == device_uuid:
+            return device_index
+    raise ValueError(f"No local NPU matches {resource} device UUID {device_uuid!r}")
+
+
+__all__ = [
+    "ExportedKVCache",
+    "ExportedNPUEvent",
+    "ImportedKVCache",
+    "KVCacheStorageAdapter",
+    "KVCacheStorageSpec",
+    "KVCacheTensorSpec",
+    "NPUEventSpec",
+    "TorchNPUIPCAdapter",
+    "WorkerKVCacheSpec",
+    "export_worker_kv_caches",
+    "import_npu_event",
+    "import_worker_kv_caches",
+    "record_npu_event",
+]

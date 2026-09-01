@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 if TYPE_CHECKING:
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import WorkerKVCacheSpec
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import WorkerRegistration
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import WorkerKVCacheSpec
 
 _MESSAGE_TIMEOUT_S = 60.0
 _PROCESS_EXIT_TIMEOUT_S = 10.0
@@ -215,10 +215,8 @@ def _producer(connection: Connection) -> None:
         import torch
         import torch_npu  # noqa: F401
 
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import (
             export_worker_kv_caches,
-        )
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import (
             record_npu_event,
         )
 
@@ -255,11 +253,9 @@ def _consumer(connection: Connection, specs) -> None:
         import torch
         import torch_npu  # noqa: F401
 
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.memory import (
-            import_worker_kv_caches,
-        )
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import (
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import (
             import_npu_event,
+            import_worker_kv_caches,
         )
 
         if not torch.npu.is_available():

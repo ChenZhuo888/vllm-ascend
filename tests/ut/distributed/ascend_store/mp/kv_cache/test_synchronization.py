@@ -5,7 +5,7 @@ import torch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import (
     NPUEventSpec,
     import_npu_event,
     record_npu_event,

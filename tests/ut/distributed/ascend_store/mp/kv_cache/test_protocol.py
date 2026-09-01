@@ -10,6 +10,12 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache import protocol as kv_cache_protocol
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import (
+    KVCacheStorageSpec,
+    KVCacheTensorSpec,
+    NPUEventSpec,
+    WorkerKVCacheSpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
     ACK_RESPONSE,
     KVCacheMethod,
@@ -74,12 +80,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.regist
     SchedulerRegistration,
     WorkerIdentity,
     WorkerRegistration,
-)
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.synchronization import NPUEventSpec
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.view import (
-    KVCacheStorageSpec,
-    KVCacheTensorSpec,
-    WorkerKVCacheSpec,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import MPProtocolError
 
