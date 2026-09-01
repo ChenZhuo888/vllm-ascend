@@ -1,4 +1,11 @@
-"""KV cache RPC methods and payload codecs."""
+"""Define the cross-process contract for KV cache RPCs.
+
+Requests expose the logical service identity and session before their
+serialized body, allowing the server to choose the service's executor thread
+without decoding business data. Codecs project live vLLM objects into
+metadata-only views and validate the process boundary; service behavior remains
+in the client, server, and manager.
+"""
 
 import enum
 from collections.abc import Sequence
@@ -64,20 +71,15 @@ class KVCacheMethod(str, enum.Enum):
     GET_BLOCK_IDS_WITH_LOAD_ERRORS = "GET_BLOCK_IDS_WITH_LOAD_ERRORS"
 
 
-@dataclass
-class LookupRequestView:
-    """Request fields used by lookup; prompt_token_ids preserves length only."""
+# ==============================
+# Service registration and session lifecycle
+# ==============================
 
-    request_id: str
-    prompt_token_ids: range
-    block_hashes: list[BlockHash]
-    num_tokens: int
-
-
-def decode_ack_response(responses: Sequence[bytes], method: KVCacheMethod) -> None:
-    response = _single_response(responses, method.value)
-    if response != ACK_RESPONSE:
-        raise MPProtocolError(f"{method.value} expects an OK response, got {response!r}")
+# Registration binds a configuration to one identity and session. Identity and
+# session are repeated outside the serialized registration so routing happens
+# before decoding and the decoded body can be checked against its header. Worker
+# recovery also restores its fixed cache mapping before the client reports the
+# service as registered; renew and unregister reuse the same header without a body.
 
 
 def encode_registration(registration: _Registration) -> bytes:
@@ -190,209 +192,24 @@ def decode_register_kv_caches_request(
     return identity, session_id, spec
 
 
-def encode_wait_for_save_request(
-    registration: WorkerRegistration,
-    metadata: AscendConnectorMetadata,
-    event_spec: NPUEventSpec,
-) -> tuple[bytes, ...]:
-    if not isinstance(metadata, AscendConnectorMetadata):
-        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
-    if not isinstance(event_spec, NPUEventSpec):
-        raise TypeError(f"event_spec must be NPUEventSpec, got {type(event_spec).__name__}")
-    return _encode_worker_request(
-        registration,
-        {"metadata": metadata, "event_spec": event_spec},
-        KVCacheMethod.WAIT_FOR_SAVE,
-    )
+# ==============================
+# Scheduler request lifecycle
+# ==============================
+
+# Scheduler RPCs turn live vLLM request and scheduling objects into the
+# metadata-only views kept by the server-side Scheduler. Together they carry
+# one request from cache lookup through allocation and completion, while
+# responses return only cache decisions and local block-pool updates.
 
 
-def decode_wait_for_save_request(
-    payloads: tuple[bytes, ...],
-) -> tuple[WorkerIdentity, str, AscendConnectorMetadata, NPUEventSpec]:
-    method = KVCacheMethod.WAIT_FOR_SAVE
-    identity, session_id, body = _decode_worker_request(payloads, method)
-    metadata, event_spec = _body_fields(body, method.value, "metadata", "event_spec")
-    _require_type(metadata, AscendConnectorMetadata, "metadata")
-    _require_type(event_spec, NPUEventSpec, "event_spec")
-    return identity, session_id, metadata, event_spec
+@dataclass
+class LookupRequestView:
+    """Request fields used by lookup; prompt_token_ids preserves length only."""
 
-
-def encode_get_finished_request(
-    registration: WorkerRegistration,
-    finished_req_ids: set[str],
-    metadata: AscendConnectorMetadata,
-) -> tuple[bytes, ...]:
-    if not isinstance(metadata, AscendConnectorMetadata):
-        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
-    return _encode_worker_request(
-        registration,
-        {"finished_req_ids": _validate_text_set(finished_req_ids, "finished_req_ids"), "metadata": metadata},
-        KVCacheMethod.GET_FINISHED,
-    )
-
-
-def decode_get_finished_request(
-    payloads: tuple[bytes, ...],
-) -> tuple[WorkerIdentity, str, set[str], AscendConnectorMetadata]:
-    method = KVCacheMethod.GET_FINISHED
-    identity, session_id, body = _decode_worker_request(payloads, method)
-    finished_req_ids, metadata = _body_fields(body, method.value, "finished_req_ids", "metadata")
-    _require_type(metadata, AscendConnectorMetadata, "metadata")
-    return identity, session_id, _decode_text_set(finished_req_ids, "finished_req_ids"), metadata
-
-
-def encode_get_finished_response(
-    done_sending: set[str],
-    done_recving: set[str],
-) -> tuple[bytes, ...]:
-    return _encode_response(
-        KVCacheMethod.GET_FINISHED,
-        {
-            "done_sending": _validate_text_set(done_sending, "done_sending"),
-            "done_recving": _validate_text_set(done_recving, "done_recving"),
-        },
-    )
-
-
-def decode_get_finished_response(responses: Sequence[bytes]) -> tuple[set[str], set[str]]:
-    body = _decode_response(responses, KVCacheMethod.GET_FINISHED)
-    done_sending, done_recving = _body_fields(
-        body,
-        "GET_FINISHED response",
-        "done_sending",
-        "done_recving",
-    )
-    return _decode_text_set(done_sending, "done_sending"), _decode_text_set(done_recving, "done_recving")
-
-
-def encode_build_connector_worker_meta_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
-    return _encode_empty_worker_request(registration, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
-
-
-def decode_build_connector_worker_meta_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
-    return _decode_empty_worker_request(payloads, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
-
-
-def encode_build_connector_worker_meta_response(
-    metadata: AscendStoreKVConnectorWorkerMetadata | None,
-) -> tuple[bytes, ...]:
-    if metadata is not None and not isinstance(metadata, AscendStoreKVConnectorWorkerMetadata):
-        raise TypeError(f"metadata must be AscendStoreKVConnectorWorkerMetadata or None, got {type(metadata).__name__}")
-    return _encode_response(KVCacheMethod.BUILD_CONNECTOR_WORKER_META, {"metadata": metadata})
-
-
-def decode_build_connector_worker_meta_response(
-    responses: Sequence[bytes],
-) -> AscendStoreKVConnectorWorkerMetadata | None:
-    body = _decode_response(responses, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
-    (metadata,) = _body_fields(body, "BUILD_CONNECTOR_WORKER_META response", "metadata")
-    if metadata is not None:
-        _require_type(metadata, AscendStoreKVConnectorWorkerMetadata, "metadata")
-    return metadata
-
-
-def encode_get_kv_events_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
-    return _encode_empty_worker_request(registration, KVCacheMethod.GET_KV_EVENTS)
-
-
-def decode_get_kv_events_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
-    return _decode_empty_worker_request(payloads, KVCacheMethod.GET_KV_EVENTS)
-
-
-def encode_get_kv_events_response(events: list[BlockStored]) -> tuple[bytes, ...]:
-    if not isinstance(events, list):
-        raise TypeError(f"events must be a list, got {type(events).__name__}")
-    for event in events:
-        if not isinstance(event, BlockStored):
-            raise TypeError(f"event must be BlockStored, got {type(event).__name__}")
-    return _encode_response(KVCacheMethod.GET_KV_EVENTS, {"events": events})
-
-
-def decode_get_kv_events_response(responses: Sequence[bytes]) -> list[BlockStored]:
-    body = _decode_response(responses, KVCacheMethod.GET_KV_EVENTS)
-    (events,) = _body_fields(body, "GET_KV_EVENTS response", "events")
-    if not isinstance(events, list):
-        raise MPProtocolError(f"events must be a list, got {type(events).__name__}")
-    for event in events:
-        _require_type(event, BlockStored, "event")
-    return events
-
-
-def encode_start_load_kv_request(
-    registration: WorkerRegistration,
-    metadata: AscendConnectorMetadata,
-) -> tuple[bytes, ...]:
-    if not isinstance(metadata, AscendConnectorMetadata):
-        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
-    return _encode_worker_request(registration, {"metadata": metadata}, KVCacheMethod.START_LOAD_KV)
-
-
-def decode_start_load_kv_request(
-    payloads: tuple[bytes, ...],
-) -> tuple[WorkerIdentity, str, AscendConnectorMetadata]:
-    method = KVCacheMethod.START_LOAD_KV
-    identity, session_id, body = _decode_worker_request(payloads, method)
-    (metadata,) = _body_fields(body, method.value, "metadata")
-    _require_type(metadata, AscendConnectorMetadata, "metadata")
-    return identity, session_id, metadata
-
-
-def encode_wait_for_layer_load_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
-    return _encode_empty_worker_request(registration, KVCacheMethod.WAIT_FOR_LAYER_LOAD)
-
-
-def decode_wait_for_layer_load_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
-    return _decode_empty_worker_request(payloads, KVCacheMethod.WAIT_FOR_LAYER_LOAD)
-
-
-def encode_save_kv_layer_request(
-    registration: WorkerRegistration,
-    event_spec: NPUEventSpec,
-) -> tuple[bytes, ...]:
-    if not isinstance(event_spec, NPUEventSpec):
-        raise TypeError(f"event_spec must be NPUEventSpec, got {type(event_spec).__name__}")
-    return _encode_worker_request(registration, {"event_spec": event_spec}, KVCacheMethod.SAVE_KV_LAYER)
-
-
-def decode_save_kv_layer_request(
-    payloads: tuple[bytes, ...],
-) -> tuple[WorkerIdentity, str, NPUEventSpec]:
-    method = KVCacheMethod.SAVE_KV_LAYER
-    identity, session_id, body = _decode_worker_request(payloads, method)
-    (event_spec,) = _body_fields(body, method.value, "event_spec")
-    _require_type(event_spec, NPUEventSpec, "event_spec")
-    return identity, session_id, event_spec
-
-
-def encode_get_block_ids_with_load_errors_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
-    return _encode_empty_worker_request(registration, KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS)
-
-
-def decode_get_block_ids_with_load_errors_request(
-    payloads: tuple[bytes, ...],
-) -> tuple[WorkerIdentity, str]:
-    return _decode_empty_worker_request(payloads, KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS)
-
-
-def encode_get_block_ids_with_load_errors_response(block_ids: set[int]) -> tuple[bytes, ...]:
-    return _encode_response(
-        KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS,
-        {"block_ids": _validate_non_negative_int_set(block_ids, "block_ids")},
-    )
-
-
-def decode_get_block_ids_with_load_errors_response(responses: Sequence[bytes]) -> set[int]:
-    body = _decode_response(responses, KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS)
-    (block_ids,) = _body_fields(body, "GET_BLOCK_IDS_WITH_LOAD_ERRORS response", "block_ids")
-    return _decode_non_negative_int_set(block_ids, "block_ids")
-
-
-def scheduler_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
-    return _decode_scheduler_identity(payloads)
-
-
-def worker_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> WorkerIdentity:
-    return _decode_worker_identity(payloads)
+    request_id: str
+    prompt_token_ids: range
+    block_hashes: list[BlockHash]
+    num_tokens: int
 
 
 def encode_lookup_request(
@@ -610,6 +427,231 @@ def decode_update_connector_output_response(responses: Sequence[bytes]) -> list[
     return _decode_list(free_block_ids, "free_block_ids")
 
 
+# ==============================
+# Worker transfer lifecycle
+# ==============================
+
+# Worker RPCs coordinate transfer work after the fixed cache mapping is active.
+# Messages carry serializable metadata and NPU IPC descriptions across the
+# process boundary; imported tensors, events, transfer threads, and progress
+# remain owned by the server-side Worker.
+
+
+def encode_wait_for_save_request(
+    registration: WorkerRegistration,
+    metadata: AscendConnectorMetadata,
+    event_spec: NPUEventSpec,
+) -> tuple[bytes, ...]:
+    if not isinstance(metadata, AscendConnectorMetadata):
+        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
+    if not isinstance(event_spec, NPUEventSpec):
+        raise TypeError(f"event_spec must be NPUEventSpec, got {type(event_spec).__name__}")
+    return _encode_worker_request(
+        registration,
+        {"metadata": metadata, "event_spec": event_spec},
+        KVCacheMethod.WAIT_FOR_SAVE,
+    )
+
+
+def decode_wait_for_save_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str, AscendConnectorMetadata, NPUEventSpec]:
+    method = KVCacheMethod.WAIT_FOR_SAVE
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    metadata, event_spec = _body_fields(body, method.value, "metadata", "event_spec")
+    _require_type(metadata, AscendConnectorMetadata, "metadata")
+    _require_type(event_spec, NPUEventSpec, "event_spec")
+    return identity, session_id, metadata, event_spec
+
+
+def encode_get_finished_request(
+    registration: WorkerRegistration,
+    finished_req_ids: set[str],
+    metadata: AscendConnectorMetadata,
+) -> tuple[bytes, ...]:
+    if not isinstance(metadata, AscendConnectorMetadata):
+        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
+    return _encode_worker_request(
+        registration,
+        {"finished_req_ids": _validate_text_set(finished_req_ids, "finished_req_ids"), "metadata": metadata},
+        KVCacheMethod.GET_FINISHED,
+    )
+
+
+def decode_get_finished_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str, set[str], AscendConnectorMetadata]:
+    method = KVCacheMethod.GET_FINISHED
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    finished_req_ids, metadata = _body_fields(body, method.value, "finished_req_ids", "metadata")
+    _require_type(metadata, AscendConnectorMetadata, "metadata")
+    return identity, session_id, _decode_text_set(finished_req_ids, "finished_req_ids"), metadata
+
+
+def encode_get_finished_response(
+    done_sending: set[str],
+    done_recving: set[str],
+) -> tuple[bytes, ...]:
+    return _encode_response(
+        KVCacheMethod.GET_FINISHED,
+        {
+            "done_sending": _validate_text_set(done_sending, "done_sending"),
+            "done_recving": _validate_text_set(done_recving, "done_recving"),
+        },
+    )
+
+
+def decode_get_finished_response(responses: Sequence[bytes]) -> tuple[set[str], set[str]]:
+    body = _decode_response(responses, KVCacheMethod.GET_FINISHED)
+    done_sending, done_recving = _body_fields(
+        body,
+        "GET_FINISHED response",
+        "done_sending",
+        "done_recving",
+    )
+    return _decode_text_set(done_sending, "done_sending"), _decode_text_set(done_recving, "done_recving")
+
+
+def encode_build_connector_worker_meta_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
+    return _encode_empty_worker_request(registration, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
+
+
+def decode_build_connector_worker_meta_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
+    return _decode_empty_worker_request(payloads, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
+
+
+def encode_build_connector_worker_meta_response(
+    metadata: AscendStoreKVConnectorWorkerMetadata | None,
+) -> tuple[bytes, ...]:
+    if metadata is not None and not isinstance(metadata, AscendStoreKVConnectorWorkerMetadata):
+        raise TypeError(f"metadata must be AscendStoreKVConnectorWorkerMetadata or None, got {type(metadata).__name__}")
+    return _encode_response(KVCacheMethod.BUILD_CONNECTOR_WORKER_META, {"metadata": metadata})
+
+
+def decode_build_connector_worker_meta_response(
+    responses: Sequence[bytes],
+) -> AscendStoreKVConnectorWorkerMetadata | None:
+    body = _decode_response(responses, KVCacheMethod.BUILD_CONNECTOR_WORKER_META)
+    (metadata,) = _body_fields(body, "BUILD_CONNECTOR_WORKER_META response", "metadata")
+    if metadata is not None:
+        _require_type(metadata, AscendStoreKVConnectorWorkerMetadata, "metadata")
+    return metadata
+
+
+def encode_get_kv_events_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
+    return _encode_empty_worker_request(registration, KVCacheMethod.GET_KV_EVENTS)
+
+
+def decode_get_kv_events_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
+    return _decode_empty_worker_request(payloads, KVCacheMethod.GET_KV_EVENTS)
+
+
+def encode_get_kv_events_response(events: list[BlockStored]) -> tuple[bytes, ...]:
+    if not isinstance(events, list):
+        raise TypeError(f"events must be a list, got {type(events).__name__}")
+    for event in events:
+        if not isinstance(event, BlockStored):
+            raise TypeError(f"event must be BlockStored, got {type(event).__name__}")
+    return _encode_response(KVCacheMethod.GET_KV_EVENTS, {"events": events})
+
+
+def decode_get_kv_events_response(responses: Sequence[bytes]) -> list[BlockStored]:
+    body = _decode_response(responses, KVCacheMethod.GET_KV_EVENTS)
+    (events,) = _body_fields(body, "GET_KV_EVENTS response", "events")
+    if not isinstance(events, list):
+        raise MPProtocolError(f"events must be a list, got {type(events).__name__}")
+    for event in events:
+        _require_type(event, BlockStored, "event")
+    return events
+
+
+def encode_start_load_kv_request(
+    registration: WorkerRegistration,
+    metadata: AscendConnectorMetadata,
+) -> tuple[bytes, ...]:
+    if not isinstance(metadata, AscendConnectorMetadata):
+        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
+    return _encode_worker_request(registration, {"metadata": metadata}, KVCacheMethod.START_LOAD_KV)
+
+
+def decode_start_load_kv_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str, AscendConnectorMetadata]:
+    method = KVCacheMethod.START_LOAD_KV
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    (metadata,) = _body_fields(body, method.value, "metadata")
+    _require_type(metadata, AscendConnectorMetadata, "metadata")
+    return identity, session_id, metadata
+
+
+def encode_wait_for_layer_load_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
+    return _encode_empty_worker_request(registration, KVCacheMethod.WAIT_FOR_LAYER_LOAD)
+
+
+def decode_wait_for_layer_load_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIdentity, str]:
+    return _decode_empty_worker_request(payloads, KVCacheMethod.WAIT_FOR_LAYER_LOAD)
+
+
+def encode_save_kv_layer_request(
+    registration: WorkerRegistration,
+    event_spec: NPUEventSpec,
+) -> tuple[bytes, ...]:
+    if not isinstance(event_spec, NPUEventSpec):
+        raise TypeError(f"event_spec must be NPUEventSpec, got {type(event_spec).__name__}")
+    return _encode_worker_request(registration, {"event_spec": event_spec}, KVCacheMethod.SAVE_KV_LAYER)
+
+
+def decode_save_kv_layer_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str, NPUEventSpec]:
+    method = KVCacheMethod.SAVE_KV_LAYER
+    identity, session_id, body = _decode_worker_request(payloads, method)
+    (event_spec,) = _body_fields(body, method.value, "event_spec")
+    _require_type(event_spec, NPUEventSpec, "event_spec")
+    return identity, session_id, event_spec
+
+
+def encode_get_block_ids_with_load_errors_request(registration: WorkerRegistration) -> tuple[bytes, ...]:
+    return _encode_empty_worker_request(registration, KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS)
+
+
+def decode_get_block_ids_with_load_errors_request(
+    payloads: tuple[bytes, ...],
+) -> tuple[WorkerIdentity, str]:
+    return _decode_empty_worker_request(payloads, KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS)
+
+
+def encode_get_block_ids_with_load_errors_response(block_ids: set[int]) -> tuple[bytes, ...]:
+    return _encode_response(
+        KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS,
+        {"block_ids": _validate_non_negative_int_set(block_ids, "block_ids")},
+    )
+
+
+def decode_get_block_ids_with_load_errors_response(responses: Sequence[bytes]) -> set[int]:
+    body = _decode_response(responses, KVCacheMethod.GET_BLOCK_IDS_WITH_LOAD_ERRORS)
+    (block_ids,) = _body_fields(body, "GET_BLOCK_IDS_WITH_LOAD_ERRORS response", "block_ids")
+    return _decode_non_negative_int_set(block_ids, "block_ids")
+
+
+# ==============================
+# Identity-keyed RPC envelopes
+# ==============================
+
+# Scheduler and Worker envelopes expose their logical identity in fixed leading
+# frames, followed by the session and serialized body. Route key factories read
+# only that prefix on the RPC I/O thread, letting the affinity executor run work
+# for one service in order before a handler decodes the full request.
+
+
+def scheduler_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> SchedulerIdentity:
+    return _decode_scheduler_identity(payloads)
+
+
+def worker_affinity_key(_client_identity: bytes, payloads: tuple[bytes, ...]) -> WorkerIdentity:
+    return _decode_worker_identity(payloads)
+
+
 def _encode_scheduler_request(
     registration: SchedulerRegistration,
     body: dict,
@@ -699,6 +741,61 @@ def _decode_worker_envelope(
     return _decode_worker_identity(payloads), _decode_text(payloads[3], "session_id"), payloads[4]
 
 
+def _require_payload_count(payloads: Sequence[bytes], expected: int, method: str) -> None:
+    if len(payloads) != expected:
+        raise MPProtocolError(f"{method} expects {expected} payloads, got {len(payloads)}")
+
+
+def _encode_scheduler_identity(identity: SchedulerIdentity) -> tuple[bytes, ...]:
+    return (
+        _encode_text(identity.engine_id, "engine_id"),
+        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
+    )
+
+
+def _decode_scheduler_identity(payloads: Sequence[bytes]) -> SchedulerIdentity:
+    if len(payloads) < 2:
+        raise MPProtocolError(f"Scheduler identity expects at least 2 payloads, got {len(payloads)}")
+    return SchedulerIdentity(
+        engine_id=_decode_text(payloads[0], "engine_id"),
+        data_parallel_rank=_decode_non_negative_int(payloads[1], "data_parallel_rank"),
+    )
+
+
+def _encode_worker_identity(identity: WorkerIdentity) -> tuple[bytes, ...]:
+    return (
+        _encode_text(identity.engine_id, "engine_id"),
+        _encode_non_negative_int(identity.rank, "rank"),
+        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
+    )
+
+
+def _decode_worker_identity(payloads: Sequence[bytes]) -> WorkerIdentity:
+    if len(payloads) < 3:
+        raise MPProtocolError(f"Worker identity expects at least 3 payloads, got {len(payloads)}")
+    return WorkerIdentity(
+        engine_id=_decode_text(payloads[0], "engine_id"),
+        rank=_decode_non_negative_int(payloads[1], "rank"),
+        data_parallel_rank=_decode_non_negative_int(payloads[2], "data_parallel_rank"),
+    )
+
+
+# ==============================
+# Serialized bodies and boundary validation
+# ==============================
+
+# Every business body is one cloudpickled dictionary frame and every structured
+# response is one frame. Encoders reject invalid local values before sending;
+# decoders turn malformed peer data into MPProtocolError so wire failures remain
+# distinct from service failures.
+
+
+def decode_ack_response(responses: Sequence[bytes], method: KVCacheMethod) -> None:
+    response = _single_response(responses, method.value)
+    if response != ACK_RESPONSE:
+        raise MPProtocolError(f"{method.value} expects an OK response, got {response!r}")
+
+
 def _encode_response(method: KVCacheMethod, body: dict) -> tuple[bytes, ...]:
     return (_encode_body(body, f"{method.value} response"),)
 
@@ -746,45 +843,6 @@ def _require_type(value, expected_type: type, field_name: str) -> None:
 def _require_empty_body(body: bytes, method: str) -> None:
     if body:
         raise MPProtocolError(f"{method} body must be empty")
-
-
-def _require_payload_count(payloads: Sequence[bytes], expected: int, method: str) -> None:
-    if len(payloads) != expected:
-        raise MPProtocolError(f"{method} expects {expected} payloads, got {len(payloads)}")
-
-
-def _encode_scheduler_identity(identity: SchedulerIdentity) -> tuple[bytes, ...]:
-    return (
-        _encode_text(identity.engine_id, "engine_id"),
-        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
-    )
-
-
-def _decode_scheduler_identity(payloads: Sequence[bytes]) -> SchedulerIdentity:
-    if len(payloads) < 2:
-        raise MPProtocolError(f"Scheduler identity expects at least 2 payloads, got {len(payloads)}")
-    return SchedulerIdentity(
-        engine_id=_decode_text(payloads[0], "engine_id"),
-        data_parallel_rank=_decode_non_negative_int(payloads[1], "data_parallel_rank"),
-    )
-
-
-def _encode_worker_identity(identity: WorkerIdentity) -> tuple[bytes, ...]:
-    return (
-        _encode_text(identity.engine_id, "engine_id"),
-        _encode_non_negative_int(identity.rank, "rank"),
-        _encode_non_negative_int(identity.data_parallel_rank, "data_parallel_rank"),
-    )
-
-
-def _decode_worker_identity(payloads: Sequence[bytes]) -> WorkerIdentity:
-    if len(payloads) < 3:
-        raise MPProtocolError(f"Worker identity expects at least 3 payloads, got {len(payloads)}")
-    return WorkerIdentity(
-        engine_id=_decode_text(payloads[0], "engine_id"),
-        rank=_decode_non_negative_int(payloads[1], "rank"),
-        data_parallel_rank=_decode_non_negative_int(payloads[2], "data_parallel_rank"),
-    )
 
 
 def _encode_non_negative_int(value: int, field_name: str) -> bytes:
