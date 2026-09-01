@@ -503,35 +503,14 @@ _LEGACY_SESSION_ID = "legacy"
 WorkerLookupHandler = Callable[["SchedulerIdentity", int, Sequence[BlockHash], list[int] | None, bool, int], int]
 
 
-def _validate_engine_id(engine_id: str) -> None:
-    if not isinstance(engine_id, str):
-        raise TypeError(f"engine_id must be a string, got {type(engine_id).__name__}")
-    if not engine_id:
-        raise ValueError("engine_id must not be empty")
-
-
-def _validate_rank(rank: int, field_name: str) -> None:
-    if not isinstance(rank, int) or isinstance(rank, bool):
-        raise TypeError(f"{field_name} must be an integer, got {type(rank).__name__}")
-    if rank < 0:
-        raise ValueError(f"{field_name} must not be negative, got {rank}")
-
-
-def _validate_session_id(session_id: str) -> None:
-    if not isinstance(session_id, str):
-        raise TypeError(f"session_id must be a string, got {type(session_id).__name__}")
-    if not session_id:
-        raise ValueError("session_id must not be empty")
-
-
 @dataclass(frozen=True)
 class SchedulerIdentity:
     engine_id: str
     data_parallel_rank: int = 0
 
     def __post_init__(self) -> None:
-        _validate_engine_id(self.engine_id)
-        _validate_rank(self.data_parallel_rank, "data_parallel_rank")
+        _require_non_empty_str(self.engine_id, "engine_id")
+        _require_non_negative_int(self.data_parallel_rank, "data_parallel_rank")
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> SchedulerIdentity:
@@ -558,9 +537,9 @@ class WorkerIdentity:
     data_parallel_rank: int = 0
 
     def __post_init__(self) -> None:
-        _validate_engine_id(self.engine_id)
-        _validate_rank(self.rank, "rank")
-        _validate_rank(self.data_parallel_rank, "data_parallel_rank")
+        _require_non_empty_str(self.engine_id, "engine_id")
+        _require_non_negative_int(self.rank, "rank")
+        _require_non_negative_int(self.data_parallel_rank, "data_parallel_rank")
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> WorkerIdentity:
@@ -590,7 +569,7 @@ class SchedulerRegistration:
     session_id: str = _LEGACY_SESSION_ID
 
     def __post_init__(self) -> None:
-        _validate_session_id(self.session_id)
+        _require_non_empty_str(self.session_id, "session_id")
 
     @classmethod
     def create(
@@ -600,7 +579,7 @@ class SchedulerRegistration:
         page_size_bytes: int,
         session_id: str = _LEGACY_SESSION_ID,
     ) -> SchedulerRegistration:
-        _validate_rank(page_size_bytes, "page_size_bytes")
+        _require_non_negative_int(page_size_bytes, "page_size_bytes")
         return cls(
             identity=SchedulerIdentity.from_vllm_config(vllm_config),
             config=KVPoolConfigSpec.from_vllm_config(vllm_config, kv_cache_config),
@@ -616,7 +595,7 @@ class WorkerRegistration:
     session_id: str = _LEGACY_SESSION_ID
 
     def __post_init__(self) -> None:
-        _validate_session_id(self.session_id)
+        _require_non_empty_str(self.session_id, "session_id")
 
     @classmethod
     def create(

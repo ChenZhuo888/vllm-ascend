@@ -243,6 +243,14 @@ def test_registration_rejects_invalid_required_configuration(section, field, val
         SchedulerRegistration.create(config, None, 0)
 
 
+@pytest.mark.parametrize("page_size_bytes", ["4096", -1, True])
+def test_registration_rejects_invalid_page_size_bytes(page_size_bytes) -> None:
+    config = _make_vllm_config()
+
+    with pytest.raises(TypeError, match="page_size_bytes must be a non-negative integer"):
+        SchedulerRegistration.create(config, None, page_size_bytes)
+
+
 def test_registration_preserves_optional_configuration() -> None:
     config = _make_vllm_config()
     hf_config = SimpleNamespace(num_hidden_layers=2)
