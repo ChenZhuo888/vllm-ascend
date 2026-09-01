@@ -342,9 +342,9 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         if not isinstance(metadata, AscendConnectorMetadata):
             raise TypeError(f"Expected AscendConnectorMetadata, got {type(metadata).__name__}")
         done_sending, done_recving = self._kv_cache_client.get_finished(finished_req_ids, metadata)
-        # A Store rejected before server admission has no remote completion
-        # to poll, so delayed-free requests are reported complete locally
-        # exactly once.
+        # A Store without a successful remote acknowledgement may never appear in
+        # completion results. Report delayed-free requests complete locally once so
+        # vLLM can release their blocks instead of waiting indefinitely.
         locally_finished = self._locally_finished_store_req_ids & metadata.delayed_free_req_ids
         self._locally_finished_store_req_ids -= locally_finished
         return done_sending | locally_finished, done_recving
