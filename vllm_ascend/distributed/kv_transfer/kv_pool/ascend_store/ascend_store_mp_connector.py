@@ -37,6 +37,8 @@ _KV_CACHE_SERVER_URL_KEY = "kv_cache_server_url"
 
 
 class AscendStoreMPConnectorMetadata(KVConnectorMetadata):
+    """Empty metadata returned when the remote Scheduler is unavailable."""
+
     pass
 
 
@@ -53,6 +55,14 @@ def _get_kv_cache_server_url(vllm_config: VllmConfig) -> str:
 
 
 class AscendStoreMPConnector(KVConnectorBase_V1):
+    """Bridge one vLLM connector role to a process-hosted KV cache service.
+
+    Each instance registers either a Scheduler or Worker service. Scheduler
+    callbacks keep live vLLM state local and apply commands returned by the
+    remote service; Worker callbacks keep source NPU resources alive while
+    passing process-neutral descriptions to the server-side transfer runtime.
+    """
+
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         return extra_config.get("use_layerwise", False)
@@ -112,6 +122,28 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
             self._kv_cache_client.close()
             raise
 
+    def _require_scheduler_role(self, action: str) -> None:
+        if self.role != KVConnectorRole.SCHEDULER:
+            raise RuntimeError(f"{action} is only available on the scheduler connector")
+
+    def _require_worker_role(self, action: str) -> None:
+        if self.role != KVConnectorRole.WORKER:
+            raise RuntimeError(f"{action} is only available on the worker connector")
+
+    # ==============================
+    # Scheduler state kept in the vLLM process
+    # ==============================
+
+    # Scheduler callbacks keep live requests, the real BlockPool, and KV event
+    # aggregation in the vLLM process. The remote service receives metadata
+    # snapshots and returns cache decisions plus touch/free commands, which are
+    # applied here to the local state it cannot own.
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        # The BlockPool never crosses the process border; the server's mamba
+        # bookkeeping returns block-id commands that are replayed on it here.
+        self._gpu_block_pool = gpu_block_pool
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -127,14 +159,6 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         self._local_requests[request.request_id] = request
         self._synced_token_len[request.request_id] = len(request.prompt_token_ids)
         self._kv_cache_client.update_state_after_alloc(request, blocks, num_external_tokens)
-
-    def _require_scheduler_role(self, action: str) -> None:
-        if self.role != KVConnectorRole.SCHEDULER:
-            raise RuntimeError(f"{action} is only available on the scheduler connector")
-
-    def _require_worker_role(self, action: str) -> None:
-        if self.role != KVConnectorRole.WORKER:
-            raise RuntimeError(f"{action} is only available on the worker connector")
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         self._require_scheduler_role("build_connector_meta")
@@ -164,11 +188,6 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
                 increments[req_id] = list(all_token_ids[start:])
             self._synced_token_len[req_id] = len(all_token_ids)
         return increments
-
-    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
-        # The BlockPool never crosses the process border; the server's mamba
-        # bookkeeping returns block-id commands that are replayed on it here.
-        self._gpu_block_pool = gpu_block_pool
 
     def request_finished(self, request: Request, block_ids: list[int]) -> tuple[bool, dict[str, Any] | None]:
         return self._finish_request(request, block_ids, all_groups=False)
@@ -214,6 +233,17 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
             yield from kv_cache_events
             self._kv_cache_events = None
 
+    # ==============================
+    # Worker transfers and NPU resource lifetime
+    # ==============================
+
+    # A Worker keeps its original cache allocations and records ordering events
+    # on its own NPU stream. A successful cache export stays alive until
+    # shutdown, while per-step event handles stay alive through their RPC; only
+    # process-neutral descriptions cross to the service. Local completion and
+    # load-error sets preserve safe fallback behavior when remote work is
+    # unavailable.
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         self._require_worker_role("register_kv_caches")
         with self._kv_cache_export_lock:
@@ -244,6 +274,16 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         self._pending_load_block_ids.update(load_block_ids)
         if not self._kv_cache_client.start_load_kv(metadata):
             self._local_load_error_block_ids.update(load_block_ids)
+
+    @staticmethod
+    def _collect_load_block_ids(metadata: AscendConnectorMetadata) -> set[int]:
+        block_ids: set[int] = set()
+        for request in metadata.requests:
+            if request.load_spec is None or not request.load_spec.can_load:
+                continue
+            if len(request.block_ids_by_group) == 1:
+                block_ids.update(block_id for block_id in request.block_ids_by_group[0] if block_id > 0)
+        return block_ids
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
@@ -302,6 +342,9 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         if not isinstance(metadata, AscendConnectorMetadata):
             raise TypeError(f"Expected AscendConnectorMetadata, got {type(metadata).__name__}")
         done_sending, done_recving = self._kv_cache_client.get_finished(finished_req_ids, metadata)
+        # A Store rejected before server admission has no remote completion
+        # to poll, so delayed-free requests are reported complete locally
+        # exactly once.
         locally_finished = self._locally_finished_store_req_ids & metadata.delayed_free_req_ids
         self._locally_finished_store_req_ids -= locally_finished
         return done_sending | locally_finished, done_recving
@@ -310,6 +353,8 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         self._require_worker_role("get_block_ids_with_load_errors")
         server_errors = self._kv_cache_client.get_block_ids_with_load_errors()
         load_errors = self._local_load_error_block_ids
+        # If the server cannot report load results, every pending block is
+        # unsafe.
         if server_errors is None:
             load_errors.update(self._pending_load_block_ids)
         else:
@@ -332,15 +377,14 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         kv_cache_events.add_events(events)
         return kv_cache_events
 
-    @staticmethod
-    def _collect_load_block_ids(metadata: AscendConnectorMetadata) -> set[int]:
-        block_ids: set[int] = set()
-        for request in metadata.requests:
-            if request.load_spec is None or not request.load_spec.can_load:
-                continue
-            if len(request.block_ids_by_group) == 1:
-                block_ids.update(block_id for block_id in request.block_ids_by_group[0] if block_id > 0)
-        return block_ids
+    # ==============================
+    # Connector shutdown order
+    # ==============================
+
+    # Both roles close the client session before releasing any exported Worker
+    # cache handles. Server-side cleanup can then release its imported mappings
+    # while the source allocations are still shareable; local handles are
+    # released even if client close fails.
 
     def shutdown(self) -> None:
         try:
