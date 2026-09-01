@@ -1,12 +1,24 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.manager import KVCacheServiceManager
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import encode_registration
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.protocol import (
+    decode_registration,
+    encode_registration,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.registration import (
     SchedulerRegistration,
     WorkerRegistration,
@@ -51,6 +63,13 @@ class _UnserializableRuntimeState:
         raise AssertionError("runtime state must not enter a registration payload")
 
 
+@dataclass(frozen=True)
+class _UnsupportedKVCacheSpec(KVCacheSpec):
+    @property
+    def page_size_bytes(self) -> int:
+        return self.block_size
+
+
 def _make_vllm_config(
     engine_id: str = "engine-0",
     rank: int = 0,
@@ -84,16 +103,81 @@ def test_registration_projects_only_kv_pool_configuration() -> None:
     config.compilation_config = _UnserializableRuntimeState()
     config.kv_transfer_config.kv_role = "kv_both"
     config.kv_transfer_config.kv_connector_extra_config = {"backend": "mooncake"}
+    config.kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
 
     registration = SchedulerRegistration.create(config, None, 4096)
     payload = encode_registration(registration)
-    runtime_config, kv_cache_config = registration.config.build_runtime()
+    runtime_config = registration.config
+    kv_cache_config = registration.config.build_kv_cache_config()
 
     assert len(payload) < 64 * 1024
+    assert runtime_config is registration.config
     assert runtime_config.model_config.model == "org/model"
     assert runtime_config.model_config.max_model_len == 1024
     assert runtime_config.kv_transfer_config.kv_connector_extra_config == {"backend": "mooncake"}
+    assert runtime_config.kv_events_config is not None
+    assert runtime_config.kv_events_config.enable_kv_cache_events
     assert kv_cache_config is None
+
+
+@pytest.mark.parametrize(
+    "kv_cache_spec",
+    [
+        FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=128, dtype=torch.bfloat16),
+        UniformTypeKVCacheSpecs(
+            block_size=16,
+            kv_cache_specs={
+                "model.layers.0.attn": FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=8,
+                    head_size=128,
+                    dtype=torch.bfloat16,
+                )
+            },
+        ),
+        AscendMLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=576, dtype=torch.bfloat16),
+    ],
+    ids=["vllm", "vllm-uniform", "ascend"],
+)
+def test_registration_round_trips_supported_kv_cache_specs(kv_cache_spec) -> None:
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[_UnserializableRuntimeState()],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["model.layers.0.attn"],
+                kv_cache_spec=kv_cache_spec,
+            )
+        ],
+    )
+
+    registration = SchedulerRegistration.create(_make_vllm_config(), kv_cache_config, 4096)
+    restored = decode_registration((encode_registration(registration),), SchedulerRegistration)
+    restored_kv_cache_config = restored.config.build_kv_cache_config()
+
+    assert restored_kv_cache_config is not None
+    assert restored_kv_cache_config.num_blocks == 64
+    assert restored_kv_cache_config.kv_cache_tensors == []
+    assert restored_kv_cache_config.kv_cache_groups[0].layer_names == ["model.layers.0.attn"]
+    restored_spec = restored_kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    assert type(restored_spec) is type(kv_cache_spec)
+    assert restored_spec == kv_cache_spec
+
+
+def test_registration_rejects_unsupported_kv_cache_spec() -> None:
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["model.layers.0.attn"],
+                kv_cache_spec=_UnsupportedKVCacheSpec(block_size=16),
+            )
+        ],
+    )
+
+    with pytest.raises(TypeError, match="Unsupported KV cache spec type"):
+        SchedulerRegistration.create(_make_vllm_config(), kv_cache_config, 4096)
 
 
 def test_registration_rejects_runtime_objects_in_extra_config() -> None:

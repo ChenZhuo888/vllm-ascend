@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-import enum
-import importlib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, is_dataclass
 from types import SimpleNamespace
 from typing import Any
 
-import torch
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 _DEFAULT_BLOCK_SIZE = 16
 _DEFAULT_MODEL_LAYERS = 1
@@ -19,78 +21,28 @@ _SUPPORTED_SPEC_MODULES = {
     "vllm.v1.kv_cache_interface",
     "vllm_ascend.core.kv_cache_interface",
 }
-_SUPPORTED_ENUM_MODULES = {
-    "vllm.v1.attention.backends.registry",
-    "vllm.v1.kv_cache_interface",
-}
-
-WireValue = (
-    None | bool | int | float | str | bytes | list["WireValue"] | tuple["WireValue", ...] | dict[str, "WireValue"]
-)
-
-
-@dataclass(frozen=True)
-class _DTypeSpec:
-    name: str
-
-
-@dataclass(frozen=True)
-class _EnumSpec:
-    module: str
-    name: str
-    value: WireValue
-
-
-@dataclass(frozen=True)
-class KVCacheSpecData:
-    module: str
-    name: str
-    values: tuple[tuple[str, Any], ...]
-
-    @classmethod
-    def from_spec(cls, spec: KVCacheSpec) -> KVCacheSpecData:
-        spec_type = type(spec)
-        if spec_type.__module__ not in _SUPPORTED_SPEC_MODULES:
-            raise TypeError(
-                f"Unsupported KV cache spec type {spec_type.__module__}.{spec_type.__name__}; "
-                "AscendStore MP registrations support vLLM and vLLM Ascend cache specs only"
-            )
-        if not is_dataclass(spec):
-            raise TypeError(f"KV cache spec {spec_type.__name__} must be a dataclass")
-        return cls(
-            module=spec_type.__module__,
-            name=spec_type.__name__,
-            values=tuple((field.name, _project_value(getattr(spec, field.name))) for field in fields(spec)),
-        )
-
-    def build(self) -> KVCacheSpec:
-        if self.module not in _SUPPORTED_SPEC_MODULES:
-            raise TypeError(f"Unsupported KV cache spec module {self.module!r}")
-        module = importlib.import_module(self.module)
-        spec_type = getattr(module, self.name, None)
-        if not isinstance(spec_type, type) or not issubclass(spec_type, KVCacheSpec):
-            raise TypeError(f"Unsupported KV cache spec type {self.module}.{self.name}")
-        return spec_type(**{name: _restore_value(value) for name, value in self.values})
 
 
 @dataclass(frozen=True)
 class KVCacheGroupData:
     layer_names: tuple[str, ...]
-    kv_cache_spec: KVCacheSpecData
+    kv_cache_spec: KVCacheSpec
     is_eagle_group: bool
 
     @classmethod
     def from_group(cls, group: KVCacheGroupSpec) -> KVCacheGroupData:
+        _validate_kv_cache_spec(group.kv_cache_spec)
         return cls(
             layer_names=tuple(group.layer_names),
-            kv_cache_spec=KVCacheSpecData.from_spec(group.kv_cache_spec),
+            kv_cache_spec=group.kv_cache_spec,
             is_eagle_group=bool(getattr(group, "is_eagle_group", False)),
         )
 
     def build(self) -> KVCacheGroupSpec:
+        _validate_kv_cache_spec(self.kv_cache_spec)
         return KVCacheGroupSpec(
             layer_names=list(self.layer_names),
-            kv_cache_spec=self.kv_cache_spec.build(),
+            kv_cache_spec=self.kv_cache_spec,
             is_eagle_group=self.is_eagle_group,
         )
 
@@ -116,6 +68,20 @@ class KVCacheConfigData:
             kv_cache_tensors=[],
             kv_cache_groups=[group.build() for group in self.groups],
         )
+
+
+def _validate_kv_cache_spec(spec: KVCacheSpec) -> None:
+    spec_type = type(spec)
+    if spec_type.__module__ not in _SUPPORTED_SPEC_MODULES:
+        raise TypeError(
+            f"Unsupported KV cache spec type {spec_type.__module__}.{spec_type.__name__}; "
+            "AscendStore MP registrations support vLLM and vLLM Ascend cache specs only"
+        )
+    if not is_dataclass(spec):
+        raise TypeError(f"KV cache spec {spec_type.__name__} must be a dataclass")
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        for nested_spec in spec.kv_cache_specs.values():
+            _validate_kv_cache_spec(nested_spec)
 
 
 @dataclass(frozen=True)
@@ -297,6 +263,11 @@ class KVPoolSpeculativeConfigSpec:
 
 
 @dataclass(frozen=True)
+class KVPoolEventsConfigSpec:
+    enable_kv_cache_events: bool
+
+
+@dataclass(frozen=True)
 class KVPoolConfigSpec:
     model_config: KVPoolModelConfigSpec
     parallel_config: KVPoolParallelConfigSpec
@@ -304,7 +275,7 @@ class KVPoolConfigSpec:
     cache_config: KVPoolCacheConfigSpec
     scheduler_config: KVPoolSchedulerConfigSpec
     speculative_config: KVPoolSpeculativeConfigSpec | None
-    kv_events_enabled: bool
+    kv_events_config: KVPoolEventsConfigSpec | None
     kv_cache_config: KVCacheConfigData | None
 
     @classmethod
@@ -321,49 +292,16 @@ class KVPoolConfigSpec:
             cache_config=KVPoolCacheConfigSpec.from_vllm_config(vllm_config),
             scheduler_config=KVPoolSchedulerConfigSpec.from_vllm_config(vllm_config),
             speculative_config=KVPoolSpeculativeConfigSpec.from_vllm_config(vllm_config),
-            kv_events_enabled=_read_bool(kv_events_config, "enable_kv_cache_events", False),
+            kv_events_config=(
+                KVPoolEventsConfigSpec(enable_kv_cache_events=True)
+                if _read_bool(kv_events_config, "enable_kv_cache_events", False)
+                else None
+            ),
             kv_cache_config=KVCacheConfigData.from_config(kv_cache_config) if kv_cache_config is not None else None,
         )
 
-    def build_runtime(self) -> tuple[SimpleNamespace, KVCacheConfig | None]:
-        kv_events_config = SimpleNamespace(enable_kv_cache_events=True) if self.kv_events_enabled else None
-        vllm_config = SimpleNamespace(
-            model_config=self.model_config,
-            parallel_config=self.parallel_config,
-            kv_transfer_config=self.kv_transfer_config,
-            cache_config=self.cache_config,
-            scheduler_config=self.scheduler_config,
-            speculative_config=self.speculative_config,
-            kv_events_config=kv_events_config,
-        )
-        kv_cache_config = self.kv_cache_config.build() if self.kv_cache_config is not None else None
-        return vllm_config, kv_cache_config
-
-
-def _project_value(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
-        return value
-    if isinstance(value, torch.dtype):
-        return _DTypeSpec(str(value).removeprefix("torch."))
-    if isinstance(value, KVCacheSpec):
-        return KVCacheSpecData.from_spec(value)
-    if isinstance(value, enum.Enum):
-        enum_type = type(value)
-        if enum_type.__module__ not in _SUPPORTED_ENUM_MODULES:
-            raise TypeError(f"Unsupported configuration enum {enum_type.__module__}.{enum_type.__name__}")
-        return _EnumSpec(enum_type.__module__, enum_type.__name__, _project_value(value.value))
-    if isinstance(value, list):
-        return [_project_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_project_value(item) for item in value)
-    if isinstance(value, Mapping):
-        projected = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError(f"Configuration mapping keys must be strings, got {type(key).__name__}")
-            projected[key] = _project_value(item)
-        return projected
-    raise TypeError(f"Unsupported registration configuration value {type(value).__name__}")
+    def build_kv_cache_config(self) -> KVCacheConfig | None:
+        return self.kv_cache_config.build() if self.kv_cache_config is not None else None
 
 
 def _project_extra_value(value: Any) -> Any:
@@ -381,31 +319,6 @@ def _project_extra_value(value: Any) -> Any:
             projected[key] = _project_extra_value(item)
         return projected
     raise TypeError(f"Unsupported registration configuration value {type(value).__name__}")
-
-
-def _restore_value(value: Any) -> Any:
-    if isinstance(value, _DTypeSpec):
-        dtype = getattr(torch, value.name, None)
-        if not isinstance(dtype, torch.dtype):
-            raise TypeError(f"Unsupported torch dtype {value.name!r}")
-        return dtype
-    if isinstance(value, _EnumSpec):
-        if value.module not in _SUPPORTED_ENUM_MODULES:
-            raise TypeError(f"Unsupported configuration enum module {value.module!r}")
-        module = importlib.import_module(value.module)
-        enum_type = getattr(module, value.name, None)
-        if not isinstance(enum_type, type) or not issubclass(enum_type, enum.Enum):
-            raise TypeError(f"Unsupported configuration enum {value.module}.{value.name}")
-        return enum_type(_restore_value(value.value))
-    if isinstance(value, KVCacheSpecData):
-        return value.build()
-    if isinstance(value, list):
-        return [_restore_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_restore_value(item) for item in value)
-    if isinstance(value, dict):
-        return {key: _restore_value(item) for key, item in value.items()}
-    return value
 
 
 def _call_int(obj: object, name: str, *args: object, default: int) -> int:

@@ -107,10 +107,9 @@ class KVCacheServiceManager:
     def _create_worker(registration: WorkerRegistration) -> "MPKVPoolWorker":
         from .pool.worker import MPKVPoolWorker
 
-        vllm_config, kv_cache_config = registration.config.build_runtime()
         return MPKVPoolWorker(
-            vllm_config,
-            kv_cache_config=kv_cache_config,
+            registration.config,
+            kv_cache_config=registration.config.build_kv_cache_config(),
             rank=registration.identity.rank,
         )
 

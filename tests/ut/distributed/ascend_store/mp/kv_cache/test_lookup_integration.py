@@ -87,11 +87,10 @@ def _create_worker(
 ) -> MPKVPoolWorker:
     identity = registration.identity
     worker_key = (identity.engine_id, identity.data_parallel_rank, identity.rank)
-    vllm_config, kv_cache_config = registration.config.build_runtime()
     return MPKVPoolWorker(
-        vllm_config,
+        registration.config,
         store=_FakeStore(worker_results[worker_key]),
-        kv_cache_config=kv_cache_config,
+        kv_cache_config=registration.config.build_kv_cache_config(),
         rank=identity.rank,
     )
 
