@@ -1,3 +1,6 @@
+import queue
+import threading
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -5,7 +8,10 @@ import torch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.worker import MPKVPoolWorker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.pool.worker import (
+    MPKVPoolWorker,
+    _MPTransferThreadMixin,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata, ReqMeta
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache.npu_ipc import (
     KVCacheStorageSpec,
@@ -37,6 +43,33 @@ class _CPUMemoryAdapter:
 
     def import_storage(self, spec: KVCacheStorageSpec) -> tuple[torch.Tensor, int]:
         return self.storages[int.from_bytes(spec.handle)], 3
+
+
+class _Store:
+    def __init__(self, error: Exception | None = None):
+        self.error = error
+
+    def set_device(self) -> None:
+        if self.error is not None:
+            raise self.error
+
+
+class _TestTransferThread(_MPTransferThreadMixin, threading.Thread):
+    def __init__(self, store: _Store | None = None):
+        super().__init__(daemon=True, name="test-transfer")
+        self.m_store = store or _Store()
+        self.ready_event = threading.Event()
+        self.request_queue: queue.Queue[Any] = queue.Queue()
+        self.handled: list[Any] = []
+        self._fatal_error: BaseException | None = None
+
+    @staticmethod
+    def _set_os_thread_name() -> None:
+        return None
+
+    def _handle_request(self, request: Any) -> None:
+        self.handled.append(request)
+        self.request_queue.task_done()
 
 
 def _make_vllm_config(tp_size: int = 1, rank: int = 0) -> MagicMock:
@@ -96,6 +129,31 @@ def test_mp_worker_reuses_original_kv_events() -> None:
 
 def test_mp_worker_reuses_original_retrieve_methods() -> None:
     assert MPKVPoolWorker.get_block_ids_with_load_errors is KVPoolWorker.get_block_ids_with_load_errors
+
+
+def test_mp_transfer_thread_drains_accepted_requests_before_stopping() -> None:
+    thread = _TestTransferThread()
+    thread.start()
+    assert thread.ready_event.wait(timeout=1)
+
+    thread.add_request("first")
+    thread.add_request("second")
+    thread.stop()
+
+    assert thread.handled == ["first", "second"]
+    assert not thread.is_alive()
+    with pytest.raises(RuntimeError, match="no longer accepts requests"):
+        thread.add_request("late")
+
+
+def test_mp_transfer_thread_reports_device_setup_failure_without_blocking_startup() -> None:
+    thread = _TestTransferThread(_Store(RuntimeError("device unavailable")))
+    thread.start()
+
+    assert thread.ready_event.wait(timeout=1)
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert isinstance(thread._fatal_error, RuntimeError)
 
 
 def test_mp_worker_uses_registered_rank() -> None:
