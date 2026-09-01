@@ -366,9 +366,10 @@ class ServiceLifecycleManager(Generic[IdentityT, ServiceT]):
     # ==============================
 
     # Expiration first makes stale services unavailable by moving them to
-    # ``expiring`` under the lifecycle lock. It then closes them on their owner
-    # lane without that lock and exposes the session as recoverable only after
-    # cleanup finishes. The maintenance thread runs this same transaction.
+    # ``expiring`` under the lifecycle lock. It then closes them through the
+    # owner close handler without that lock and exposes the session as
+    # recoverable only after cleanup finishes. The maintenance thread runs this
+    # same transaction.
 
     def expire_leases(self) -> int:
         with self._expiration_lock:

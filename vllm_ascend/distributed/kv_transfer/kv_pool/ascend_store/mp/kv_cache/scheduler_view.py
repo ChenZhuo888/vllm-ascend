@@ -61,7 +61,7 @@ class ConnectorOutputView:
 
 @dataclass
 class ScheduledNewReqPayload:
-    """Wire projection of the dynamic fields of vLLM NewRequestData."""
+    """Serializable copy of the per-request fields vLLM carries in NewRequestData."""
 
     req_id: str
     num_computed_tokens: int

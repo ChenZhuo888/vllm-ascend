@@ -70,7 +70,7 @@ class KVCacheStorageAdapter(Protocol):
 
 @dataclass
 class ExportedKVCache:
-    """Wire specification plus references keeping exported allocations alive."""
+    """Serializable specification plus references keeping exported allocations alive."""
 
     spec: WorkerKVCacheSpec
     _storages: tuple[torch.Tensor, ...]

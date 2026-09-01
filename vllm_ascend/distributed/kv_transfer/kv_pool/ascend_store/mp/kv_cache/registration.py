@@ -493,7 +493,7 @@ def _require_non_negative_int(value: object, name: str) -> int:
 # Service identities and registrations
 # ==============================
 
-# Scheduler services are owned per engine and data-parallel lane, while Worker
+# Scheduler services are owned per engine and data-parallel rank, while Worker
 # services additionally own one rank's imported cache. The session id separates
 # a restarted client from an older owner of the same logical identity so stale
 # lifecycle calls cannot target its replacement.

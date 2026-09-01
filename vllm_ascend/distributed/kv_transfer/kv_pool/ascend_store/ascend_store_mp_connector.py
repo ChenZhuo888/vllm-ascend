@@ -95,7 +95,7 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
         self._kv_cache_client = KVCacheClient(_get_kv_cache_server_url(vllm_config))
         # Scheduler-process-local state: the live Request references feeding
         # the all_token_ids increments, the real BlockPool the server's
-        # touch/free commands are replayed on, and the KV event aggregation
+        # touch/free commands are applied to, and the KV event aggregation
         # fed from worker outputs.
         self._local_requests: dict[str, Request] = {}
         self._synced_token_len: dict[str, int] = {}
@@ -141,7 +141,7 @@ class AscendStoreMPConnector(KVConnectorBase_V1):
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         # The BlockPool never crosses the process border; the server's mamba
-        # bookkeeping returns block-id commands that are replayed on it here.
+        # bookkeeping returns block-id commands that are applied to it here.
         self._gpu_block_pool = gpu_block_pool
 
     def get_num_new_matched_tokens(

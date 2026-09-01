@@ -55,8 +55,9 @@ class _WorkerLookupBridge:
     """Route KVPoolScheduler's non-layerwise lookup to its Worker service.
 
     KVPoolScheduler expects a LookupKeyClient. Inside KVCacheServer, the manager
-    callback reaches the Worker on its owner lane without another RPC. Layerwise
-    lookup uses store_scheduler directly and never enters this bridge.
+    callback calls the Worker service on the executor thread assigned to that
+    Worker, without another RPC. Layerwise lookup uses store_scheduler directly
+    and never enters this bridge.
     """
 
     def __init__(self, identity: SchedulerIdentity, lookup_handler: WorkerLookupHandler):
