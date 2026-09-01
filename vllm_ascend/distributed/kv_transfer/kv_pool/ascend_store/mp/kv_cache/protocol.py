@@ -351,18 +351,21 @@ def decode_build_connector_meta_response(responses: Sequence[bytes]) -> tuple:
 def encode_request_finished(
     registration: SchedulerRegistration,
     request_id: str,
-    block_ids,
+    block_ids: list[int] | tuple[list[int], ...],
     all_groups: bool,
 ) -> tuple[bytes, ...]:
+    all_groups = _validate_bool(all_groups, "all_groups")
     body = {
         "request_id": _validate_text(request_id, "request_id"),
-        "block_ids": block_ids,
-        "all_groups": _validate_bool(all_groups, "all_groups"),
+        "block_ids": _validate_block_ids(block_ids, all_groups),
+        "all_groups": all_groups,
     }
     return _encode_scheduler_request(registration, body, KVCacheMethod.REQUEST_FINISHED)
 
 
-def decode_request_finished(payloads: tuple[bytes, ...]) -> tuple[SchedulerIdentity, str, str, object, bool]:
+def decode_request_finished(
+    payloads: tuple[bytes, ...],
+) -> tuple[SchedulerIdentity, str, str, list[int] | tuple[list[int], ...], bool]:
     method = KVCacheMethod.REQUEST_FINISHED
     identity, session_id, body = _decode_scheduler_request(payloads, method)
     request_id, block_ids, all_groups = _body_fields(
@@ -372,12 +375,13 @@ def decode_request_finished(payloads: tuple[bytes, ...]) -> tuple[SchedulerIdent
         "block_ids",
         "all_groups",
     )
+    decoded_all_groups = _decode_bool_value(all_groups, "all_groups")
     return (
         identity,
         session_id,
         _decode_text_value(request_id, "request_id"),
-        block_ids,
-        _decode_bool_value(all_groups, "all_groups"),
+        _decode_block_ids(block_ids, decoded_all_groups),
+        decoded_all_groups,
     )
 
 
@@ -935,6 +939,44 @@ def _decode_non_negative_int_set(value, field_name: str) -> set[int]:
     if not isinstance(value, set):
         raise MPProtocolError(f"{field_name} must be a set, got {type(value).__name__}")
     return {_decode_non_negative_int_value(item, f"{field_name} item") for item in value}
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_block_ids(
+    block_ids: list[int] | tuple[list[int], ...], all_groups: bool
+) -> list[int] | tuple[list[int], ...]:
+    expected_shape = "a sequence of per-group block id sequences" if all_groups else "a sequence of block ids"
+    if not isinstance(block_ids, Sequence) or isinstance(block_ids, (str, bytes)):
+        raise TypeError(f"block_ids must be {expected_shape}, got {type(block_ids).__name__}")
+    if all_groups:
+        for group_ids in block_ids:
+            if not isinstance(group_ids, Sequence) or isinstance(group_ids, (str, bytes)):
+                raise TypeError(f"block_ids groups must be integer sequences, got {type(group_ids).__name__}")
+            if any(not _is_int(block_id) for block_id in group_ids):
+                raise TypeError("block_ids groups must contain integers only")
+    elif any(not _is_int(block_id) for block_id in block_ids):
+        raise TypeError("block_ids must contain integers only")
+    return block_ids
+
+
+def _decode_block_ids(
+    block_ids: list[int] | tuple[list[int], ...], all_groups: bool
+) -> list[int] | tuple[list[int], ...]:
+    expected_shape = "a sequence of per-group block id sequences" if all_groups else "a sequence of block ids"
+    if not isinstance(block_ids, Sequence) or isinstance(block_ids, (str, bytes)):
+        raise MPProtocolError(f"block_ids must be {expected_shape}, got {type(block_ids).__name__}")
+    if all_groups:
+        for group_ids in block_ids:
+            if not isinstance(group_ids, Sequence) or isinstance(group_ids, (str, bytes)):
+                raise MPProtocolError(f"block_ids groups must be integer sequences, got {type(group_ids).__name__}")
+            if any(not _is_int(block_id) for block_id in group_ids):
+                raise MPProtocolError("block_ids groups must contain integers only")
+    elif any(not _is_int(block_id) for block_id in block_ids):
+        raise MPProtocolError("block_ids must contain integers only")
+    return block_ids
 
 
 def _validate_bool(value: bool, field_name: str) -> bool:

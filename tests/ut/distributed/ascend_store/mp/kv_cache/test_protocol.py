@@ -558,6 +558,37 @@ def test_request_finished_round_trip() -> None:
     assert decode_request_finished_response(response) == (True, None)
 
 
+def test_request_finished_rejects_malformed_block_ids() -> None:
+    registration = SchedulerRegistration.create(
+        _make_vllm_config(),
+        kv_cache_config=None,
+        page_size_bytes=0,
+        session_id="scheduler-session",
+    )
+
+    def malformed_payload(block_ids, all_groups: bool) -> tuple[bytes, ...]:
+        body = {"request_id": "request-0", "block_ids": block_ids, "all_groups": all_groups}
+        return kv_cache_protocol._encode_scheduler_request(registration, body, KVCacheMethod.REQUEST_FINISHED)
+
+    with pytest.raises(MPProtocolError, match="block_ids must be a sequence of block ids"):
+        decode_request_finished(malformed_payload("7,8", False))
+    with pytest.raises(MPProtocolError, match="block_ids must contain integers only"):
+        decode_request_finished(malformed_payload([7, "8"], False))
+    with pytest.raises(MPProtocolError, match="block_ids must be a sequence of per-group block id sequences"):
+        decode_request_finished(malformed_payload(7, True))
+    with pytest.raises(MPProtocolError, match="block_ids groups must be integer sequences"):
+        decode_request_finished(malformed_payload([7, 8], True))
+    with pytest.raises(MPProtocolError, match="block_ids groups must be integer sequences"):
+        decode_request_finished(malformed_payload(([7], "8"), True))
+    with pytest.raises(MPProtocolError, match="block_ids groups must contain integers only"):
+        decode_request_finished(malformed_payload(([7], [True]), True))
+
+    with pytest.raises(TypeError, match="block_ids must contain integers only"):
+        encode_request_finished(registration, "request-0", [7, "8"], False)
+    with pytest.raises(TypeError, match="block_ids groups must be integer sequences"):
+        encode_request_finished(registration, "request-0", [7, 8], True)
+
+
 def test_update_connector_output_round_trip() -> None:
     registration = SchedulerRegistration.create(
         _make_vllm_config(),
