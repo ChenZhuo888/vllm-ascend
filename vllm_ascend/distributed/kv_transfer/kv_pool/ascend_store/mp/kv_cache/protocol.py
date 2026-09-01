@@ -8,7 +8,7 @@ in the client, server, and manager.
 """
 
 import enum
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TypeVar
 
@@ -46,6 +46,7 @@ _WORKER_REQUEST_PAYLOADS = 5
 
 _Registration = SchedulerRegistration | WorkerRegistration
 RegistrationT = TypeVar("RegistrationT", bound=_Registration)
+_ValidatedT = TypeVar("_ValidatedT")
 
 
 class KVCacheMethod(str, enum.Enum):
@@ -177,8 +178,7 @@ def encode_register_kv_caches_request(
     registration: WorkerRegistration,
     spec: WorkerKVCacheSpec,
 ) -> tuple[bytes, ...]:
-    if not isinstance(spec, WorkerKVCacheSpec):
-        raise TypeError(f"spec must be WorkerKVCacheSpec, got {type(spec).__name__}")
+    _validate_type(spec, WorkerKVCacheSpec, "spec")
     return _encode_worker_request(registration, {"spec": spec}, KVCacheMethod.REGISTER_KV_CACHES)
 
 
@@ -446,10 +446,8 @@ def encode_wait_for_save_request(
     metadata: AscendConnectorMetadata,
     event_spec: NPUEventSpec,
 ) -> tuple[bytes, ...]:
-    if not isinstance(metadata, AscendConnectorMetadata):
-        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
-    if not isinstance(event_spec, NPUEventSpec):
-        raise TypeError(f"event_spec must be NPUEventSpec, got {type(event_spec).__name__}")
+    _validate_type(metadata, AscendConnectorMetadata, "metadata")
+    _validate_type(event_spec, NPUEventSpec, "event_spec")
     return _encode_worker_request(
         registration,
         {"metadata": metadata, "event_spec": event_spec},
@@ -473,8 +471,7 @@ def encode_get_finished_request(
     finished_req_ids: set[str],
     metadata: AscendConnectorMetadata,
 ) -> tuple[bytes, ...]:
-    if not isinstance(metadata, AscendConnectorMetadata):
-        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
+    _validate_type(metadata, AscendConnectorMetadata, "metadata")
     return _encode_worker_request(
         registration,
         {"finished_req_ids": _validate_text_set(finished_req_ids, "finished_req_ids"), "metadata": metadata},
@@ -551,11 +548,9 @@ def decode_get_kv_events_request(payloads: tuple[bytes, ...]) -> tuple[WorkerIde
 
 
 def encode_get_kv_events_response(events: list[BlockStored]) -> tuple[bytes, ...]:
-    if not isinstance(events, list):
-        raise TypeError(f"events must be a list, got {type(events).__name__}")
+    _validate_type(events, list, "events")
     for event in events:
-        if not isinstance(event, BlockStored):
-            raise TypeError(f"event must be BlockStored, got {type(event).__name__}")
+        _validate_type(event, BlockStored, "event")
     return _encode_response(KVCacheMethod.GET_KV_EVENTS, {"events": events})
 
 
@@ -573,8 +568,7 @@ def encode_start_load_kv_request(
     registration: WorkerRegistration,
     metadata: AscendConnectorMetadata,
 ) -> tuple[bytes, ...]:
-    if not isinstance(metadata, AscendConnectorMetadata):
-        raise TypeError(f"metadata must be AscendConnectorMetadata, got {type(metadata).__name__}")
+    _validate_type(metadata, AscendConnectorMetadata, "metadata")
     return _encode_worker_request(registration, {"metadata": metadata}, KVCacheMethod.START_LOAD_KV)
 
 
@@ -600,8 +594,7 @@ def encode_save_kv_layer_request(
     registration: WorkerRegistration,
     event_spec: NPUEventSpec,
 ) -> tuple[bytes, ...]:
-    if not isinstance(event_spec, NPUEventSpec):
-        raise TypeError(f"event_spec must be NPUEventSpec, got {type(event_spec).__name__}")
+    _validate_type(event_spec, NPUEventSpec, "event_spec")
     return _encode_worker_request(registration, {"event_spec": event_spec}, KVCacheMethod.SAVE_KV_LAYER)
 
 
@@ -789,9 +782,9 @@ def _decode_worker_identity(payloads: Sequence[bytes]) -> WorkerIdentity:
 # ==============================
 
 # Every business body is one cloudpickled dictionary frame and every structured
-# response is one frame. Encoders reject invalid local values before sending;
-# decoders turn malformed peer data into MPProtocolError so wire failures remain
-# distinct from service failures.
+# response is one frame. Local validators raise ordinary Python errors; decoders
+# reuse those constraints where fields are shared and report malformed peer data
+# as MPProtocolError, keeping protocol failures distinct from service failures.
 
 
 def decode_ack_response(responses: Sequence[bytes], method: KVCacheMethod) -> None:
@@ -839,9 +832,21 @@ def _body_fields(body: dict, method: str, *fields: str) -> tuple:
     return tuple(body[field] for field in fields)
 
 
-def _require_type(value, expected_type: type, field_name: str) -> None:
+def _decode_validated(validator: Callable[..., _ValidatedT], *args: object) -> _ValidatedT:
+    try:
+        return validator(*args)
+    except (TypeError, ValueError) as exc:
+        raise MPProtocolError(str(exc)) from exc
+
+
+def _validate_type(value: object, expected_type: type[_ValidatedT], field_name: str) -> _ValidatedT:
     if not isinstance(value, expected_type):
-        raise MPProtocolError(f"{field_name} must be {expected_type.__name__}, got {type(value).__name__}")
+        raise TypeError(f"{field_name} must be {expected_type.__name__}, got {type(value).__name__}")
+    return value
+
+
+def _require_type(value: object, expected_type: type[_ValidatedT], field_name: str) -> None:
+    _decode_validated(_validate_type, value, expected_type, field_name)
 
 
 def _require_empty_body(body: bytes, method: str) -> None:
@@ -874,11 +879,7 @@ def _validate_non_negative_int(value: int, field_name: str) -> int:
 
 
 def _decode_non_negative_int_value(value, field_name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise MPProtocolError(f"{field_name} must be an integer, got {type(value).__name__}")
-    if value < 0:
-        raise MPProtocolError(f"{field_name} must not be negative, got {value}")
-    return value
+    return _decode_validated(_validate_non_negative_int, value, field_name)
 
 
 def _encode_text(value: str, field_name: str) -> bytes:
@@ -902,11 +903,7 @@ def _validate_text(value: str, field_name: str) -> str:
 
 
 def _decode_text_value(value, field_name: str) -> str:
-    if not isinstance(value, str):
-        raise MPProtocolError(f"{field_name} must be a string, got {type(value).__name__}")
-    if not value:
-        raise MPProtocolError(f"{field_name} must not be empty")
-    return value
+    return _decode_validated(_validate_text, value, field_name)
 
 
 def _validate_block_hash(value: BlockHash) -> BlockHash:
@@ -924,9 +921,7 @@ def _validate_text_set(value: set[str], field_name: str) -> set[str]:
 
 
 def _decode_text_set(value, field_name: str) -> set[str]:
-    if not isinstance(value, set):
-        raise MPProtocolError(f"{field_name} must be a set, got {type(value).__name__}")
-    return {_decode_text_value(item, f"{field_name} item") for item in value}
+    return _decode_validated(_validate_text_set, value, field_name)
 
 
 def _validate_non_negative_int_set(value: set[int], field_name: str) -> set[int]:
@@ -936,9 +931,7 @@ def _validate_non_negative_int_set(value: set[int], field_name: str) -> set[int]
 
 
 def _decode_non_negative_int_set(value, field_name: str) -> set[int]:
-    if not isinstance(value, set):
-        raise MPProtocolError(f"{field_name} must be a set, got {type(value).__name__}")
-    return {_decode_non_negative_int_value(item, f"{field_name} item") for item in value}
+    return _decode_validated(_validate_non_negative_int_set, value, field_name)
 
 
 def _is_int(value) -> bool:
@@ -965,18 +958,7 @@ def _validate_block_ids(
 def _decode_block_ids(
     block_ids: list[int] | tuple[list[int], ...], all_groups: bool
 ) -> list[int] | tuple[list[int], ...]:
-    expected_shape = "a sequence of per-group block id sequences" if all_groups else "a sequence of block ids"
-    if not isinstance(block_ids, Sequence) or isinstance(block_ids, (str, bytes)):
-        raise MPProtocolError(f"block_ids must be {expected_shape}, got {type(block_ids).__name__}")
-    if all_groups:
-        for group_ids in block_ids:
-            if not isinstance(group_ids, Sequence) or isinstance(group_ids, (str, bytes)):
-                raise MPProtocolError(f"block_ids groups must be integer sequences, got {type(group_ids).__name__}")
-            if any(not _is_int(block_id) for block_id in group_ids):
-                raise MPProtocolError("block_ids groups must contain integers only")
-    elif any(not _is_int(block_id) for block_id in block_ids):
-        raise MPProtocolError("block_ids must contain integers only")
-    return block_ids
+    return _decode_validated(_validate_block_ids, block_ids, all_groups)
 
 
 def _validate_bool(value: bool, field_name: str) -> bool:
@@ -986,9 +968,7 @@ def _validate_bool(value: bool, field_name: str) -> bool:
 
 
 def _decode_bool_value(value, field_name: str) -> bool:
-    if not isinstance(value, bool):
-        raise MPProtocolError(f"{field_name} must be a boolean, got {type(value).__name__}")
-    return value
+    return _decode_validated(_validate_bool, value, field_name)
 
 
 def _decode_list(value, field_name: str) -> list:

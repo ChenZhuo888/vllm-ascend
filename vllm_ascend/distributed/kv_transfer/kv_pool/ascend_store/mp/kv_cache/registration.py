@@ -77,28 +77,14 @@ class KVCacheConfigData:
         )
 
 
-def _validate_kv_cache_spec(spec: KVCacheSpec) -> None:
-    spec_type = type(spec)
-    if spec_type.__module__ not in _SUPPORTED_SPEC_MODULES:
-        raise TypeError(
-            f"Unsupported KV cache spec type {spec_type.__module__}.{spec_type.__name__}; "
-            "AscendStore MP registrations support vLLM and vLLM Ascend cache specs only"
-        )
-    if not is_dataclass(spec):
-        raise TypeError(f"KV cache spec {spec_type.__name__} must be a dataclass")
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        for nested_spec in spec.kv_cache_specs.values():
-            _validate_kv_cache_spec(nested_spec)
-
-
 # ==============================
-# Server-side configuration projection
+# Configuration rebuilt for the server process
 # ==============================
 
 # The inherited KVPool Scheduler and Worker expect a VllmConfig-shaped object,
-# but the real VllmConfig also owns runtime state that must not be serialized.
-# These immutable projections preserve only the fields consumed in the server
-# process and serve directly as its runtime configuration.
+# but the real VllmConfig also contains process-local runtime state. These
+# immutable specifications carry only the fields consumed in KVCacheServer and
+# rebuild the configuration used by its Scheduler and Worker services.
 
 
 @dataclass(frozen=True)
@@ -400,95 +386,6 @@ class KVPoolConfigSpec:
         return self.kv_cache_config.build() if self.kv_cache_config is not None else None
 
 
-def _project_extra_value(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
-        return value
-    if isinstance(value, list):
-        return [_project_extra_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_project_extra_value(item) for item in value)
-    if isinstance(value, Mapping):
-        projected = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError(f"Configuration mapping keys must be strings, got {type(key).__name__}")
-            projected[key] = _project_extra_value(item)
-        return projected
-    raise TypeError(f"Unsupported registration configuration value {type(value).__name__}")
-
-
-_MISSING = object()
-
-
-def _require_attr(obj: object, name: str, owner: str, *, allow_none: bool = False) -> Any:
-    value = getattr(obj, name, _MISSING)
-    if value is _MISSING or (value is None and not allow_none):
-        raise ValueError(f"{owner}.{name} must be set")
-    return value
-
-
-def _call_required_positive_int(obj: object, name: str, field_name: str, *args: object) -> int:
-    method = getattr(obj, name, None)
-    if not callable(method):
-        raise TypeError(f"{field_name.removesuffix('()')} must be callable")
-    return _require_positive_int(method(*args), field_name)
-
-
-def _require_bool(value: object, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise TypeError(f"{name} must be a boolean, got {type(value).__name__}")
-    return value
-
-
-def _require_int(value: object, name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
-    return value
-
-
-def _require_positive_int(value: object, name: str) -> int:
-    value = _require_int(value, name)
-    if value <= 0:
-        raise ValueError(f"{name} must be positive, got {value}")
-    return value
-
-
-def _optional_positive_int(value: object, name: str) -> int | None:
-    if value is None:
-        return None
-    return _require_positive_int(value, name)
-
-
-def _require_non_empty_str(value: object, name: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{name} must be a string, got {type(value).__name__}")
-    if not value:
-        raise ValueError(f"{name} must not be empty")
-    return value
-
-
-def _optional_str(value: object, name: str) -> str | None:
-    if value is None:
-        return None
-    return _require_non_empty_str(value, name)
-
-
-def _optional_int_tuple(value: object, name: str) -> tuple[int, ...] | None:
-    if value is None:
-        return None
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        raise TypeError(f"{name} must be a sequence of integers, got {type(value).__name__}")
-    if not all(isinstance(item, int) and not isinstance(item, bool) for item in value):
-        raise TypeError(f"{name} must contain integers only")
-    return tuple(value)
-
-
-def _require_non_negative_int(value: object, name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise TypeError(f"{name} must be a non-negative integer, got {value!r}")
-    return value
-
-
 # ==============================
 # Service identities and registrations
 # ==============================
@@ -609,3 +506,117 @@ class WorkerRegistration:
             config=KVPoolConfigSpec.from_vllm_config(vllm_config, kv_cache_config),
             session_id=session_id,
         )
+
+
+# ==============================
+# Registration boundary validation
+# ==============================
+
+# Registrations are built from live vLLM objects and later trusted as runtime
+# configuration in the server process. These checks admit only supported cache
+# specifications and plain configuration values, and reject incomplete or
+# invalid data before it crosses the process boundary.
+
+
+def _validate_kv_cache_spec(spec: KVCacheSpec) -> None:
+    spec_type = type(spec)
+    if spec_type.__module__ not in _SUPPORTED_SPEC_MODULES:
+        raise TypeError(
+            f"Unsupported KV cache spec type {spec_type.__module__}.{spec_type.__name__}; "
+            "AscendStore MP registrations support vLLM and vLLM Ascend cache specs only"
+        )
+    if not is_dataclass(spec):
+        raise TypeError(f"KV cache spec {spec_type.__name__} must be a dataclass")
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        for nested_spec in spec.kv_cache_specs.values():
+            _validate_kv_cache_spec(nested_spec)
+
+
+def _project_extra_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    if isinstance(value, list):
+        return [_project_extra_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_project_extra_value(item) for item in value)
+    if isinstance(value, Mapping):
+        projected = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"Configuration mapping keys must be strings, got {type(key).__name__}")
+            projected[key] = _project_extra_value(item)
+        return projected
+    raise TypeError(f"Unsupported registration configuration value {type(value).__name__}")
+
+
+_MISSING = object()
+
+
+def _require_attr(obj: object, name: str, owner: str, *, allow_none: bool = False) -> Any:
+    value = getattr(obj, name, _MISSING)
+    if value is _MISSING or (value is None and not allow_none):
+        raise ValueError(f"{owner}.{name} must be set")
+    return value
+
+
+def _call_required_positive_int(obj: object, name: str, field_name: str, *args: object) -> int:
+    method = getattr(obj, name, None)
+    if not callable(method):
+        raise TypeError(f"{field_name.removesuffix('()')} must be callable")
+    return _require_positive_int(method(*args), field_name)
+
+
+def _require_bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a boolean, got {type(value).__name__}")
+    return value
+
+
+def _require_int(value: object, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
+    return value
+
+
+def _require_positive_int(value: object, name: str) -> int:
+    value = _require_int(value, name)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _optional_positive_int(value: object, name: str) -> int | None:
+    if value is None:
+        return None
+    return _require_positive_int(value, name)
+
+
+def _require_non_negative_int(value: object, name: str) -> int:
+    value = _require_int(value, name)
+    if value < 0:
+        raise ValueError(f"{name} must not be negative, got {value}")
+    return value
+
+
+def _require_non_empty_str(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string, got {type(value).__name__}")
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return value
+
+
+def _optional_str(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    return _require_non_empty_str(value, name)
+
+
+def _optional_int_tuple(value: object, name: str) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TypeError(f"{name} must be a sequence of integers, got {type(value).__name__}")
+    if not all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+        raise TypeError(f"{name} must contain integers only")
+    return tuple(value)
