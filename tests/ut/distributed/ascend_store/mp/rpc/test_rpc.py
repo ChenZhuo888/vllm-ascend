@@ -272,6 +272,16 @@ def test_protocol_rejects_invalid_request_deadline() -> None:
         decode_request((b"request-1", b"ECHO", b"invalid"))
 
 
+def test_protocol_rejects_boolean_request_deadline() -> None:
+    with pytest.raises(TypeError, match="deadline_ns must be an integer, got bool"):
+        encode_request(b"request-1", SystemMethod.ECHO, deadline_ns=True)
+
+
+def test_protocol_rejects_invalid_response_status() -> None:
+    with pytest.raises(TypeError, match="status must be ResponseStatus, got str"):
+        encode_response(b"request-1", SystemMethod.ECHO, "OK")
+
+
 def test_client_server_round_trip():
     process, parent_conn, endpoint = _start_server(_run_server)
     client = None

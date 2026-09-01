@@ -116,6 +116,8 @@ def decode_method(data: bytes) -> str:
 
 
 def encode_response_status(status: ResponseStatus) -> bytes:
+    if not isinstance(status, ResponseStatus):
+        raise TypeError(f"status must be ResponseStatus, got {type(status).__name__}")
     return status.value.encode()
 
 
@@ -142,7 +144,7 @@ def _normalize_payloads(payloads: Iterable[bytes]) -> tuple[bytes, ...]:
 def _encode_deadline(deadline_ns: int | None) -> bytes:
     if deadline_ns is None:
         return b""
-    if not isinstance(deadline_ns, int):
+    if not isinstance(deadline_ns, int) or isinstance(deadline_ns, bool):
         raise TypeError(f"deadline_ns must be an integer, got {type(deadline_ns).__name__}")
     if deadline_ns <= 0:
         raise ValueError(f"deadline_ns must be greater than 0, got {deadline_ns}")
