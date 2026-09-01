@@ -89,8 +89,8 @@ class _ObservedWorker:
         self._backend: _ObservedBackend | None = None
         self._backend_creation_count = 0
         self._worker = MPKVPoolWorker(
-            registration.vllm_config,
-            kv_cache_config=registration.kv_cache_config,
+            registration.config,
+            kv_cache_config=registration.config.build_kv_cache_config(),
             rank=registration.identity.rank,
             backend_factory=self._create_backend,
         )
@@ -101,7 +101,6 @@ class _ObservedWorker:
         return self._backend
 
     def configure_kv_caches(self, spec: "WorkerKVCacheSpec") -> None:
-        previous_caches = getattr(self._worker, "kv_caches", None)
         self._worker.configure_kv_caches(spec)
         base = self._worker.kv_caches["model.layers.0.attn"][0]
         view = self._worker.kv_caches["model.layers.1.attn"][0]
@@ -120,12 +119,10 @@ class _ObservedWorker:
             (
                 "configured",
                 {
-                    "generation": spec.generation,
                     "device_type": base.device.type,
                     "base_values": base.cpu().tolist(),
                     "view_values": view.cpu().tolist(),
                     "shared_storage": base.untyped_storage().data_ptr() == view.untyped_storage().data_ptr(),
-                    "previous_released": None if previous_caches is None else previous_caches == {},
                     "backend_device_index": self._backend.device_index if self._backend is not None else None,
                     "backend_creation_count": self._backend_creation_count,
                 },
@@ -158,14 +155,12 @@ class _ObservedWorker:
         return self._worker.get_finished(finished_req_ids, metadata)
 
     def close(self) -> None:
-        generation = self._worker.kv_cache_spec.generation if self._worker.kv_cache_spec is not None else None
         current_caches = getattr(self._worker, "kv_caches", None)
         self._worker.close()
         self._connection.send(
             (
                 "closed",
                 {
-                    "generation": generation,
                     "mapping_released": current_caches == {},
                     "worker_caches_empty": self._worker.kv_caches == {},
                 },
@@ -231,7 +226,7 @@ def _producer(connection: Connection) -> None:
         view = base[1:, ::2]
         exported_event = record_npu_event()
 
-        exported = export_worker_kv_caches({"base": base, "view": view}, generation=1)
+        exported = export_worker_kv_caches({"base": base, "view": view})
         connection.send(("ready", (exported.spec, exported_event.spec)))
 
         if not connection.poll(_PRODUCER_RELEASE_TIMEOUT_S):
@@ -311,15 +306,15 @@ def _wait_until_registered(client) -> None:
         time.sleep(0.05)
 
 
-def _wait_for_active_export(connector, generation: int):
+def _wait_for_active_export(connector):
     deadline = time.monotonic() + _MESSAGE_TIMEOUT_S
     while True:
         with connector._kv_cache_export_lock:
-            active = connector._active_kv_cache_export
-            if active is not None and active.spec.generation == generation:
+            active = connector._kv_cache_export
+            if active is not None:
                 return active
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"Timed out waiting for KV cache generation {generation} to become active")
+            raise TimeoutError("Timed out waiting for the Worker KV cache export to become active")
         time.sleep(0.05)
 
 
@@ -489,7 +484,7 @@ def test_npu_kv_cache_storage_round_trip_across_processes() -> None:
     assert producer_exitcode == 0
 
 
-def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
+def test_worker_connector_registers_once_and_releases_mapping() -> None:
     import torch
     import torch_npu  # noqa: F401
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
@@ -537,20 +532,18 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
         _wait_until_connected(connector._kv_cache_client)
         _wait_until_registered(connector._kv_cache_client)
 
-        exports = []
-        generation_results = []
-        for generation in (1, 2):
-            base = torch.full((4, 4), generation, dtype=torch.float16, device="npu")
-            view = base[:, ::2]
-            torch.npu.synchronize()
-            connector.register_kv_caches({"model.layers.0.attn": base, "model.layers.1.attn": view})
-            exports.append(_wait_for_active_export(connector, generation))
-            generation_results.append(_receive(observation_connection, f"cache generation {generation}"))
+        base = torch.full((4, 4), 1, dtype=torch.float16, device="npu")
+        view = base[:, ::2]
+        torch.npu.synchronize()
+        connector.register_kv_caches({"model.layers.0.attn": base, "model.layers.1.attn": view})
+        export = _wait_for_active_export(connector)
+        configure_result = _receive(observation_connection, "cache configuration")
 
+        # The connector registers one fixed mapping; re-registration is rejected.
+        with pytest.raises(RuntimeError, match="already registered"):
+            connector.register_kv_caches({"model.layers.0.attn": base})
         with connector._kv_cache_export_lock:
-            assert connector._pending_kv_cache_exports == {}
-            assert connector._active_kv_cache_export is exports[1]
-        assert exports[0]._storages == ()
+            assert connector._kv_cache_export is export
 
         metadata = AscendConnectorMetadata(set(), set())
         metadata.add_request(
@@ -601,40 +594,25 @@ def test_worker_connector_replaces_generation_and_releases_mapping() -> None:
 
         connector.shutdown()
         with connector._kv_cache_export_lock:
-            assert connector._pending_kv_cache_exports == {}
-            assert connector._active_kv_cache_export is None
-        assert exports[1]._storages == ()
+            assert connector._kv_cache_export is None
+        assert export._storages == ()
         assert observation_connection.poll(0), "Connector released its export before Server released the mapping"
         close_status, close_result = observation_connection.recv()
         connector = None
 
-        (first_status, first_generation), (second_status, second_generation) = generation_results
+        configure_status, configured = configure_result
 
-        assert first_status == "configured"
-        assert first_generation == {
-            "generation": 1,
+        assert configure_status == "configured"
+        assert configured == {
             "device_type": "npu",
             "base_values": [[1.0] * 4 for _ in range(4)],
             "view_values": [[1.0] * 2 for _ in range(4)],
             "shared_storage": True,
-            "previous_released": None,
-            "backend_device_index": 0,
-            "backend_creation_count": 1,
-        }
-        assert second_status == "configured"
-        assert second_generation == {
-            "generation": 2,
-            "device_type": "npu",
-            "base_values": [[2.0] * 4 for _ in range(4)],
-            "view_values": [[2.0] * 2 for _ in range(4)],
-            "shared_storage": True,
-            "previous_released": True,
             "backend_device_index": 0,
             "backend_creation_count": 1,
         }
         assert close_status == "closed"
         assert close_result == {
-            "generation": 2,
             "mapping_released": True,
             "worker_caches_empty": True,
         }
@@ -738,7 +716,7 @@ def test_real_mooncake_backend_store_and_retrieve(tmp_path, monkeypatch) -> None
                     "model.layers.1.attn": second_layer,
                 }
             )
-            _wait_for_active_export(connector, generation=1)
+            _wait_for_active_export(connector)
 
             store_metadata = AscendConnectorMetadata(
                 set(),

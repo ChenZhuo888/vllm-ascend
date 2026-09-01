@@ -83,8 +83,8 @@ class _MultiNPUObservedWorker:
         self._backend: _ObservingMooncakeBackend | None = None
         self._backend_creation_count = 0
         self._worker = MPKVPoolWorker(
-            registration.vllm_config,
-            kv_cache_config=registration.kv_cache_config,
+            registration.config,
+            kv_cache_config=registration.config.build_kv_cache_config(),
             rank=registration.identity.rank,
             backend_factory=self._create_backend,
         )
@@ -95,15 +95,12 @@ class _MultiNPUObservedWorker:
         return self._backend
 
     def configure_kv_caches(self, spec: "WorkerKVCacheSpec") -> None:
-        previous_caches = getattr(self._worker, "kv_caches", None)
         self._worker.configure_kv_caches(spec)
         assert self._backend is not None
         self._connection.send(
             (
                 "configured",
                 {
-                    "generation": spec.generation,
-                    "previous_released": None if previous_caches is None else previous_caches == {},
                     "backend_device_index": self._backend.device_index,
                     "backend_creation_count": self._backend_creation_count,
                 },
@@ -125,14 +122,12 @@ class _MultiNPUObservedWorker:
         return self._worker.get_finished(finished_req_ids, metadata)
 
     def close(self) -> None:
-        generation = self._worker.kv_cache_spec.generation if self._worker.kv_cache_spec is not None else None
         current_caches = getattr(self._worker, "kv_caches", None)
         self._worker.close()
         self._connection.send(
             (
                 "closed",
                 {
-                    "generation": generation,
                     "mapping_released": current_caches == {},
                     "worker_caches_empty": self._worker.kv_caches == {},
                 },
@@ -386,14 +381,12 @@ def test_mooncake_two_npu_workers_store_and_retrieve(tmp_path, monkeypatch) -> N
                 torch.npu.synchronize()
                 caches[rank] = (first_layer, second_layer, first_fill, second_fill)
                 connector.register_kv_caches({"model.layers.0.attn": first_layer, "model.layers.1.attn": second_layer})
-                _wait_for_active_export(connector, generation=1)
+                _wait_for_active_export(connector)
 
             for rank in (0, 1):
                 status, result = _receive(observation_connections[rank], f"Worker {rank} configuration")
                 assert status == "configured"
                 assert result == {
-                    "generation": 1,
-                    "previous_released": None,
                     "backend_device_index": rank,
                     "backend_creation_count": 1,
                 }
@@ -440,7 +433,6 @@ def test_mooncake_two_npu_workers_store_and_retrieve(tmp_path, monkeypatch) -> N
                 closed_status, closed_result = _receive(observation_connections[rank], f"Worker {rank} close")
                 assert closed_status == "closed"
                 assert closed_result == {
-                    "generation": 1,
                     "mapping_released": True,
                     "worker_caches_empty": True,
                 }
