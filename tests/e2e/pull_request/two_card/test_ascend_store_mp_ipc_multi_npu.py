@@ -146,6 +146,9 @@ def _make_tp2_worker_config(rank: int, server_url: str):
         parallel_config=SimpleNamespace(
             data_parallel_rank=0,
             rank=rank,
+            world_size=2,
+            data_parallel_index=0,
+            data_parallel_size=1,
             tensor_parallel_size=2,
             pipeline_parallel_size=1,
             prefill_context_parallel_size=1,

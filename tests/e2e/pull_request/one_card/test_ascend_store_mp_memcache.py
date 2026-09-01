@@ -125,6 +125,9 @@ def _make_memcache_worker_config(server_url: str) -> SimpleNamespace:
         parallel_config=SimpleNamespace(
             data_parallel_rank=0,
             rank=0,
+            world_size=1,
+            data_parallel_index=0,
+            data_parallel_size=1,
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
             prefill_context_parallel_size=1,
