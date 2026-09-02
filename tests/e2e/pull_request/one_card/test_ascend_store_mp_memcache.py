@@ -54,8 +54,8 @@ def _write_memcache_configs(
     world_size: int = 1,
     lease_ttl_ms: int | None = None,
 ) -> tuple[Path, Path]:
-    log_path = tmp_path / "memcache-logs"
-    log_path.mkdir()
+    # memcache_hybrid 1.1.x rejects ock.mmc.log_path in the local config, so
+    # library logs go to the built-in default location instead of tmp_path.
     meta_config_path = tmp_path / "mmc-meta.conf"
     local_config_path = tmp_path / "mmc-local.conf"
     meta_config = [
@@ -63,7 +63,6 @@ def _write_memcache_configs(
         f"ock.mmc.meta_service.config_store_url = tcp://127.0.0.1:{config_store_port}",
         f"ock.mmc.meta_service.metrics_url = http://127.0.0.1:{metrics_port}",
         "ock.mmc.log_level = error",
-        f"ock.mmc.log_path = {log_path}",
     ]
     if lease_ttl_ms is not None:
         meta_config.insert(3, f"ock.mmc.meta.lease_ttl_ms = {lease_ttl_ms}")
@@ -74,7 +73,6 @@ def _write_memcache_configs(
                 f"ock.mmc.meta_service_url = tcp://127.0.0.1:{meta_port}",
                 f"ock.mmc.local_service.config_store_url = tcp://127.0.0.1:{config_store_port}",
                 "ock.mmc.log_level = error",
-                f"ock.mmc.log_path = {log_path}",
                 f"ock.mmc.local_service.world_size = {world_size}",
                 f"ock.mmc.local_service.protocol = {protocol}",
                 "ock.mmc.local_service.dram.size = 1GB",
