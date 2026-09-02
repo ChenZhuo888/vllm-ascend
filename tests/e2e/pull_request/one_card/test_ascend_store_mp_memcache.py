@@ -232,7 +232,7 @@ def test_real_memcache_backend_store_and_retrieve(tmp_path: Path, monkeypatch: p
                 "model.layers.1.attn": second_layer,
             }
         )
-        _wait_for_active_export(connector, generation=1)
+        _wait_for_active_export(connector)
 
         store_metadata = AscendConnectorMetadata(
             set(),
