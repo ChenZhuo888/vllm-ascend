@@ -151,7 +151,7 @@ def _make_tp2_worker_config(rank: int, server_url: str):
         ),
         kv_transfer_config=SimpleNamespace(
             engine_id="ascend-store-mp-multi-npu-test",
-            kv_connector="AscendStoreMPConnector",
+            kv_connector="AscendStoreConnector",
             kv_role="kv_producer",
             kv_connector_extra_config={"backend": "mooncake", "kv_cache_server_url": server_url},
             is_kv_producer=True,
@@ -201,7 +201,12 @@ def _run_multi_npu_server(
         global_te.get_transfer_engine = _recording_get_transfer_engine
 
         worker_factory = partial(_create_rank_routed_worker, connections=observation_connections)
-        server = KVCacheServer(_SERVER_URL, max_workers=2, worker_factory=worker_factory)
+        server = KVCacheServer(
+            _SERVER_URL,
+            scheduler_threads=2,
+            worker_threads=2,
+            worker_factory=worker_factory,
+        )
         control_thread = threading.Thread(
             target=_request_server_stop,
             args=(server, control_connection),

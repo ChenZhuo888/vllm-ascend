@@ -51,6 +51,8 @@ from .protocol import (
 from .registration import SchedulerRegistration, WorkerRegistration
 from .scheduler_view import ConnectorOutputView
 
+DEFAULT_SCHEDULER_THREADS = 4
+DEFAULT_WORKER_THREADS = 4
 _MAX_PENDING_REQUESTS = 64
 
 
@@ -58,9 +60,10 @@ class KVCacheServer:
     """Expose KV cache services through RPC routes with explicit thread ownership.
 
     Scheduler and Worker business requests are ordered by service identity,
-    while lease renewal runs outside their work queues. The server translates
-    protocol requests for KVCacheServiceManager and coordinates service lifetime
-    with graceful or forced RPC shutdown.
+    while different identities can use their independently sized execution
+    pools concurrently. Lease renewal runs outside those work queues. The server
+    translates protocol requests for KVCacheServiceManager and coordinates
+    service lifetime with graceful or forced RPC shutdown.
 
     Optional factories let tests replace or observe service construction while
     exercising the real routing, thread-affinity, and lifecycle paths. Production
@@ -71,12 +74,26 @@ class KVCacheServer:
     def __init__(
         self,
         bind_url: str,
-        max_workers: int = 4,
+        scheduler_threads: int = DEFAULT_SCHEDULER_THREADS,
+        worker_threads: int = DEFAULT_WORKER_THREADS,
         scheduler_factory: SchedulerFactory | None = None,
         worker_factory: WorkerFactory | None = None,
     ):
-        scheduler_executor = AffinityExecutor(max_workers, _MAX_PENDING_REQUESTS, "ascend-store-kv-scheduler")
-        worker_executor = AffinityExecutor(max_workers, _MAX_PENDING_REQUESTS, "ascend-store-kv-worker")
+        if scheduler_threads <= 0:
+            raise ValueError("scheduler_threads must be greater than 0")
+        if worker_threads <= 0:
+            raise ValueError("worker_threads must be greater than 0")
+
+        scheduler_executor = AffinityExecutor(
+            scheduler_threads,
+            _MAX_PENDING_REQUESTS,
+            "ascend-store-kv-scheduler",
+        )
+        worker_executor = AffinityExecutor(
+            worker_threads,
+            _MAX_PENDING_REQUESTS,
+            "ascend-store-kv-worker",
+        )
         lease_executor = InlineExecutor()
         self._close_lock = threading.Lock()
         self._abort_requested = threading.Event()

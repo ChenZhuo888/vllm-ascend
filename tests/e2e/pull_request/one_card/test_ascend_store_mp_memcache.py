@@ -135,7 +135,7 @@ def _make_memcache_worker_config(server_url: str) -> SimpleNamespace:
         ),
         kv_transfer_config=SimpleNamespace(
             engine_id="ascend-store-mp-memcache-test",
-            kv_connector="AscendStoreMPConnector",
+            kv_connector="AscendStoreConnector",
             kv_role="kv_producer",
             kv_connector_extra_config={"backend": "memcache", "kv_cache_server_url": server_url},
             is_kv_producer=True,

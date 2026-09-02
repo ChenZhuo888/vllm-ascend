@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreKVEvents
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
@@ -48,9 +49,14 @@ def _get_kv_cache_server_url(vllm_config: VllmConfig) -> str:
         raise ValueError("kv_transfer_config must be set for AscendStoreMPConnector")
 
     extra_config = kv_transfer_config.kv_connector_extra_config or {}
-    server_url = extra_config.get(_KV_CACHE_SERVER_URL_KEY)
+    if _KV_CACHE_SERVER_URL_KEY in extra_config:
+        server_url = extra_config[_KV_CACHE_SERVER_URL_KEY]
+        source = f"kv_connector_extra_config[{_KV_CACHE_SERVER_URL_KEY!r}]"
+    else:
+        server_url = envs.VLLM_ASCEND_STORE_SERVER_URL
+        source = "VLLM_ASCEND_STORE_SERVER_URL"
     if not isinstance(server_url, str) or not server_url:
-        raise ValueError(f"kv_connector_extra_config[{_KV_CACHE_SERVER_URL_KEY!r}] must be a non-empty string")
+        raise ValueError(f"{source} must be a non-empty string")
     return server_url
 
 

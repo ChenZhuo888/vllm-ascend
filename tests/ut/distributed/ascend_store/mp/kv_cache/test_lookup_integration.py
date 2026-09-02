@@ -103,7 +103,8 @@ def _create_worker(
 def _run_lookup_server(bind_url: str, conn, worker_results: dict[tuple[str, int, int], list[int]]) -> None:
     server = KVCacheServer(
         bind_url,
-        max_workers=4,
+        scheduler_threads=4,
+        worker_threads=4,
         scheduler_factory=_create_scheduler,
         worker_factory=partial(_create_worker, worker_results=worker_results),
     )

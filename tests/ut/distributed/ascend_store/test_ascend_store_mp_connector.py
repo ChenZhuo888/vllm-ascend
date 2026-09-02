@@ -27,6 +27,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.rpc import MPSe
 
 CONNECTOR_MODULE = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_mp_connector"
 SERVER_URL = "ipc:///tmp/ascend_store_mp_test"
+_UNSET_SERVER_URL = object()
 
 
 class _CPUMemoryAdapter:
@@ -46,11 +47,11 @@ def _make_vllm_config(server_url: object = SERVER_URL, rank: int = 0) -> MagicMo
     config = MagicMock()
     config.parallel_config.data_parallel_rank = 0
     config.parallel_config.rank = rank
-    config.kv_transfer_config.kv_connector = "AscendStoreMPConnector"
+    config.kv_transfer_config.kv_connector = "AscendStoreConnector"
     config.kv_transfer_config.engine_id = "engine-0"
     config.kv_transfer_config.kv_role = "kv_producer"
     config.kv_transfer_config.kv_connector_extra_config = {}
-    if server_url is not None:
+    if server_url is not _UNSET_SERVER_URL:
         config.kv_transfer_config.kv_connector_extra_config["kv_cache_server_url"] = server_url
     return config
 
@@ -84,6 +85,29 @@ def test_connector_registers_its_role(role: KVConnectorRole) -> None:
 
         connector.shutdown()
         client_class.return_value.close.assert_called_once_with()
+
+
+def test_connector_uses_default_server_url(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_ASCEND_STORE_SERVER_URL", raising=False)
+    config = _make_vllm_config(server_url=_UNSET_SERVER_URL)
+
+    with patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class:
+        AscendStoreMPConnector(config, KVConnectorRole.SCHEDULER, _make_kv_cache_config())
+
+    client_class.assert_called_once_with("tcp://127.0.0.1:5555")
+
+
+def test_connector_rejects_invalid_default_server_url(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_STORE_SERVER_URL", "")
+    config = _make_vllm_config(server_url=_UNSET_SERVER_URL)
+
+    with (
+        patch(f"{CONNECTOR_MODULE}.KVCacheClient") as client_class,
+        pytest.raises(ValueError, match="VLLM_ASCEND_STORE_SERVER_URL"),
+    ):
+        AscendStoreMPConnector(config, KVConnectorRole.SCHEDULER, _make_kv_cache_config())
+
+    client_class.assert_not_called()
 
 
 @pytest.mark.parametrize("use_layerwise", [False, True])

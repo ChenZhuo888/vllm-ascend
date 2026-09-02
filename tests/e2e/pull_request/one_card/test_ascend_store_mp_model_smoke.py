@@ -74,7 +74,11 @@ def _run_smoke_server(endpoint_connection: Connection, control_connection: Conne
         vllm_logger.addHandler(file_handler)
         vllm_logger.debug("KV cache smoke server log capture ready")
 
-        server = KVCacheServer(_SERVER_URL, max_workers=2)
+        server = KVCacheServer(
+            _SERVER_URL,
+            scheduler_threads=2,
+            worker_threads=2,
+        )
         control_thread = threading.Thread(
             target=_request_server_stop,
             args=(server, control_connection),
@@ -105,17 +109,19 @@ def _build_llm(
     use_layerwise: bool = False,
     backend: str = "mooncake",
 ):
+    monkeypatch.setenv("VLLM_ASCEND_STORE_MULTIPROCESS", "1")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
     from vllm import LLM
     from vllm.config import KVTransferConfig
 
     # vLLM forks an EngineCore subprocess by default, and a forked child
     # cannot re-initialize NPU once this process has touched it. Run the
     # engine in-process instead.
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     gpu_memory_utilization = float(os.getenv("ASCEND_STORE_MP_SMOKE_GPU_MEM", "0.5"))
 
     kv_transfer_config = KVTransferConfig(
-        kv_connector="AscendStoreMPConnector",
+        kv_connector="AscendStoreConnector",
         kv_role="kv_both",
         kv_connector_extra_config={
             "backend": backend,

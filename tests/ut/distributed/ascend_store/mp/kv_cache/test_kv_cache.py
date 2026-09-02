@@ -226,7 +226,8 @@ def _create_blocking_scheduler(
 def _run_server(bind_url: str, conn, worker_hits: dict[tuple[int, int], int]) -> None:
     server = KVCacheServer(
         bind_url,
-        max_workers=4,
+        scheduler_threads=4,
+        worker_threads=4,
         scheduler_factory=_create_scheduler,
         worker_factory=partial(_create_worker, worker_hits=worker_hits),
     )
@@ -241,7 +242,8 @@ def _run_server(bind_url: str, conn, worker_hits: dict[tuple[int, int], int]) ->
 def _run_affinity_server(bind_url: str, conn, started_events, release_events) -> None:
     server = KVCacheServer(
         bind_url,
-        max_workers=4,
+        scheduler_threads=4,
+        worker_threads=4,
         scheduler_factory=partial(
             _create_blocking_scheduler,
             started_events=started_events,
@@ -342,6 +344,12 @@ def kv_cache_server_url() -> Iterator[str]:
         yield endpoint
     finally:
         _stop_server(process)
+
+
+@pytest.mark.parametrize("thread_option", ["scheduler_threads", "worker_threads"])
+def test_server_rejects_nonpositive_execution_pool_size(thread_option: str) -> None:
+    with pytest.raises(ValueError, match=thread_option):
+        KVCacheServer(_DEFAULT_URL, **{thread_option: 0})
 
 
 def test_server_request_stop_completes_run_loop() -> None:

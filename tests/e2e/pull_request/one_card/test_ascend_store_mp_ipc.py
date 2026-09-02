@@ -187,7 +187,7 @@ def _make_worker_config(server_url: str | None = None):
         ),
         kv_transfer_config=SimpleNamespace(
             engine_id="ascend-store-mp-ipc-test",
-            kv_connector="AscendStoreMPConnector",
+            kv_connector="AscendStoreConnector",
             kv_role="kv_producer",
             kv_connector_extra_config=extra_config,
             is_kv_producer=True,
@@ -345,7 +345,12 @@ def _run_kv_cache_server(
             if observation_connection is not None
             else None
         )
-        server = KVCacheServer(_SERVER_URL, max_workers=2, worker_factory=worker_factory)
+        server = KVCacheServer(
+            _SERVER_URL,
+            scheduler_threads=2,
+            worker_threads=2,
+            worker_factory=worker_factory,
+        )
         control_thread = threading.Thread(
             target=_request_server_stop,
             args=(server, control_connection),
