@@ -17,6 +17,9 @@ from .server import (
 
 logger = logging.getLogger(__name__)
 
+_AUTOMATIC_ABORT_EXIT_CODE = 1
+_SIGINT_EXIT_CODE = 128 + signal.SIGINT
+
 # ==============================
 # Command-line entry point
 # ==============================
@@ -92,9 +95,8 @@ def _run_kv_cache_server(
     scheduler_threads: int,
     worker_threads: int,
 ) -> int:
-    shutdown_signals = _ShutdownSignals()
-    shutdown_signals.install()
-    server_stopped = threading.Event()
+    shutdown = _ServerShutdown()
+    shutdown.install()
     control_thread: threading.Thread | None = None
 
     try:
@@ -105,7 +107,7 @@ def _run_kv_cache_server(
         )
         control_thread = threading.Thread(
             target=_coordinate_server_shutdown,
-            args=(server, shutdown_signals, server_stopped),
+            args=(server, shutdown),
             daemon=True,
             name="ascend-store-kv-shutdown",
         )
@@ -113,12 +115,12 @@ def _run_kv_cache_server(
         logger.info("AscendStore KV cache server listening on %s", server.endpoint)
         server.run()
     finally:
-        server_stopped.set()
-        shutdown_signals.wake_waiters()
+        shutdown.notify_server_stopped()
         if control_thread is not None:
             control_thread.join()
-        shutdown_signals.restore()
-    return 0
+        shutdown.restore()
+
+    return shutdown.exit_code
 
 
 # ==============================
@@ -127,17 +129,28 @@ def _run_kv_cache_server(
 
 # Signal handlers only record intent because they run in the main thread and
 # may interrupt code that already owns a server lock. A control thread performs
-# the lifecycle calls: the first signal asks the run loop to drain, while a
-# later Ctrl-C cancels that drain without starting either operation twice.
+# the lifecycle calls, while the recorded outcome lets the process distinguish
+# a completed drain, an automatic abort, and a later Ctrl-C that cancels draining.
 
 
-class _ShutdownSignals:
-    """Record one graceful shutdown request and one later Ctrl-C abort."""
+class _ServerShutdown:
+    """Coordinate process signals with one server run and its exit status."""
 
     def __init__(self) -> None:
         self.shutdown_requested = threading.Event()
-        self.abort_requested = threading.Event()
+        self.force_abort_requested = threading.Event()
+        self.graceful_shutdown_unavailable = threading.Event()
+        self.server_stopped = threading.Event()
+        self._abort_waiter = threading.Event()
         self._previous_handlers: dict[int, signal.Handlers] = {}
+
+    @property
+    def exit_code(self) -> int:
+        if self.force_abort_requested.is_set():
+            return _SIGINT_EXIT_CODE
+        if self.graceful_shutdown_unavailable.is_set():
+            return _AUTOMATIC_ABORT_EXIT_CODE
+        return 0
 
     def install(self) -> None:
         try:
@@ -153,35 +166,43 @@ class _ShutdownSignals:
             signal.signal(signum, handler)
         self._previous_handlers.clear()
 
-    def wake_waiters(self) -> None:
+    def notify_server_stopped(self) -> None:
         """Release the control thread after the server stops on its own."""
+        self.server_stopped.set()
         self.shutdown_requested.set()
-        self.abort_requested.set()
+        self._abort_waiter.set()
+
+    def wait_for_abort_or_server_stop(self) -> None:
+        """Wait without treating a completed server run as a forced abort."""
+        self._abort_waiter.wait()
 
     def _handle(self, signum: int, _frame: FrameType | None) -> None:
+        if self.server_stopped.is_set():
+            return
         if not self.shutdown_requested.is_set():
             self.shutdown_requested.set()
         elif signum == signal.SIGINT:
-            self.abort_requested.set()
+            self.force_abort_requested.set()
+            self._abort_waiter.set()
 
 
 def _coordinate_server_shutdown(
     server: KVCacheServer,
-    shutdown_signals: _ShutdownSignals,
-    server_stopped: threading.Event,
+    shutdown: _ServerShutdown,
 ) -> None:
-    shutdown_signals.shutdown_requested.wait()
-    if server_stopped.is_set():
+    shutdown.shutdown_requested.wait()
+    if shutdown.server_stopped.is_set():
         return
 
     logger.info("Graceful shutdown started; press Ctrl-C again to abort outstanding requests")
     if not server.request_stop():
+        shutdown.graceful_shutdown_unavailable.set()
         logger.warning("Graceful shutdown is unavailable; aborting the KV cache server")
         server.abort()
         return
 
-    shutdown_signals.abort_requested.wait()
-    if server_stopped.is_set():
+    shutdown.wait_for_abort_or_server_stop()
+    if shutdown.server_stopped.is_set():
         return
 
     logger.warning("Forced KV cache server abort requested")

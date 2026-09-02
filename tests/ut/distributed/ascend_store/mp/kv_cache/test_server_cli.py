@@ -7,8 +7,8 @@ import pytest
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.kv_cache import cli
 
 
-def test_main_runs_kv_cache_server(monkeypatch):
-    run_server = MagicMock(return_value=0)
+def test_main_returns_kv_cache_server_exit_code(monkeypatch):
+    run_server = MagicMock(return_value=130)
     monkeypatch.setattr(cli, "_run_kv_cache_server", run_server)
 
     assert (
@@ -23,7 +23,7 @@ def test_main_runs_kv_cache_server(monkeypatch):
                 "6",
             ]
         )
-        == 0
+        == 130
     )
 
     run_server.assert_called_once_with("tcp://127.0.0.1:6000", 2, 6)
@@ -58,30 +58,41 @@ def test_main_rejects_invalid_worker_count(option, value):
 
 
 def test_repeated_sigterm_does_not_abort(monkeypatch):
-    server, handlers, restored = _run_server_with_signals(monkeypatch, [signal.SIGTERM, signal.SIGTERM])
+    server, handlers, restored, exit_code = _run_server_with_signals(monkeypatch, [signal.SIGTERM, signal.SIGTERM])
 
     server.request_stop.assert_called_once_with()
     server.abort.assert_not_called()
+    assert exit_code == 0
     assert restored == {signal.SIGINT, signal.SIGTERM}
     assert set(handlers) == {signal.SIGINT, signal.SIGTERM}
 
 
 def test_second_sigint_aborts_once(monkeypatch):
-    server, _, _ = _run_server_with_signals(monkeypatch, [signal.SIGINT, signal.SIGINT], wait_for_abort=True)
+    server, _, _, exit_code = _run_server_with_signals(
+        monkeypatch,
+        [signal.SIGINT, signal.SIGINT],
+        wait_for_abort=True,
+    )
 
     server.request_stop.assert_called_once_with()
     server.abort.assert_called_once_with()
+    assert exit_code == 130
 
 
 def test_sigint_aborts_after_sigterm(monkeypatch):
-    server, _, _ = _run_server_with_signals(monkeypatch, [signal.SIGTERM, signal.SIGINT], wait_for_abort=True)
+    server, _, _, exit_code = _run_server_with_signals(
+        monkeypatch,
+        [signal.SIGTERM, signal.SIGINT],
+        wait_for_abort=True,
+    )
 
     server.request_stop.assert_called_once_with()
     server.abort.assert_called_once_with()
+    assert exit_code == 130
 
 
-def test_failed_drain_request_aborts(monkeypatch):
-    server, _, _ = _run_server_with_signals(
+def test_unavailable_graceful_shutdown_aborts_with_failure(monkeypatch):
+    server, _, _, exit_code = _run_server_with_signals(
         monkeypatch,
         [signal.SIGTERM],
         request_stop_result=False,
@@ -90,6 +101,7 @@ def test_failed_drain_request_aborts(monkeypatch):
 
     server.request_stop.assert_called_once_with()
     server.abort.assert_called_once_with()
+    assert exit_code == 1
 
 
 def _run_server_with_signals(
@@ -98,7 +110,7 @@ def _run_server_with_signals(
     *,
     request_stop_result: bool = True,
     wait_for_abort: bool = False,
-) -> tuple[MagicMock, dict[int, object], set[int]]:
+) -> tuple[MagicMock, dict[int, object], set[int], int]:
     handlers: dict[int, object] = {}
     restored: set[int] = set()
 
@@ -136,10 +148,10 @@ def _run_server_with_signals(
     server_class = MagicMock(return_value=server)
     monkeypatch.setattr(cli, "KVCacheServer", server_class)
 
-    assert cli._run_kv_cache_server("tcp://127.0.0.1:6000", 2, 6) == 0
+    exit_code = cli._run_kv_cache_server("tcp://127.0.0.1:6000", 2, 6)
     server_class.assert_called_once_with(
         "tcp://127.0.0.1:6000",
         scheduler_threads=2,
         worker_threads=6,
     )
-    return server, handlers, restored
+    return server, handlers, restored, exit_code
