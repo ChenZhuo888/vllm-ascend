@@ -81,6 +81,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.adapter import (
+    KVCacheStoreKeyLayerRecvingProcessAdapter,
+    KVCacheStoreKeyLayerSendingProcessAdapter,
+    KVCacheStoreLayerRecvingProcessAdapter,
+    KVCacheStoreLayerSendingProcessAdapter,
+    KVCacheStoreRecvingProcessAdapter,
+    KVCacheStoreSendingProcessAdapter,
+)
 from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
@@ -125,8 +133,8 @@ class KVPoolWorker:
         self._init_kv_transfer_config(vllm_config, extra_config, use_layerwise, kv_cache_config)
         self._init_key_head_config(model_config, parallel_config)
         self._init_metadata(model_config, vllm_config, extra_config)
-        self._init_backend(parallel_config, extra_config)
         self._init_kv_events(vllm_config)
+        self._init_backend(parallel_config, extra_config)
         self._init_state_vars()
         self._init_layerwise_config()
         self._kv_stats = AscendStoreKVConnectorStats()
@@ -153,6 +161,9 @@ class KVPoolWorker:
 
     def _init_kv_transfer_config(self, vllm_config, extra_config, use_layerwise, kv_cache_config) -> None:
         self._extra_config = extra_config
+        self.use_multiprocess = extra_config.get("use_multiprocess", False)
+        if not isinstance(self.use_multiprocess, bool):
+            raise ValueError("use_multiprocess must be a boolean")
         self.use_layerwise = use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = extra_config.get("load_async", False)
@@ -319,6 +330,31 @@ class KVPoolWorker:
         self.token_database.cache_coordinator = self.cache_coordinator
 
     def _init_backend(self, parallel_config, extra_config) -> None:
+        self.transfer_process = None
+        self.m_store: Any
+        use_transfer_process = self.use_multiprocess
+        if use_transfer_process:
+            from .mp.transfer_backend import requires_model_worker_backend
+
+            use_transfer_process = not requires_model_worker_backend(self.backend_name)
+        if use_transfer_process:
+            from .mp.transfer import KVTransferProcess
+
+            self.transfer_process = KVTransferProcess(
+                dict(
+                    backend=self.backend_name,
+                    device_index=torch.npu.current_device(),
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    dcp_size=self.dcp_size,
+                    put_step=self.put_step,
+                    kv_role=self.kv_role,
+                    enable_kv_events=self.enable_kv_events,
+                    lazy_init=self.use_compress,
+                )
+            )
+            self.m_store = self.transfer_process
+            return
         backend = backend_map.get(self.backend.lower())
         assert backend is not None
         backend_path = backend.get("path")
@@ -489,6 +525,113 @@ class KVPoolWorker:
 
     def _start_kv_transfer_threads(self) -> None:
         if self._transfer_threads_started:
+            return
+
+        if self.transfer_process is not None:
+            if self.use_layerwise:
+                self.get_event = threading.Event()
+                self.layer_load_finished_events = [threading.Event() for _ in range(self.num_layers)]
+                self.layer_save_finished_events = [threading.Event() for _ in range(self.num_layers)]
+                self.sync_save_events = [torch.npu.Event(interprocess=True) for _ in range(self.num_layers)]
+                ready_event = threading.Event()
+                can_save = self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put
+                common = dict(
+                    m_store=self.m_store,
+                    token_database=self.token_database,
+                    block_size=self.block_size,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    dcp_size=self.dcp_size,
+                    ready_event=ready_event,
+                    process=self.transfer_process,
+                )
+                if self.use_layerwise_transfer:
+                    common["block_size"] = self.grouped_block_size
+                    group_builders = self._build_group_layer_builders()
+                    layer_send_adapter = None
+                    if can_save:
+                        layer_send_adapter = KVCacheStoreLayerSendingProcessAdapter(
+                            **common,
+                            page_size_bytes=self.page_size_bytes,
+                            num_layers=self.num_layers,
+                            layer_save_finished_events=self.layer_save_finished_events,
+                            sync_save_events=self.sync_save_events,
+                            max_transfer_blocks=self.layerwise_max_transfer_blocks,
+                            max_transfer_bytes=self.layerwise_max_transfer_bytes,
+                            group_builders=group_builders,
+                        )
+                        self.kv_send_thread = layer_send_adapter
+                    layer_recv_adapter = KVCacheStoreLayerRecvingProcessAdapter(
+                        **common,
+                        page_size_bytes=self.page_size_bytes,
+                        get_event=self.get_event,
+                        layer_load_finished_events=self.layer_load_finished_events,
+                        layer_save_finished_events=self.layer_save_finished_events,
+                        sync_save_events=self.sync_save_events,
+                        num_layers=self.num_layers,
+                        h2d_stagger_us=self.h2d_stagger_us,
+                        max_transfer_blocks=self.layerwise_max_transfer_blocks,
+                        max_transfer_bytes=self.layerwise_max_transfer_bytes,
+                        group_builders=group_builders,
+                        external_slot_release_waiter=self.external_slot_release_waiter,
+                        save_failure_checker=(
+                            self.kv_send_thread.raise_if_failed if self.kv_send_thread is not None else None
+                        ),
+                    )
+                    self.kv_recv_thread = layer_recv_adapter
+                    self.transfer_process.bind_adapters((layer_send_adapter, layer_recv_adapter))
+                else:
+                    key_send_adapter = None
+                    if can_save:
+                        key_send_adapter = KVCacheStoreKeyLayerSendingProcessAdapter(
+                            **common,
+                            put_step=self.put_step,
+                            num_layers=self.num_layers,
+                            layer_save_finished_events=self.layer_save_finished_events,
+                            sync_save_events=self.sync_save_events,
+                        )
+                        self.kv_send_thread = key_send_adapter
+                    key_recv_adapter = KVCacheStoreKeyLayerRecvingProcessAdapter(
+                        **common,
+                        get_event=self.get_event,
+                        layer_load_finished_events=self.layer_load_finished_events,
+                        layer_save_finished_events=self.layer_save_finished_events,
+                        num_layers=self.num_layers,
+                    )
+                    self.kv_recv_thread = key_recv_adapter
+                    self.transfer_process.bind_adapters((key_send_adapter, key_recv_adapter))
+                self._transfer_threads_started = True
+                return
+
+            common = dict(
+                m_store=self.m_store,
+                token_database=self.token_database,
+                block_size=self.grouped_block_size,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                dcp_size=self.dcp_size,
+                process=self.transfer_process,
+            )
+            store_send_adapter = None
+            if self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put:
+                store_send_adapter = KVCacheStoreSendingProcessAdapter(
+                    **common,
+                    put_step=self.put_step,
+                    kv_role=self.kv_role,
+                    group_uses_align_state=self.group_uses_align_state,
+                    enable_kv_event=self.enable_kv_events,
+                )
+                self.kv_send_thread = store_send_adapter
+            store_recv_adapter = None
+            if self.load_async:
+                store_recv_adapter = KVCacheStoreRecvingProcessAdapter(
+                    **common,
+                    invalid_block_ids=self._invalid_block_ids,
+                    invalid_block_ids_lock=self._invalid_block_ids_lock,
+                )
+                self.kv_recv_thread = store_recv_adapter
+            self.transfer_process.bind_adapters((store_send_adapter, store_recv_adapter))
+            self._transfer_threads_started = True
             return
 
         if self.use_layerwise:
@@ -852,7 +995,11 @@ class KVPoolWorker:
         # directly here (like main) — no separate init_backend handshake.
         if self.use_layerwise_transfer:
             self.m_store.ensure_initialized()
-        self.m_store.register_buffer(ptrs, lengths)
+        process = self.transfer_process
+        if process is not None:
+            process.register_kv_caches(self, kv_caches, ptrs, lengths)
+        else:
+            self.m_store.register_buffer(ptrs, lengths)
         self._start_kv_transfer_threads()
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
@@ -1790,7 +1937,9 @@ class KVPoolWorker:
             if can_save is None or not can_save:
                 continue
             if current_event is None:
-                current_event = torch.npu.Event()
+                current_event = (
+                    torch.npu.Event(interprocess=True) if self.transfer_process is not None else torch.npu.Event()
+                )
                 current_event.record()
             request.skip_null_blocks_by_group = self.group_uses_align_state
             request.current_event = current_event
@@ -1798,7 +1947,15 @@ class KVPoolWorker:
             send_thread.add_request(request)
 
         if current_event is not None:
-            send_thread.request_queue.join()
+            if isinstance(send_thread, KVCacheStoreSendingProcessAdapter):
+                send_thread.wait_for_pending()
+            else:
+                send_thread.request_queue.join()
+
+    def close(self) -> None:
+        process = self.transfer_process
+        if process is not None:
+            process.close()
 
     def retrieve_layer(
         self,
@@ -2112,6 +2269,12 @@ class KVPoolWorker:
             send_thread.dec_stored_request(req_id)  # type: ignore[attr-defined]
 
     def get_finished(self, finished_req_ids: set[str], meta: AscendConnectorMetadata) -> tuple[set[str], set[str]]:
+        process = self.transfer_process
+        if process is not None:
+            process.client.raise_if_failed()
+            for transfer in (self.kv_send_thread, self.kv_recv_thread):
+                if transfer is not None:
+                    transfer.raise_if_failed()
         if self.kv_send_thread is not None:
             send_thread = self.kv_send_thread
             for req_id in meta.preempted_req_ids:
