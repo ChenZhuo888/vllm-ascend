@@ -1,32 +1,19 @@
 """Device selection and buffer ownership for the private transfer process."""
 
-import os
 from typing import Any
 
 import torch
 
 
-def requires_model_worker_backend(name: str) -> bool:
-    """Keep backends that need model-worker-only state on their existing path."""
-    if name != "mooncake":
-        return False
-    if not os.getenv("MOONCAKE_CONFIG_PATH"):
-        return False
-    from ..backend.mooncake_backend import MooncakeStoreConfig
-
-    return MooncakeStoreConfig.load_from_env().enable_ssd_offload
-
-
-def create_transfer_backend(name: str, device_index: int, lazy_init: bool = False) -> "TransferBackend":
-    # Only the selected SDK is imported; no distributed groups are initialized
-    # in this process. These constructors do not consume ParallelConfig unless
-    # Mooncake SSD offload needs its process-global rank.
+def create_transfer_backend(
+    name: str, device_index: int, global_rank: int, lazy_init: bool = False
+) -> "TransferBackend":
+    # Import only the selected SDK. Model-worker identity arrives as plain
+    # values, so this process never joins the worker's distributed groups.
     if name == "mooncake":
-        from ..backend.mooncake_backend import MooncakeBackend, MooncakeStoreConfig
+        from .mooncake_backend import MPMooncakeBackend
 
-        if MooncakeStoreConfig.load_from_env().enable_ssd_offload:
-            raise NotImplementedError("Multiprocess transfer does not yet support Mooncake SSD offload")
-        backend = MooncakeBackend(None, lazy_init=lazy_init)  # type: ignore[arg-type]
+        backend = MPMooncakeBackend(device_index, global_rank, lazy_init=lazy_init)
     elif name == "memcache":
         from ..backend.memcache_backend import MemcacheBackend
 

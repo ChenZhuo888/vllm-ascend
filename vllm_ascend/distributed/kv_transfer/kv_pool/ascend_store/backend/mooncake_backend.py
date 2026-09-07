@@ -157,7 +157,7 @@ def _inject_store_qos(extra_config: dict[str, Any] | None) -> None:
 class MooncakeBackend(Backend):
     def __init__(
         self,
-        parallel_config: ParallelConfig,
+        parallel_config: ParallelConfig | None,
         lazy_init: bool = False,
         contribute_memory: bool = True,
         extra_config: dict[str, Any] | None = None,
@@ -215,7 +215,7 @@ class MooncakeBackend(Backend):
         # rank so that DP/TP/PP/CP replicas never share a directory (dense and
         # MoE alike); only ranks that contribute memory need an offload dir.
         if ssd_kwargs and ssd_kwargs.get("ssd_offload_path") and self._contribute_memory:
-            global_rank = get_global_rank(self.parallel_config)
+            global_rank = self._get_ssd_offload_rank()
             rank_path = os.path.join(str(ssd_kwargs["ssd_offload_path"]), f"rank_{global_rank}")
             try:
                 os.makedirs(rank_path, exist_ok=True)
@@ -271,6 +271,11 @@ class MooncakeBackend(Backend):
             )
         logger.info("Mooncake tenant_id=%s", self.config.tenant_id)
         return store
+
+    def _get_ssd_offload_rank(self) -> int:
+        if self.parallel_config is None:
+            raise RuntimeError("Mooncake SSD offload requires the model worker rank")
+        return get_global_rank(self.parallel_config)
 
     @classmethod
     def create_scheduler_client(cls, parallel_config: ParallelConfig):

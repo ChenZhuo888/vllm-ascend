@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_pcp_group,
     get_tensor_model_parallel_rank,
@@ -104,6 +104,20 @@ LAYERWISE_READ_LEASE_TTL_MS = 5 * 60 * 1000
 MEMCACHE_UNMATCHED_STATE = -3101
 PARTIAL_LEASE_RETRY_COUNT = 10
 PARTIAL_LEASE_RETRY_INTERVAL_S = 0.001
+
+
+def _get_worker_global_rank(parallel_config: ParallelConfig) -> int:
+    """Build a cross-DP rank from identity populated by the model Worker.
+
+    DCP reuses TP devices, so one DP replica spans TP, PP and prefill CP only.
+    """
+    replica_size = (
+        parallel_config.tensor_parallel_size
+        * parallel_config.pipeline_parallel_size
+        * parallel_config.prefill_context_parallel_size
+    )
+    rank_in_replica = parallel_config.rank % replica_size
+    return parallel_config.data_parallel_index * replica_size + rank_in_replica
 
 
 class KVPoolWorker:
@@ -332,18 +346,14 @@ class KVPoolWorker:
     def _init_backend(self, parallel_config, extra_config) -> None:
         self.transfer_process = None
         self.m_store: Any
-        use_transfer_process = self.use_multiprocess
-        if use_transfer_process:
-            from .mp.transfer_backend import requires_model_worker_backend
-
-            use_transfer_process = not requires_model_worker_backend(self.backend_name)
-        if use_transfer_process:
+        if self.use_multiprocess:
             from .mp.transfer import KVTransferProcess
 
             self.transfer_process = KVTransferProcess(
                 dict(
                     backend=self.backend_name,
                     device_index=torch.npu.current_device(),
+                    global_rank=_get_worker_global_rank(parallel_config),
                     tp_rank=self.tp_rank,
                     tp_size=self.tp_size,
                     dcp_size=self.dcp_size,

@@ -78,7 +78,9 @@ class TransferService:
         self.config = config
         self.device_index = config["device_index"]
         torch.npu.set_device(self.device_index)
-        self.backend = create_transfer_backend(config["backend"], self.device_index, config.get("lazy_init", False))
+        self.backend = create_transfer_backend(
+            config["backend"], self.device_index, config["global_rank"], config.get("lazy_init", False)
+        )
         self.cache: ImportedKVCache | None = None
         self.sender: KVTransferThread | None = None
         self.receiver: KVTransferThread | None = None

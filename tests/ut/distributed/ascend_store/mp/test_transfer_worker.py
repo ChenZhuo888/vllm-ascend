@@ -181,6 +181,7 @@ def test_child_handlers_match_thread_keys_and_roundtrip_buffer_contents(monkeypa
     )
     config = dict(
         device_index=None,
+        global_rank=0,
         tp_rank=1,
         tp_size=2,
         dcp_size=1,
@@ -252,6 +253,7 @@ def test_child_tp_mismatch_handler_reuses_worker_business_logic(monkeypatch):
     config = dict(
         backend="mooncake",
         device_index=None,
+        global_rank=0,
         tp_rank=0,
         tp_size=2,
         dcp_size=1,
@@ -335,6 +337,7 @@ def test_child_handlers_preserve_hybrid_group_keys_and_buffers(monkeypatch):
     config = dict(
         backend="mooncake",
         device_index=None,
+        global_rank=0,
         tp_rank=0,
         tp_size=1,
         dcp_size=1,
@@ -401,6 +404,7 @@ def test_child_key_layer_handlers_roundtrip_buffer_contents(monkeypatch):
     config = dict(
         backend="mooncake",
         device_index=None,
+        global_rank=0,
         tp_rank=0,
         tp_size=1,
         dcp_size=1,
@@ -461,6 +465,7 @@ def test_child_gva_layer_handlers_roundtrip_multiple_cache_groups(monkeypatch):
     config = dict(
         backend="memcache",
         device_index=None,
+        global_rank=0,
         tp_rank=0,
         tp_size=1,
         dcp_size=1,
@@ -630,34 +635,41 @@ def test_worker_selects_process_without_changing_ordinary_transfer_modes(use_hyb
         worker.use_compress = use_compress
         worker.tp_mismatch = tp_mismatch
         worker.use_multiprocess = True
-        with (
-            patch(
-                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.transfer_backend.requires_model_worker_backend",
-                return_value=False,
-            ),
-            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.transfer.KVTransferProcess") as factory,
-        ):
-            worker._init_backend(None, worker._extra_config)
+        parallel_config = SimpleNamespace(
+            rank=5,
+            data_parallel_index=2,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=2,
+            prefill_context_parallel_size=1,
+        )
+        with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.transfer.KVTransferProcess") as factory:
+            worker._init_backend(parallel_config, worker._extra_config)
             assert worker.m_store is factory.return_value
             assert factory.call_args.args[0]["tp_rank"] == worker.tp_rank
             assert factory.call_args.args[0]["kv_role"] == "kv_producer"
             assert factory.call_args.args[0]["lazy_init"] is use_compress
+            assert factory.call_args.args[0]["global_rank"] == 9
     finally:
         case.doCleanups()
 
 
-def test_backend_requiring_distributed_state_keeps_existing_thread_path():
+def test_mooncake_uses_transfer_process_with_worker_rank():
     case = unittest.TestCase()
     try:
         worker = make_worker(case)
         worker.use_compress = False
         worker.use_multiprocess = True
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.transfer_backend.requires_model_worker_backend",
-            return_value=True,
-        ):
-            worker._init_backend(None, worker._extra_config)
-        assert worker.transfer_process is None
+        parallel_config = SimpleNamespace(
+            rank=3,
+            data_parallel_index=1,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=2,
+        )
+        with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.transfer.KVTransferProcess") as factory:
+            worker._init_backend(parallel_config, worker._extra_config)
+        assert worker.transfer_process is factory.return_value
+        assert factory.call_args.args[0]["global_rank"] == 7
     finally:
         case.doCleanups()
 
@@ -665,13 +677,7 @@ def test_backend_requiring_distributed_state_keeps_existing_thread_path():
 def test_worker_selects_process_for_layerwise_mode():
     case = unittest.TestCase()
     try:
-        with (
-            patch(
-                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.transfer_backend.requires_model_worker_backend",
-                return_value=False,
-            ),
-            patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.transfer.KVTransferProcess") as factory,
-        ):
+        with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.transfer.KVTransferProcess") as factory:
             worker = make_worker(case, use_layerwise=True, extra_config={"use_multiprocess": True})
         assert worker.transfer_process is factory.return_value
         assert worker.m_store is factory.return_value
