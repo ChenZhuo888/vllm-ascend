@@ -107,12 +107,28 @@ def request(req_id="request"):
     return ReqMeta(req_id, 4, [[1, 3]], [b"a" * 32, b"b" * 32], can_save=True)
 
 
+class EventImportRecorder:
+    """Child-side NPU event import spy: one imported object per IPC handle."""
+
+    def __init__(self):
+        self.calls = 0
+        self.by_handle: dict[bytes, MagicMock] = {}
+
+    def __call__(self, spec):
+        self.calls += 1
+        if spec.handle not in self.by_handle:
+            self.by_handle[spec.handle] = MagicMock()
+        return self.by_handle[spec.handle]
+
+
 def registered_runtime(monkeypatch, config, backend, worker, caches, pointers, lengths):
     adapter = _CPUMemoryAdapter()
     export = npu_ipc.export_worker_kv_caches
     import_cache = npu_ipc.import_worker_kv_caches
     monkeypatch.setattr(npu_ipc, "export_worker_kv_caches", lambda values: export(values, adapter))
     monkeypatch.setattr(npu_ipc, "import_worker_kv_caches", lambda spec: import_cache(spec, adapter))
+    event_imports = EventImportRecorder()
+    monkeypatch.setattr(npu_ipc, "import_npu_event", event_imports)
     with patch(
         "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.transfer_backend.create_transfer_backend",
         return_value=backend,
@@ -123,6 +139,7 @@ def registered_runtime(monkeypatch, config, backend, worker, caches, pointers, l
     parent.register_kv_caches(worker, caches, pointers, lengths)
     payload = parent.client.call.call_args.args[1]
     runtime.execute("register", msgspec.msgpack.decode(msgspec.msgpack.encode(payload)))
+    runtime.event_imports = event_imports
     return runtime, parent
 
 
@@ -132,15 +149,20 @@ def run_transfer(runtime, parent, operation, req):
     return runtime.submit(operation, msgspec.msgpack.decode(msgspec.msgpack.encode(payload))).result(2)
 
 
-def layerwise_worker(db, *, use_gva):
+def layerwise_worker(db, *, use_gva, num_layers=1):
     group_ids = sorted(db.group_kv_caches_base_addr)
+    save_events = []
+    for layer in range(num_layers):
+        event = MagicMock()
+        event.ipc_handle.return_value = f"layer-{layer}-event".encode()
+        save_events.append(event)
     return SimpleNamespace(
         token_database=db,
         group_kv_caches_base_addr=db.group_kv_caches_base_addr,
         group_block_len=db.group_block_len,
         group_block_stride=db.group_block_stride,
         group_kv_cache_families={group_id: "default" for group_id in group_ids},
-        group_num_layers={group_id: 1 for group_id in group_ids},
+        group_num_layers={group_id: num_layers for group_id in group_ids},
         group_layer_cache_entry_offsets={
             group_id: [0, len(db.group_kv_caches_base_addr[group_id])] for group_id in group_ids
         },
@@ -148,7 +170,8 @@ def layerwise_worker(db, *, use_gva):
         use_layerwise=True,
         use_layerwise_transfer=use_gva,
         block_size=db.block_size[0],
-        num_layers=1,
+        num_layers=num_layers,
+        sync_save_events=save_events,
         page_size_bytes=sum(db.group_block_len[0]),
         consumer_is_to_put=False,
         h2d_stagger_us=0,
@@ -158,8 +181,8 @@ def layerwise_worker(db, *, use_gva):
     )
 
 
-def run_layer_transfer(runtime, parent, operation, tasks, event=None):
-    parent.submit_layer_request(operation, tasks, tasks[0].layer_id, event)
+def run_layer_transfer(runtime, parent, operation, tasks):
+    parent.submit_layer_request(operation, tasks, tasks[0].layer_id)
     payload = parent.client.submit.call_args.args[1]
     return runtime.submit(operation, msgspec.msgpack.decode(msgspec.msgpack.encode(payload))).result(2)
 
@@ -417,19 +440,16 @@ def test_child_key_layer_handlers_roundtrip_buffer_contents(monkeypatch):
     runtime, parent = registered_runtime(
         monkeypatch, config, backend, worker, {"layer.0": tensor}, [tensor.data_ptr()], [tensor.nbytes]
     )
-    event = MagicMock()
-    event.ipc_handle.return_value = b"layer-event"
-    imported_event = MagicMock()
-    monkeypatch.setattr(npu_ipc, "import_npu_event", lambda _spec: imported_event)
     req = request()
     req.is_last_chunk = True
     task = LayerTransferTask(0, [LayerBlockRange(req, 0, 2)])
     expected = torch.zeros_like(tensor)
     expected[[1, 3]] = tensor[[1, 3]]
     try:
-        result = run_layer_transfer(runtime, parent, "store", [task], event)
+        result = run_layer_transfer(runtime, parent, "store", [task])
         assert result["finished_req_ids"] == [req.req_id]
         assert len(backend.writes) == 2
+        imported_event = runtime.event_imports.by_handle[b"layer-0-event"]
         imported_event.synchronize.assert_called_once_with()
 
         tensor.zero_()
@@ -478,10 +498,6 @@ def test_child_gva_layer_handlers_roundtrip_multiple_cache_groups(monkeypatch):
     pointers = [cache.data_ptr() for cache in caches.values()]
     lengths = [cache.nbytes for cache in caches.values()]
     runtime, parent = registered_runtime(monkeypatch, config, backend, worker, caches, pointers, lengths)
-    event = MagicMock()
-    event.ipc_handle.return_value = b"layer-event"
-    imported_event = MagicMock()
-    monkeypatch.setattr(npu_ipc, "import_npu_event", lambda _spec: imported_event)
     tasks = []
     for group_id, remote in enumerate(remotes):
         shared = SharedBlockData(
@@ -502,10 +518,11 @@ def test_child_gva_layer_handlers_roundtrip_multiple_cache_groups(monkeypatch):
             )
         )
     try:
-        result = run_layer_transfer(runtime, parent, "store", tasks, event)
+        result = run_layer_transfer(runtime, parent, "store", tasks)
         assert set(result["finished_req_ids"]) == {"request-0", "request-1"}
         assert [remote.tolist() for remote in remotes] == [cache.tolist() for cache in caches.values()]
         assert backend.finishes == [(["key-0", "key-1"], [0, 0])]
+        imported_event = runtime.event_imports.by_handle[b"layer-0-event"]
         imported_event.synchronize.assert_called_once_with()
 
         for cache in caches.values():
@@ -515,6 +532,77 @@ def test_child_gva_layer_handlers_roundtrip_multiple_cache_groups(monkeypatch):
         assert [cache.tolist() for cache in caches.values()] == [remote.tolist() for remote in remotes]
         assert [len(copy[0]) for copy in backend.copies] == [4, 4]
         assert [copy[-1] for copy in backend.copies] == [0, 1]
+    finally:
+        runtime.close()
+        parent.close()
+
+
+def two_layer_key_runtime(monkeypatch):
+    tensor = torch.arange(8, dtype=torch.uint8).view(4, 2)
+    db = database()
+    db.set_group_buffers(
+        {0: [tensor.data_ptr()]},
+        {0: [2]},
+        {0: [2]},
+        group_num_layers={0: 2},
+        group_layer_cache_entry_offsets={0: [0, 1]},
+    )
+    worker = layerwise_worker(db, use_gva=False, num_layers=2)
+    config = dict(
+        backend="mooncake",
+        device_index=None,
+        global_rank=0,
+        tp_rank=0,
+        tp_size=1,
+        dcp_size=1,
+        put_step=1,
+        kv_role="kv_producer",
+        enable_kv_events=False,
+        lazy_init=False,
+    )
+    backend = MemoryBackend()
+    runtime, parent = registered_runtime(
+        monkeypatch, config, backend, worker, {"layer.0": tensor}, [tensor.data_ptr()], [tensor.nbytes]
+    )
+    return runtime, parent, backend
+
+
+def test_layerwise_events_are_imported_once_per_layer_at_registration(monkeypatch):
+    runtime, parent, _ = two_layer_key_runtime(monkeypatch)
+    try:
+        assert runtime.event_imports.calls == 2
+        assert set(runtime.event_imports.by_handle) == {b"layer-0-event", b"layer-1-event"}
+        assert runtime.sender.sync_save_events == [
+            runtime.event_imports.by_handle[b"layer-0-event"],
+            runtime.event_imports.by_handle[b"layer-1-event"],
+        ]
+    finally:
+        runtime.close()
+        parent.close()
+
+
+def test_repeated_layer_stores_reuse_the_imported_event(monkeypatch):
+    runtime, parent, backend = two_layer_key_runtime(monkeypatch)
+    imported_event = runtime.event_imports.by_handle[b"layer-1-event"]
+    req = request()
+    req.is_last_chunk = True
+    task = LayerTransferTask(1, [LayerBlockRange(req, 0, 2)])
+    try:
+        for round_id in range(2):
+            if round_id > 0:
+                # A hot request stores its new suffix blocks, which the pool
+                # has not seen yet.
+                backend.values.clear()
+            result = run_layer_transfer(runtime, parent, "store", [task])
+            assert result["finished_req_ids"] == [req.req_id]
+            # The layer request carries only the layer identity, never an event.
+            assert "current_event" not in parent.client.submit.call_args.args[1]
+
+        assert imported_event.synchronize.call_count == 2
+        # Stores must not re-import handles: the count stays at the two
+        # registration imports even after a second (hot) store round.
+        assert runtime.event_imports.calls == 2
+        assert runtime.sender.sync_save_events[1] is imported_event
     finally:
         runtime.close()
         parent.close()

@@ -533,6 +533,20 @@ class KVPoolWorker:
             self.kv_recv_thread.external_slot_release_waiter = waiter
         return True
 
+    def _ensure_sync_save_events(self, interprocess: bool) -> None:
+        """Create the per-layer save ordering events once, never replace them.
+
+        With subprocess transfers the IPC handles are exported inside the KV
+        cache registration payload and imported once by the child, so both
+        sides must keep referring to the same event objects for every store.
+        """
+        if self.sync_save_events is not None:
+            return
+        if interprocess:
+            self.sync_save_events = [torch.npu.Event(interprocess=True) for _ in range(self.num_layers)]
+        else:
+            self.sync_save_events = [torch.npu.Event() for _ in range(self.num_layers)]
+
     def _start_kv_transfer_threads(self) -> None:
         if self._transfer_threads_started:
             return
@@ -542,7 +556,7 @@ class KVPoolWorker:
                 self.get_event = threading.Event()
                 self.layer_load_finished_events = [threading.Event() for _ in range(self.num_layers)]
                 self.layer_save_finished_events = [threading.Event() for _ in range(self.num_layers)]
-                self.sync_save_events = [torch.npu.Event(interprocess=True) for _ in range(self.num_layers)]
+                self._ensure_sync_save_events(interprocess=True)
                 ready_event = threading.Event()
                 can_save = self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put
                 common = dict(
@@ -648,7 +662,7 @@ class KVPoolWorker:
             self.get_event = threading.Event()
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
-            self.sync_save_events = [torch.npu.Event() for i in range(self.num_layers)]
+            self._ensure_sync_save_events(interprocess=False)
             can_save = self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put
             if self.use_layerwise_transfer and can_save:
                 ready_event_sending = threading.Event()
@@ -1007,6 +1021,10 @@ class KVPoolWorker:
             self.m_store.ensure_initialized()
         process = self.transfer_process
         if process is not None:
+            if self.use_layerwise:
+                # The registration payload below exports these IPC handles,
+                # so the events must exist before it is built.
+                self._ensure_sync_save_events(interprocess=True)
             process.register_kv_caches(self, kv_caches, ptrs, lengths)
         else:
             self.m_store.register_buffer(ptrs, lengths)

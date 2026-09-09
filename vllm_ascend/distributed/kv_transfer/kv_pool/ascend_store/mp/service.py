@@ -183,6 +183,10 @@ class TransferService:
             KVCacheStoreLayerSendingThread,
             LayerBatchBuilder,
         )
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.npu_ipc import (
+            NPUEventSpec,
+            import_npu_event,
+        )
 
         self._layerwise = True
         num_layers = layerwise["num_layers"]
@@ -190,7 +194,17 @@ class TransferService:
         get_event = threading.Event()
         load_finished = [threading.Event() for _ in range(num_layers)]
         save_finished = [threading.Event() for _ in range(num_layers)]
-        sync_save_events = [None for _ in range(num_layers)]
+        # The parent creates one event per layer and keeps recording those
+        # same objects. Import each IPC handle exactly once here and keep the
+        # imported events alive until close; re-importing a handle per request
+        # leaves the replacement unsignalled on the device.
+        save_event_specs = layerwise.get("save_events") or []
+        if len(save_event_specs) != num_layers:
+            raise ValueError(
+                f"Layerwise registration needs one NPU save event per layer, "
+                f"got {len(save_event_specs)} for {num_layers} layers"
+            )
+        sync_save_events = [import_npu_event(msgspec.convert(spec, NPUEventSpec)) for spec in save_event_specs]
         common = dict(
             m_store=self.backend,
             token_database=database,
@@ -352,10 +366,6 @@ class TransferService:
 
     def _layer_transfer(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import LayerLoadTask
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mp.npu_ipc import (
-            NPUEventSpec,
-            import_npu_event,
-        )
 
         layer_id = payload["layer_id"]
         tasks = _restore_layer_tasks(payload["tasks"])
@@ -369,10 +379,8 @@ class TransferService:
         worker: Any = self.sender if operation == "store" else self.receiver
         assert worker is not None
         if operation == "store":
-            event = payload["current_event"]
-            if event is None:
+            if worker.sync_save_events[layer_id] is None:
                 raise RuntimeError(f"Layerwise save for layer {layer_id} is missing its NPU event")
-            worker.sync_save_events[layer_id] = import_npu_event(msgspec.convert(event, NPUEventSpec))
             worker.layer_save_finished_events[layer_id].clear()
             for req_id in request_ids:
                 worker.add_stored_request(req_id)

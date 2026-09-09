@@ -167,8 +167,9 @@ class _LayerSendingProcessAdapterMixin(_LayerProcessTransferAdapterMixin):
         if not transfer_tasks:
             return
         layer_id = transfer_tasks[0].layer_id
-        event = self.sync_save_events[layer_id]
-        future = self._process.submit_layer_request("store", transfer_tasks, layer_id, event)
+        # The child orders stores against the events it imported once at
+        # registration; the request itself carries no event.
+        future = self._process.submit_layer_request("store", transfer_tasks, layer_id)
         self._track(future, lambda result: self._complete_store(result, transfer_tasks, layer_id))
 
     def _complete_store(self, result: dict[str, Any], transfer_tasks: list[LayerTransferTask], layer_id: int) -> None:

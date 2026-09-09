@@ -138,6 +138,7 @@ class KVTransferProcess:
                     h2d_stagger_us=worker.h2d_stagger_us,
                     max_transfer_blocks=worker.layerwise_max_transfer_blocks,
                     max_transfer_bytes=worker.layerwise_max_transfer_bytes,
+                    save_events=self._export_sync_save_events(worker),
                 )
                 if getattr(worker, "use_layerwise", False)
                 else None
@@ -187,17 +188,16 @@ class KVTransferProcess:
         self._retain_event(future, event)
         return future
 
-    def submit_layer_request(self, operation: str, tasks: list[Any], layer_id: int, event: Any = None) -> Future:
+    def submit_layer_request(self, operation: str, tasks: list[Any], layer_id: int) -> Future:
         if self.cache is None:
             raise RuntimeError("KV caches are not registered")
+        # Layerwise stores order against the per-layer events imported once at
+        # registration, so the request carries only the layer identity.
         payload = dict(
             layer_id=layer_id,
             tasks=[_snapshot_layer_task(task) for task in tasks],
-            current_event=self._export_event(event),
         )
-        future = self.client.submit(operation, payload)
-        self._retain_event(future, event)
-        return future
+        return self.client.submit(operation, payload)
 
     # These synchronous proxies are the Backend surface used by KVPoolWorker.
     def exists(self, keys):
@@ -270,6 +270,15 @@ class KVTransferProcess:
 
         assert self._device_uuid is not None
         return NPUEventSpec(self._device_uuid, event.ipc_handle())
+
+    def _export_sync_save_events(self, worker) -> list[Any]:
+        # The worker creates these events before registration and records the
+        # same objects for every layer store; each handle is exported exactly
+        # once, here, inside the registration payload.
+        events = getattr(worker, "sync_save_events", None)
+        if not events:
+            raise RuntimeError("Layerwise registration requires the worker's NPU save events")
+        return [self._export_event(event) for event in events]
 
     def _retain_event(self, future: Future, event: Any) -> None:
         if event is None:
