@@ -367,6 +367,10 @@ class KVTransferThread(threading.Thread):
         if self._fatal_error is not None:
             raise RuntimeError(f"{self.name} failed during asynchronous transfer") from self._fatal_error
 
+    def wait_for_pending(self) -> None:
+        self.request_queue.join()
+        self.raise_if_failed()
+
     def set_finished_request(self, req_id):
         with self.done_task_lock:
             self.finished_requests.add(req_id)

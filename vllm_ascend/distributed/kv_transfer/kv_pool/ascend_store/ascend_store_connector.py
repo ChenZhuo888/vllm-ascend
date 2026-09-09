@@ -297,9 +297,6 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             # Don't do save if the role is kv_consumer
             return
 
-        if self.use_layerwise:
-            return
-
         assert self.connector_worker is not None
         self.connector_worker.wait_for_save(self._get_connector_metadata())
 

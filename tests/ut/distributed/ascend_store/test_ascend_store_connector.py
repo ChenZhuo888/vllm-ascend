@@ -431,9 +431,10 @@ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
                 role=KVConnectorRole.WORKER,
                 kv_cache_config=None,
             )
+            metadata = MagicMock()
+            connector._get_connector_metadata = MagicMock(return_value=metadata)
             connector.wait_for_save()
-            mock_worker_cls.return_value.wait_for_save.assert_not_called()
-            connector._get_connector_metadata = MagicMock(return_value=MagicMock())
+            mock_worker_cls.return_value.wait_for_save.assert_called_once_with(metadata)
             connector.save_kv_layer("layer_0", MagicMock(), MagicMock())
             mock_worker_cls.return_value.save_kv_layer.assert_called_once()
 

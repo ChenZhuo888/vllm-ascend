@@ -1962,6 +1962,10 @@ class KVPoolWorker:
         assert self.kv_send_thread is not None
         send_thread = self.kv_send_thread
 
+        if self.use_layerwise:
+            send_thread.wait_for_pending()
+            return
+
         for request in connector_metadata.requests:
             can_save = request.can_save
             if can_save is None or not can_save:

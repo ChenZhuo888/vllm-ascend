@@ -771,6 +771,15 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.kv_send_thread.add_stored_request.assert_not_called()
         worker.kv_send_thread.request_queue.join.assert_not_called()
 
+    def test_wait_for_save_waits_for_layerwise_transfers(self):
+        worker = self._make_worker(use_layerwise=True)
+        worker.kv_send_thread = MagicMock()
+
+        worker.wait_for_save(AscendConnectorMetadata(set(), set()))
+
+        worker.kv_send_thread.wait_for_pending.assert_called_once_with()
+        worker.kv_send_thread.add_request.assert_not_called()
+
     def test_get_finished_producer(self):
         worker = self._make_worker(kv_role="kv_producer")
 
