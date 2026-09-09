@@ -533,7 +533,7 @@ class KVPoolWorker:
             self.kv_recv_thread.external_slot_release_waiter = waiter
         return True
 
-    def _ensure_sync_save_events(self, interprocess: bool) -> None:
+    def _ensure_sync_save_events(self, interprocess: bool) -> list[torch.npu.Event]:
         """Create the per-layer save ordering events once, never replace them.
 
         With subprocess transfers the IPC handles are exported inside the KV
@@ -541,11 +541,13 @@ class KVPoolWorker:
         sides must keep referring to the same event objects for every store.
         """
         if self.sync_save_events is not None:
-            return
+            return self.sync_save_events
         if interprocess:
-            self.sync_save_events = [torch.npu.Event(interprocess=True) for _ in range(self.num_layers)]
+            sync_save_events = [torch.npu.Event(interprocess=True) for _ in range(self.num_layers)]
         else:
-            self.sync_save_events = [torch.npu.Event() for _ in range(self.num_layers)]
+            sync_save_events = [torch.npu.Event() for _ in range(self.num_layers)]
+        self.sync_save_events = sync_save_events
+        return sync_save_events
 
     def _start_kv_transfer_threads(self) -> None:
         if self._transfer_threads_started:
@@ -556,7 +558,7 @@ class KVPoolWorker:
                 self.get_event = threading.Event()
                 self.layer_load_finished_events = [threading.Event() for _ in range(self.num_layers)]
                 self.layer_save_finished_events = [threading.Event() for _ in range(self.num_layers)]
-                self._ensure_sync_save_events(interprocess=True)
+                sync_save_events = self._ensure_sync_save_events(interprocess=True)
                 ready_event = threading.Event()
                 can_save = self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put
                 common = dict(
@@ -579,7 +581,7 @@ class KVPoolWorker:
                             page_size_bytes=self.page_size_bytes,
                             num_layers=self.num_layers,
                             layer_save_finished_events=self.layer_save_finished_events,
-                            sync_save_events=self.sync_save_events,
+                            sync_save_events=sync_save_events,
                             max_transfer_blocks=self.layerwise_max_transfer_blocks,
                             max_transfer_bytes=self.layerwise_max_transfer_bytes,
                             group_builders=group_builders,
@@ -591,7 +593,7 @@ class KVPoolWorker:
                         get_event=self.get_event,
                         layer_load_finished_events=self.layer_load_finished_events,
                         layer_save_finished_events=self.layer_save_finished_events,
-                        sync_save_events=self.sync_save_events,
+                        sync_save_events=sync_save_events,
                         num_layers=self.num_layers,
                         h2d_stagger_us=self.h2d_stagger_us,
                         max_transfer_blocks=self.layerwise_max_transfer_blocks,
@@ -612,7 +614,7 @@ class KVPoolWorker:
                             put_step=self.put_step,
                             num_layers=self.num_layers,
                             layer_save_finished_events=self.layer_save_finished_events,
-                            sync_save_events=self.sync_save_events,
+                            sync_save_events=sync_save_events,
                         )
                         self.kv_send_thread = key_send_adapter
                     key_recv_adapter = KVCacheStoreKeyLayerRecvingProcessAdapter(
@@ -662,7 +664,7 @@ class KVPoolWorker:
             self.get_event = threading.Event()
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
-            self._ensure_sync_save_events(interprocess=False)
+            sync_save_events = self._ensure_sync_save_events(interprocess=False)
             can_save = self.kv_role in ["kv_producer", "kv_both"] or self.consumer_is_to_put
             if self.use_layerwise_transfer and can_save:
                 ready_event_sending = threading.Event()
@@ -677,7 +679,7 @@ class KVPoolWorker:
                     ready_event_sending,
                     self.num_layers,
                     self.layer_save_finished_events,
-                    self.sync_save_events,
+                    sync_save_events,
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
                     group_builders=self._build_group_layer_builders(),
@@ -697,7 +699,7 @@ class KVPoolWorker:
                     ready_event_sending,
                     self.num_layers,
                     self.layer_save_finished_events,
-                    self.sync_save_events,
+                    sync_save_events,
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -715,7 +717,7 @@ class KVPoolWorker:
                     self.get_event,
                     self.layer_load_finished_events,
                     self.layer_save_finished_events,
-                    self.sync_save_events,
+                    sync_save_events,
                     self.num_layers,
                     self.h2d_stagger_us,
                     self.layerwise_max_transfer_blocks,
