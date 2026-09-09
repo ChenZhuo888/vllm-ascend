@@ -240,6 +240,7 @@ def test_child_handlers_match_thread_keys_and_roundtrip_buffer_contents(monkeypa
         req.load_spec = LoadSpec(0, 4, True, token_len=4)
         result = run_transfer(runtime, parent, "load", req)
         assert result["finished"] and result["invalid_blocks"] == []
+        assert [(operation, keys) for operation, _duration, keys in result["operations"]] == [("load_get", 2)]
         assert tensor[0].tolist() == tensor[1].tolist()
         assert tensor[2].tolist() == tensor[3].tolist()
 
@@ -319,6 +320,7 @@ def test_child_tp_mismatch_handler_reuses_worker_business_logic(monkeypatch):
         req.load_spec = LoadSpec(0, 4, True, token_len=4)
         result = run_transfer(runtime, parent, "load", req)
         assert result["finished"] and result["invalid_blocks"] == []
+        assert [(operation, keys) for operation, _duration, keys in result["operations"]] == [("load_get", 4)]
         assert tensor[0].tolist() == tensor[1].tolist()
         assert tensor[2].tolist() == tensor[3].tolist()
     finally:
@@ -616,8 +618,15 @@ def process_endpoint(cls):
     return process, endpoint
 
 
-def completed(future, *, invalid_blocks=()):
-    future.set_result({"finished": True, "events": [], "invalid_blocks": list(invalid_blocks)})
+def completed(future, *, invalid_blocks=(), operations=()):
+    future.set_result(
+        {
+            "finished": True,
+            "events": [],
+            "invalid_blocks": list(invalid_blocks),
+            "operations": list(operations),
+        }
+    )
 
 
 def test_sending_completion_counts_all_submissions_and_ignores_preempted_generation():
@@ -651,6 +660,28 @@ def test_preempted_load_does_not_publish_stale_failure_or_completion():
     completed(future, invalid_blocks=[1])
     assert receiver.get_and_clear_finished_requests() == set()
     assert not receiver._invalid_block_ids
+
+
+def test_receiving_completion_records_child_backend_metrics():
+    process = MagicMock()
+    process.client.timeout = 1
+    future: Future = Future()
+    process.submit_request.return_value = future
+    record_operation = MagicMock()
+    receiver = KVCacheStoreRecvingProcessAdapter(
+        MagicMock(),
+        database(),
+        [2],
+        0,
+        process=process,
+        record_operation=record_operation,
+    )
+    receiver.add_request(request())
+
+    completed(future, operations=[("load_get", 0.25, 3)])
+    receiver.wait_for_pending()
+
+    record_operation.assert_called_once_with("load_get", 0.25, 3)
 
 
 def test_failed_async_transfer_is_raised_by_waiter():

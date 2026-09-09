@@ -654,6 +654,7 @@ class KVPoolWorker:
                     **common,
                     invalid_block_ids=self._invalid_block_ids,
                     invalid_block_ids_lock=self._invalid_block_ids_lock,
+                    record_operation=self._record_kv_connector_operation,
                 )
                 self.kv_recv_thread = store_recv_adapter
             self.transfer_process.bind_adapters((store_send_adapter, store_recv_adapter))

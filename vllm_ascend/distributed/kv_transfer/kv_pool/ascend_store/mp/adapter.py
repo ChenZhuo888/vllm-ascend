@@ -49,6 +49,9 @@ class _ProcessTransferAdapterMixin(KVTransferThread):
     def _complete(self, future: Future, req_id: str, event_id: int | None, generation: object) -> None:
         try:
             result = future.result()
+            if isinstance(self, KVCacheStoreRecvingThread) and self._record_operation_cb is not None:
+                for operation, duration_seconds, num_keys in result.get("operations", ()):
+                    self._record_operation_cb(operation, duration_seconds, num_keys)
             with self.done_task_lock:
                 if generation is self._generations.get(req_id):
                     if isinstance(self, KVCacheStoreRecvingThread):

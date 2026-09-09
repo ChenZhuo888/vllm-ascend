@@ -85,6 +85,7 @@ class TransferService:
         self.sender: KVTransferThread | None = None
         self.receiver: KVTransferThread | None = None
         self._layerwise = False
+        self._operation_stats = threading.local()
         self._send = ThreadPoolExecutor(max_workers=1, initializer=self.backend.set_device)
         self._recv = ThreadPoolExecutor(max_workers=1, initializer=self.backend.set_device)
 
@@ -303,6 +304,9 @@ class TransferService:
             transfer_worker.sub_size_bytes = tp_mismatch["sub_size_bytes"]
             transfer_worker.tp_rank = self.config["tp_rank"]
             transfer_worker.enable_kv_events = self.config["enable_kv_events"]
+            transfer_worker._record_kv_connector_operation = (  # type: ignore[method-assign]
+                self._record_kv_connector_operation
+            )
         common = dict(
             m_store=self.backend,
             token_database=database,
@@ -319,7 +323,11 @@ class TransferService:
             enable_kv_event=self.config["enable_kv_events"],
             worker=transfer_worker,
         )
-        self.receiver = KVCacheStoreRecvingThread(**common, worker=transfer_worker)
+        self.receiver = KVCacheStoreRecvingThread(
+            **common,
+            worker=transfer_worker,
+            record_operation=self._record_kv_connector_operation,
+        )
         if transfer_worker is not None:
             transfer_worker.kv_send_thread = self.sender
             transfer_worker._invalid_block_ids = self.receiver._invalid_block_ids
@@ -343,6 +351,7 @@ class TransferService:
             import_npu_event,
         )
 
+        self._operation_stats.entries = []
         event = payload.pop("current_event")
         if payload["load_spec"] is not None:
             payload["load_spec"] = LoadSpec(**payload["load_spec"])
@@ -355,7 +364,12 @@ class TransferService:
             worker.add_stored_request(request.req_id)
         self._run_handler(worker, request)
         finished = worker.get_and_clear_finished_requests()
-        result = {"finished": request.req_id in finished, "events": worker.get_kv_events(), "invalid_blocks": []}
+        result = {
+            "finished": request.req_id in finished,
+            "events": worker.get_kv_events(),
+            "invalid_blocks": [],
+            "operations": self._operation_stats.entries,
+        }
         if operation == "load":
             assert self.receiver is not None
             receiver = cast("KVCacheStoreRecvingThread", self.receiver)
@@ -363,6 +377,9 @@ class TransferService:
                 result["invalid_blocks"] = list(receiver._invalid_block_ids)
                 receiver._invalid_block_ids.clear()
         return result
+
+    def _record_kv_connector_operation(self, operation: str, duration_seconds: float, num_keys: int) -> None:
+        self._operation_stats.entries.append((operation, duration_seconds, num_keys))
 
     def _layer_transfer(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import LayerLoadTask
