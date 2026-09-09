@@ -444,8 +444,48 @@ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
                 role=KVConnectorRole.WORKER,
                 kv_cache_config=None,
             )
+            connector.bind_connector_metadata(MagicMock())
             connector.wait_for_layer_load("layer_0")
             mock_worker_cls.return_value.wait_for_layer_load.assert_called_once()
+
+    def test_layerwise_step_is_prepared_before_layer_hooks_once(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+        with (
+            patch.object(self.connector_mod, "KVPoolWorker") as mock_worker_cls,
+            patch.object(self.connector_mod, "LookupKeyServer"),
+        ):
+            config = MagicMock()
+            config.kv_transfer_config.kv_role = "kv_producer"
+            config.kv_transfer_config.kv_connector = "AscendStoreConnector"
+            config.kv_transfer_config.kv_connector_extra_config = {"use_layerwise": True}
+            config.parallel_config.rank = 0
+            connector = self.connector_mod.AscendStoreConnector(
+                vllm_config=config,
+                role=KVConnectorRole.WORKER,
+                kv_cache_config=None,
+            )
+            worker = mock_worker_cls.return_value
+            call_order = []
+            worker.start_load_kv.side_effect = lambda _metadata: call_order.append("start")
+            worker.wait_for_layer_load.side_effect = lambda: call_order.append("wait")
+            worker.save_kv_layer.side_effect = lambda _metadata: call_order.append("save")
+
+            first_metadata = MagicMock()
+            connector.bind_connector_metadata(first_metadata)
+            connector.wait_for_layer_load("layer_0")
+            connector.start_load_kv(MagicMock())
+
+            self.assertEqual(call_order, ["start", "wait"])
+            worker.start_load_kv.assert_called_once_with(first_metadata)
+
+            second_metadata = MagicMock()
+            connector.bind_connector_metadata(second_metadata)
+            connector.save_kv_layer("layer_0", MagicMock(), MagicMock())
+
+            self.assertEqual(call_order, ["start", "wait", "start", "save"])
+            self.assertEqual(worker.start_load_kv.call_count, 2)
+            worker.start_load_kv.assert_called_with(second_metadata)
 
     def test_mamba_state_copy_runs_after_layer_load(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
@@ -483,6 +523,7 @@ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
                 role=KVConnectorRole.WORKER,
                 kv_cache_config=None,
             )
+            connector.bind_connector_metadata(MagicMock())
             copy_bufs = MagicMock()
             self.assertTrue(connector.prepare_mamba_state_copy(copy_bufs))
 

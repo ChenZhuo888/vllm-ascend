@@ -110,6 +110,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
         self._kv_cache_events: AscendStoreKVEvents | None = None
 
+        self._layerwise_step_prepared = False
         self._current_step_has_real_forward = False
         self._mamba_copy_bufs = None
         self.requires_mamba_state_copy_after_layer_load = self.use_layerwise
@@ -234,9 +235,24 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        self._layerwise_step_prepared = False
+        self._current_step_has_real_forward = False
+        self._mamba_copy_bufs = None
+
+    def _prepare_layerwise_step(self, metadata: KVConnectorMetadata | None = None) -> None:
+        """Build this step's tasks before its first layer hook."""
+        if self._layerwise_step_prepared:
+            return
+        assert self.connector_worker is not None
+        if metadata is None:
+            metadata = self._get_connector_metadata()
+        self.connector_worker.start_load_kv(metadata)
+        self._layerwise_step_prepared = True
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
-        self._mamba_copy_bufs = None
         metadata = self._get_connector_metadata()
         self._current_step_has_real_forward = forward_context is not None
         logger.debug(
@@ -252,11 +268,15 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 for request in metadata.requests
             ],
         )
-        self.connector_worker.start_load_kv(metadata)
+        if self.use_layerwise:
+            self._prepare_layerwise_step(metadata)
+        else:
+            self.connector_worker.start_load_kv(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
             return
+        self._prepare_layerwise_step()
         assert self.connector_worker is not None
         self.connector_worker.wait_for_layer_load()
         if self._mamba_copy_bufs is not None:
@@ -289,6 +309,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
             # A load-only consumer does not publish KV.
             return
+        self._prepare_layerwise_step()
         assert self.connector_worker is not None
         self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
