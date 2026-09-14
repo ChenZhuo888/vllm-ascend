@@ -16,11 +16,15 @@
 
 """Exercise a minimal TP8 Mooncake transfer through the subprocess path."""
 
+import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
 import time
 from importlib import metadata
+from pathlib import Path
 
 import pytest
 import requests
@@ -40,6 +44,9 @@ TRANSFER_TIMEOUT_SECONDS = 300
 MOONCAKE_PACKAGE = "mooncake-transfer-engine-npu"
 MOONCAKE_VERSION = "0.3.12.post1"
 MOONCAKE_INDEX = "https://mirrors.aliyun.com/pypi/simple/"
+MOONCAKE_REPOSITORY = "https://github.com/kvcache-ai/Mooncake.git"
+LOCAL_COPY_FIX_COMMIT = "fa115fd6b76eebbc4e7faf94bff1773ad4640936"
+LOCAL_COPY_FIX_SHA256 = "bd232ccdc0df95dc7987d812619a52eb328b99c7b0468388092aee04d2608c21"
 
 
 def _ensure_mooncake_version() -> None:
@@ -66,6 +73,111 @@ def _ensure_mooncake_version() -> None:
     actual = metadata.version(MOONCAKE_PACKAGE)
     if actual != MOONCAKE_VERSION:
         raise RuntimeError(f"Expected {MOONCAKE_PACKAGE} {MOONCAKE_VERSION}, got {actual}")
+
+
+def _install_local_copy_fix(build_parent: Path) -> None:
+    """Backport Mooncake PR #4026 onto the pinned v0.3.12 plugin."""
+    source_dir = build_parent / "mooncake-0.3.12-local-copy-fix"
+    build_dir = build_parent / "mooncake-transfer-engine-build"
+    prefix_dir = build_parent / "mooncake-build-prefix"
+
+    subprocess.run(
+        [
+            "apt-get",
+            "install",
+            "-y",
+            "libasio-dev",
+            "libgflags-dev",
+            "libgoogle-glog-dev",
+            "libibverbs-dev",
+            "libjsoncpp-dev",
+            "librdmacm-dev",
+            "libyaml-cpp-dev",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            f"v{MOONCAKE_VERSION}",
+            "--recurse-submodules",
+            "--shallow-submodules",
+            MOONCAKE_REPOSITORY,
+            str(source_dir),
+        ],
+        check=True,
+    )
+
+    patch_url = f"{MOONCAKE_REPOSITORY.removesuffix('.git')}/commit/{LOCAL_COPY_FIX_COMMIT}.patch"
+    response = requests.get(patch_url, timeout=60)
+    response.raise_for_status()
+    patch = response.content
+    actual_hash = hashlib.sha256(patch).hexdigest()
+    if actual_hash != LOCAL_COPY_FIX_SHA256:
+        raise RuntimeError(f"Unexpected Mooncake PR #4026 patch SHA256: {actual_hash}")
+    subprocess.run(["git", "apply", "-"], cwd=source_dir, input=patch, check=True)
+
+    jobs = str(min(os.cpu_count() or 1, 16))
+    yalanting_source = source_dir / "extern" / "yalantinglibs"
+    yalanting_build = build_parent / "yalantinglibs-build"
+    subprocess.run(
+        [
+            "cmake",
+            "-S",
+            str(yalanting_source),
+            "-B",
+            str(yalanting_build),
+            "-DBUILD_EXAMPLES=OFF",
+            "-DBUILD_BENCHMARK=OFF",
+            "-DBUILD_UNIT_TESTS=OFF",
+            f"-DCMAKE_INSTALL_PREFIX={prefix_dir}",
+        ],
+        check=True,
+    )
+    subprocess.run(["cmake", "--build", str(yalanting_build), "-j", jobs], check=True)
+    subprocess.run(["cmake", "--install", str(yalanting_build)], check=True)
+
+    subprocess.run(
+        [
+            "cmake",
+            "-S",
+            str(source_dir / "mooncake-transfer-engine"),
+            "-B",
+            str(build_dir),
+            "-DUSE_ASCEND_DIRECT=ON",
+            "-DUSE_TCP=OFF",
+            "-DUSE_HTTP=OFF",
+            "-DWITH_METRICS=ON",
+            "-DBUILD_EXAMPLES=OFF",
+            "-DBUILD_UNIT_TESTS=OFF",
+            "-DBUILD_BENCHMARK=OFF",
+            "-DENABLE_DEBUG_SYMBOLS=OFF",
+            "-DCMAKE_BUILD_TYPE=Release",
+            f"-DCMAKE_PREFIX_PATH={prefix_dir}",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["cmake", "--build", str(build_dir), "--target", "ascend_transport", "-j", jobs],
+        check=True,
+    )
+
+    plugin = build_dir / "src" / "transport" / "ascend_transport" / "ascend_transport.so"
+    distribution = metadata.distribution(MOONCAKE_PACKAGE)
+    installed_plugins = [
+        distribution.locate_file(path) for path in distribution.files or () if path.name == "ascend_transport.so"
+    ]
+    if not plugin.is_file() or len(installed_plugins) != 1:
+        raise RuntimeError(f"Cannot replace Mooncake Ascend plugin: built={plugin}, installed={installed_plugins}")
+    shutil.copy2(plugin, installed_plugins[0])
+    print(
+        f"[ascend-store-mp-smoke] installed Mooncake {MOONCAKE_VERSION} with local-copy fix {LOCAL_COPY_FIX_COMMIT}",
+        flush=True,
+    )
 
 
 def _wait_for_local_cache_reset(server: RemoteOpenAIServer) -> None:
@@ -160,6 +272,7 @@ def _server_args(server_port: int) -> list[str]:
 @wait_until_npu_memory_free(target_free_percentage=0.8, max_wait_seconds=600)
 def test_ascend_store_multiprocess_mooncake_tp8(tmp_path) -> None:
     _ensure_mooncake_version()
+    _install_local_copy_fix(tmp_path)
     mooncake_port = get_open_port()
     mooncake_metrics_port = get_open_port()
     server_port = get_open_port()
