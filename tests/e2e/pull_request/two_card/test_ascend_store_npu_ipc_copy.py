@@ -98,7 +98,7 @@ def _copy_in_child(spec: KVCacheStorageSpec, device_index: int, result_conn: Con
         torch.npu.set_device(device_index)
         importlib.import_module("vllm_ascend.vllm_ascend_C")
 
-        from mooncake.engine import TransferEngine
+        from mooncake.engine import TransferEngine  # type: ignore[import-not-found]
         from vllm.utils.network_utils import get_ip
 
         engine = TransferEngine()

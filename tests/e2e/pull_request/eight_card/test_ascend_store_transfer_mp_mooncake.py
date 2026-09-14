@@ -173,7 +173,7 @@ def _install_local_copy_fix(build_parent: Path) -> None:
     ]
     if not plugin.is_file() or len(installed_plugins) != 1:
         raise RuntimeError(f"Cannot replace Mooncake Ascend plugin: built={plugin}, installed={installed_plugins}")
-    shutil.copy2(plugin, installed_plugins[0])
+    shutil.copy2(plugin, str(installed_plugins[0]))
     print(
         f"[ascend-store-mp-smoke] installed Mooncake {MOONCAKE_VERSION} with local-copy fix {LOCAL_COPY_FIX_COMMIT}",
         flush=True,
