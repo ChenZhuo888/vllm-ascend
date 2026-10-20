@@ -1,0 +1,82 @@
+{
+  "scope": "production Lookup RPC; same-process server thread; stub Worker; no model/backend",
+  "timing": "client hex encoding through RPC reply; excludes scheduler suffix slicing",
+  "production_commit": "a5ea57f607b5539ac2bbcf11c121b98a2f3b7ca7",
+  "experiment_commit": "58ecbc4bc024670a06e646931f30a6b709bf208e",
+  "vllm_verified_commit": "a98247ab4db686ee03c66d5feb3c761e52a2f8ab",
+  "python": "3.12.13",
+  "platform": "Linux-5.10.0-182.0.0.95.r2220_156.hce2.aarch64-aarch64-with-glibc2.35",
+  "packages": {
+    "vllm": "0.1.dev1+ga98247ab4.empty",
+    "pyzmq": "27.2.0",
+    "msgspec": "0.22.0"
+  },
+  "warmup_pairs_per_round": 80,
+  "sample_pairs_per_round": 1000,
+  "round_count": 5,
+  "results": [
+    {
+      "tokens": 16384,
+      "hash_block_size": 16,
+      "full_hash_bytes": 67587,
+      "suffix_hash_bytes": 16899,
+      "full_request_frame_bytes": 67602,
+      "suffix_request_frame_bytes": 16916,
+      "full_mean_us": 264.1502793878317,
+      "suffix_mean_us": 152.616411074996,
+      "full_median_us": 260.6995403766632,
+      "suffix_median_us": 150.69544315338135,
+      "mean_reduction_percent": 42.22364200080177,
+      "round_reductions_percent": [
+        42.35682377159926,
+        44.40328313915198,
+        41.93421050385798,
+        41.6020569715576,
+        40.8354811417252
+      ],
+      "sample_pairs": 5000
+    },
+    {
+      "tokens": 65536,
+      "hash_block_size": 16,
+      "full_hash_bytes": 270339,
+      "suffix_hash_bytes": 67587,
+      "full_request_frame_bytes": 270354,
+      "suffix_request_frame_bytes": 67604,
+      "full_mean_us": 719.0960831940174,
+      "suffix_mean_us": 302.8829965740442,
+      "full_median_us": 696.9589740037918,
+      "suffix_median_us": 304.80697751045227,
+      "mean_reduction_percent": 57.880038057122306,
+      "round_reductions_percent": [
+        57.38355893355571,
+        57.98094161547436,
+        58.307139913557194,
+        58.17832726825176,
+        57.4765210788605
+      ],
+      "sample_pairs": 5000
+    },
+    {
+      "tokens": 39936,
+      "hash_block_size": 128,
+      "full_hash_bytes": 20595,
+      "suffix_hash_bytes": 5151,
+      "full_request_frame_bytes": 20610,
+      "suffix_request_frame_bytes": 5168,
+      "full_mean_us": 160.77652387320995,
+      "suffix_mean_us": 126.61271467804909,
+      "full_median_us": 158.604234457016,
+      "suffix_median_us": 124.79536235332489,
+      "mean_reduction_percent": 21.249252298863485,
+      "round_reductions_percent": [
+        21.313220817932677,
+        21.322738820506405,
+        21.79543329037005,
+        20.609061501315118,
+        21.243702832081055
+      ],
+      "sample_pairs": 5000
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "run_id": 39410459392,
+  "run_url": "https://github.com/vllm-project/vllm-ascend/actions/runs/39410459392",
+  "production_commit": "a5ea57f607b5539ac2bbcf11c121b98a2f3b7ca7",
+  "experiment_commit": "58ecbc4bc024670a06e646931f30a6b709bf208e",
+  "base_commit": "e3f420d0015f18e1d0706ddb8c65c8c551f1ff9b",
+  "vllm_commit": "a98247ab4db686ee03c66d5feb3c761e52a2f8ab",
+  "image_tag": "9.2.0_20260928212200-a3-ubuntu22.04-py3.12",
+  "runner": "linux-aarch64-a3-800i-2",
+  "job_url": "https://github.com/vllm-project/vllm-ascend/actions/runs/39410459392/job/118588709780",
+  "artifact_id": 12259890698,
+  "scope": "Temporary IPC-only measurements; no model execution or real backend lookup. Benchmark Worker is a fixed-response stub.",
+  "pr_restored_to": "a5ea57f607b5539ac2bbcf11c121b98a2f3b7ca7"
+}
